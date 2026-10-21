@@ -66,6 +66,7 @@ _MONTH = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?"
 PUB_DATE = re.compile(rf"\b(?:Received|Accepted|Revised)(?: in revised form)?:?\s+"
                       rf"(?:\d{{1,2}}(?:st|nd|rd|th)?\s+{_MONTH}|{_MONTH}\s+\d{{1,2}},?|(?:19|20)\d\d-\d\d-\d\d)")
 INTRO_HEAD = re.compile(r"^\s*(?:\d+\.?\s*|I\.\s*)?(introduction|background)\b", re.I)
+INTRO_LITERAL = re.compile(r"^\s*(?:\d+\.?\s*|I\.\s*)?introductions?\b", re.I)
 FIGTAB = re.compile(r"^\s*(fig\.?|figure|table|tab\.)\s*\d", re.I)
 REFSTART = re.compile(r"^\s*(?:\[\d{1,3}\]|\(\d{1,3}\)|\d{1,3}\.\s|[A-Z][A-Za-z'\-]+,\s*(?:[A-Z]\.|[A-Z][a-z]+)|"
                       r"[A-Z][A-Za-z'\-]+\s+[A-Z]{1,3}[,.])")
@@ -74,7 +75,9 @@ REFCUE = re.compile(r"\bet al\b|\bvol\.?\s*\d|\bpp\.?\s*\d|\b\d{1,4}\s*[-–]\s*
 YEAR = re.compile(r"\b(?:19|20)\d\d\b")
 SMALL = frozenset({"of", "and", "for", "the", "in", "on", "with", "to", "a", "an", "by", "via", "from", "under", "vs"})
 NUMBERED_HEAD = re.compile(r"^(?:[A-Z]|\d+)(?:\.\d+)*\.?\s+[A-Z]")
-KEYWORDS_LINE = re.compile(r"^(?:key\s?words|index terms)\b\s*[:：\-–—]?\s*", re.I)
+KEYWORDS_LINE = re.compile(r"^(?:key\s?words|index terms)\b\s*[:：\-–—|]?\s*", re.I)
+ABSTRACT_RUNIN = re.compile(r"^(?:abstract|summary)\s*[—–\-:|]\s*\S", re.I)   # 'Abstract—Complex …', 'ABSTRACT | Big'
+SUMMARY_HEAD = re.compile(r"^[\divx.\s|:]*summary\b", re.I)
 
 ACK_MAX_LINES = 60          # an acknowledgement/declaration heading in the second half masks at most this many lines
 HF_EDGE = 4                 # header/footer candidates: first/last 4 non-empty lines of a page
@@ -91,6 +94,10 @@ _RANK = {"abstract": 1, "introduction": 2, "methods": 3, "results": 4, "discussi
 _TAIL_RANK = 7
 _TAIL_NEEDS_RANK = 4
 _KEYWORDS_MAX_RANK = 2      # keywords events are only accepted before the introduction
+ABSTRACT_MAX_PAGE = 3       # an 'Abstract' heading counts on the first 3 pages or the first quarter of the paper
+STRUCTURED_MAX_PAGE = 2     # a structured abstract (Background / Methods / Results / Conclusions) sits on pages 1–2 …
+STRUCTURED_MAX_GAP = 30     # … with at most this many lines between consecutive headings …
+STRUCTURED_MAX_TAIL = 80    # … and at most this many lines (keywords, affiliations, footnotes) before the body heading
 
 
 @dataclass(frozen=True)
@@ -230,7 +237,7 @@ def _ack_reason(s: str) -> str:
 @register
 class PaperDocType:
     name = "paper"
-    version = "paper1"
+    version = "paper2"
     thresholds = Thresholds()
 
     # ---- masks ---------------------------------------------------------------------------------------------
@@ -272,34 +279,62 @@ class PaperDocType:
     # ---- section marks -------------------------------------------------------------------------------------
     def label_sections(self, doc_id: str, pages: Sequence[PageText], masks: Sequence[LineMask],
                        units: Sequence[Unit]) -> list[SectionMark]:
-        """Heading-driven marks with sanity rules: order must be monotone in IMRaD order (a later 'introduction'
-        after 'results' is ignored); 'references' must come after 'discussion'/'results' (a 'References' heading
-        on page 1 is ignored); if no 'abstract' heading exists but an 'introduction' heading does, the text
-        between the first paragraph of ≥ 40 words on page 1 and the 'introduction' heading is 'abstract'; before
-        that it is 'front' (title, authors). A 'Keywords:'/'Key words' line yields a 'keywords' mark that ends at
-        the next blank line or heading."""
+        """Heading-driven marks with sanity rules.
+
+        Heading events come from three detectors: canonical headings (segment.HEADINGS, strength 'strict'),
+        descriptive headings ('Proposed methodology', strength 'loose') and top-level numbered headings whose
+        numbers run in sequence ('IV. Computational Methodology', run-in '1. Introduction. Text …', strength
+        'numbered'; classified by keyword, or 'methods' when they carry no keyword and follow the introduction).
+        Rules: the order must be monotone in IMRaD order — a lower-ranked heading after higher ones is ignored,
+        unless the higher ones are all loose (a strict 'Methods' retracts a loose 'Previous results') or form a
+        structured abstract on the first pages (then they become 'abstract'); 'references' needs 'results' or
+        later first; an 'Abstract' heading counts only on the first pages, a late 'Summary' is a conclusion; if
+        no 'abstract' heading exists but a body heading does, the text between the first paragraph of ≥ 40
+        words on page 1 and that heading is 'abstract'; before that it is 'front' (title, authors). A
+        'Keywords:'/'Key words' line yields a 'keywords' mark that ends at the next blank line or heading."""
         lines = _all_lines(pages)
         hf_masked = {(m.page_no, m.cstart) for m in masks if m.reason == "header_footer"}
         masked = {(m.page_no, m.cstart) for m in masks}
+        n_pages = pages[-1].page_no if pages else 1
+        abstract_max_page = max(ABSTRACT_MAX_PAGE, -(-n_pages // 4))
+        numbered = _numbered_headings(lines, hf_masked)
 
         # 1. heading events in reading order
-        events: list[tuple[int, str]] = []
+        events: list[_Event] = []
         for i, ln in enumerate(lines):
             if not ln.text or (ln.page_no, ln.cstart) in hf_masked:
                 continue
-            sec = "keywords" if KEYWORDS_LINE.match(ln.text) else segment.detect_heading(ln.text)
-            if sec:
-                events.append((i, sec))
-        heading_idx = {i for i, _ in events}
+            if KEYWORDS_LINE.match(ln.text):
+                events.append(_Event(i, "keywords", "strict", 0))
+            elif ABSTRACT_RUNIN.match(ln.text):
+                events.append(_Event(i, "abstract", "strict", _RANK["abstract"]))
+            elif hit := segment.detect_heading_ex(ln.text):
+                sec, strength = hit
+                events.append(_Event(i, sec, "numbered" if i in numbered else strength, _RANK.get(sec, 0)))
+            elif i in numbered:
+                sec = segment.classify_heading_text(numbered[i])
+                events.append(_Event(i, sec, "numbered", _RANK.get(sec, 0) if sec else 0))
+        heading_idx = {e.idx for e in events}
 
         # 2. sanity rules
-        accepted: list[tuple[int, str]] = []
+        accepted: list[_Event] = []
         max_rank = 0
-        for i, sec in events:
+        for ev in events:
+            ln = lines[ev.idx]
+            sec = ev.section
             if sec == "keywords":
                 if max_rank < _KEYWORDS_MAX_RANK:
-                    accepted.append((i, sec))
+                    accepted.append(ev)
                 continue
+            if sec is None:                     # numbered heading without a keyword: body text after the introduction
+                if max_rank != _RANK["introduction"]:
+                    continue
+                sec = "methods"
+            if sec == "abstract":
+                if max_rank >= _RANK["methods"] and SUMMARY_HEAD.match(ln.text):
+                    sec = "conclusion"          # a late 'Summary' closes the paper
+                elif ln.page_no > abstract_max_page:
+                    continue
             rank = _RANK.get(sec)
             if rank is None:
                 continue
@@ -307,18 +342,31 @@ class PaperDocType:
                 if max_rank < _TAIL_NEEDS_RANK:
                     continue
             elif rank < max_rank:
-                continue
-            accepted.append((i, sec))
-            max_rank = max(max_rank, rank)
+                if ev.strength == "loose":
+                    continue
+                higher = [a for a in accepted if a.rank > rank]
+                if all(a.strength == "loose" for a in higher):
+                    accepted = [a for a in accepted if not (a.rank > rank and a.strength == "loose")]
+                elif _structured_abstract(accepted, ev, sec, lines):
+                    dropped = [a for a in accepted if a.rank >= rank]
+                    accepted = [a for a in accepted if a.rank < rank]
+                    if not any(a.section == "abstract" for a in accepted):
+                        accepted.append(_Event(dropped[0].idx, "abstract", "strict", _RANK["abstract"]))
+                    accepted.extend(k for k in events                 # a 'Keywords:' line after the abstract
+                                    if k.section == "keywords" and dropped[0].idx < k.idx < ev.idx)
+                else:
+                    continue
+            accepted.append(_Event(ev.idx, sec, ev.strength, rank))
+            max_rank = max(a.rank for a in accepted)
 
         # 3. synthetic abstract
-        sections = {s for _, s in accepted}
-        if "abstract" not in sections and "introduction" in sections:
-            intro_i = next(i for i, s in accepted if s == "introduction")
-            j = _first_long_paragraph(lines, masked, before=intro_i, min_words=ABSTRACT_MIN_WORDS)
-            if j is not None:
-                accepted.append((j, "abstract"))
-                accepted.sort(key=lambda e: (e[0], e[1] == "keywords"))
+        if not any(e.section == "abstract" for e in accepted):
+            body_i = next((e.idx for e in accepted if e.section in ("introduction", "methods")), None)
+            if body_i is not None:
+                j = _first_long_paragraph(lines, masked, before=body_i, min_words=ABSTRACT_MIN_WORDS)
+                if j is not None:
+                    accepted.append(_Event(j, "abstract", "strict", _RANK["abstract"]))
+        accepted.sort(key=lambda e: (e.idx, e.section == "keywords"))
 
         # 4. emit
         marks: list[SectionMark] = [SectionMark(1, 0, "front")]
@@ -335,17 +383,17 @@ class PaperDocType:
                 marks.append(SectionMark(page_no, cstart, sec))
             current = sec
 
-        for i, sec in accepted:
-            ln = lines[i]
-            if sec == "keywords":
+        for e in accepted:
+            ln = lines[e.idx]
+            if e.section == "keywords":
                 if current == "keywords":
                     continue
                 emit(ln.page_no, ln.cstart, "keywords")
-                end = _keywords_end(lines, i, heading_idx)
+                end = _keywords_end(lines, e.idx, heading_idx)
                 if end is not None:
                     emit(end[0], end[1], "front")
             else:
-                emit(ln.page_no, ln.cstart, sec)
+                emit(ln.page_no, ln.cstart, e.section)
         # Fallback: when no body heading was detected at all, the whole document must not vanish as 'front'
         # (is_body = 0); label it 'other' instead. The mark sits at (1, 0) after the mandatory 'front' mark, and
         # the ingest stage takes the last mark at a position. The stage reports it as 'no headings detected'.
@@ -407,6 +455,50 @@ class PaperDocType:
 
 
 # ---- helpers for label_sections / topic_fields ---------------------------------------------------------------
+
+@dataclass(frozen=True)
+class _Event:
+    idx: int                # index into _all_lines(pages)
+    section: str | None     # None: numbered heading without a section keyword
+    strength: str           # 'strict' | 'loose' | 'numbered'
+    rank: int
+
+
+def _numbered_headings(lines: Sequence[_Line], hf_masked: set[tuple[int, int]]) -> dict[int, str]:
+    """Line index → heading text for top-level numbered headings whose numbers run in sequence (1, 2, 3 … with
+    at most one skipped; the first may be 1 or 2). A strict heading line resets the sequence to its own number
+    ('1 Introduction' after affiliation markers '1 Department …', '2 Department …')."""
+    out: dict[int, str] = {}
+    prev = 0
+    for i, ln in enumerate(lines):
+        if not ln.text or (ln.page_no, ln.cstart) in hf_masked:
+            continue
+        hit = segment.split_numbered_heading(ln.text)
+        if hit is None:
+            continue
+        n, head = hit
+        strict = (h := segment.detect_heading_ex(ln.text)) is not None and h[1] == "strict"
+        if strict or (prev == 0 and n <= 2) or n in (prev + 1, prev + 2):
+            out[i] = head
+            prev = n
+    return out
+
+
+def _structured_abstract(accepted: Sequence[_Event], ev: _Event, sec: str, lines: Sequence[_Line]) -> bool:
+    """True when the accepted body headings of rank ≥ the incoming 'introduction'/'methods' heading look like a
+    structured abstract (Background / Methods / Results / Conclusions): all on the first STRUCTURED_MAX_PAGE pages,
+    none a literal 'Introduction', at most STRUCTURED_MAX_GAP lines apart and at most STRUCTURED_MAX_TAIL lines
+    before the incoming heading."""
+    if sec not in ("introduction", "methods"):
+        return False
+    idxs = [a.idx for a in accepted if a.rank >= ev.rank and a.section != "keywords"]
+    if not idxs or any(lines[i].page_no > STRUCTURED_MAX_PAGE for i in idxs):
+        return False
+    if any(INTRO_LITERAL.match(lines[i].text) for i in idxs):  # a literal 'Introduction' is never part of an abstract
+        return False
+    return (all(b - a <= STRUCTURED_MAX_GAP for a, b in zip(idxs, idxs[1:]))
+            and ev.idx - idxs[-1] <= STRUCTURED_MAX_TAIL)
+
 
 _FRONT_MARKERS = re.compile(r"[*†‡§¶]|[¹²³⁰-⁹]")    # author affiliation markers
 _AUTHOR_SPLIT = re.compile(r",|;|&|\band\b")

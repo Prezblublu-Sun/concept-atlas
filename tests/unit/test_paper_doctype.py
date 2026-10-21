@@ -28,17 +28,18 @@ _HEADINGS = {
 }
 
 
-def fake_detect_heading(line: str) -> str | None:
+def fake_detect_heading_ex(line: str) -> tuple[str, str] | None:
     s = line.strip()
     if not s or len(s) > 60 or len(s.split()) > 8 or s.endswith("."):
         return None
     s = _NUMBERING.sub("", s).rstrip(" .:").lower()
-    return _HEADINGS.get(s)
+    sec = _HEADINGS.get(s)
+    return (sec, "strict") if sec else None
 
 
 @pytest.fixture(autouse=True)
 def _patch_heading(monkeypatch):
-    monkeypatch.setattr(segment, "detect_heading", fake_detect_heading)
+    monkeypatch.setattr(segment, "detect_heading_ex", fake_detect_heading_ex)
 
 
 # ---- helpers ---------------------------------------------------------------------------------------------------

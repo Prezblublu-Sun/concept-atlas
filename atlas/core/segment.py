@@ -16,23 +16,110 @@ import unicodedata
 
 from atlas.core.schemas import TAGS
 
-SEGMENT_VERSION = "seg2"   # seg2: caption labels ('Fig. 2.' at a line start) and 'Appendix A' headings
+SEGMENT_VERSION = "seg3"   # seg3: descriptive (loose) headings, numbered-sequence and run-in headings
 
-#: Canonical headings → section. Matching is case-insensitive on the whole line after stripping numbering
-#: ('2.', '2', 'II.', 'Chapter 3', '3.1') and trailing punctuation; the line must be ≤ 8 words.
+#: Canonical headings → section (strict forms). Matching is case-insensitive on the whole line after stripping
+#: numbering ('2.', '2', 'II.', 'Chapter 3', '3.1') and trailing punctuation; the line must be ≤ 8 words.
 HEADINGS: dict[str, str] = {
-    r"abstract|summary": "abstract",
+    r"abstract|summary|synopsis|structured abstract": "abstract",
     r"key ?words|index terms": "keywords",
-    r"introduction|background( and motivation)?": "introduction",
-    r"(materials?\s+and\s+)?methods?( and materials)?|methodology|experimental( (section|procedures?|setup))?|materials|patients and methods|subjects and methods|study design": "methods",
+    r"introductions?|background( and (motivation|significance))?": "introduction",
+    r"(materials?,? and )?methods?( and materials?)?|methodology|experimental( (section|procedures?|setup))?|materials|"
+    r"patients and methods|subjects and methods|study design": "methods",
     r"results?( and discussions?)?|findings": "results",
-    r"(general )?discussions?( and conclusions?)?": "discussion",
-    r"conclusions?( and (future work|outlook|perspectives?|recommendations?))?|concluding remarks|summary and conclusions?|outlook": "conclusion",
-    r"acknowledge?ments?|funding|acknowledgments|conflicts? of interests?|declaration of (competing )?interests?|competing interests?|author contributions?|data availability( statement)?": "acknowledgements",
-    r"references?|bibliography|literature cited|works cited": "references",
-    r"appendi(x|ces)(\s+[a-z0-9]{1,2})?(\.\s+.*)?|supplementary( material| materials| information| data)?|supporting information": "appendix",
+    r"(general )?discussions?( and conclusions?)?|discussions?\s*/\s*conclusions?": "discussion",
+    r"conclusions?( and (future work|outlook|perspectives?|recommendations?))?|concluding remarks|"
+    r"summary and conclusions?|outlook": "conclusion",
+    r"acknowledge?ments?|funding|acknowledgments|conflicts? of interests?|declaration of (competing )?interests?|"
+    r"competing interests?|author contributions?|data availability( statement)?": "acknowledgements",
+    r"references?|bibliography|literature cited|works cited|notes and references|references and notes": "references",
+    r"appendi(x|ces)(\s+[a-z0-9]{1,2})?(\.\s+.*)?|supplementary( material| materials| information| data)?|"
+    r"supporting information": "appendix",
 }
 _HEADING_RES: list[tuple[re.Pattern[str], str]] = [(re.compile(p, re.I), s) for p, s in HEADINGS.items()]
+
+#: Descriptive headings → section (loose forms: 'Proposed methodology', 'Numerical Results and Analysis',
+#: 'Kriging method (KG)', 'Case studies', 'Related work'). Same matching as HEADINGS, but the line must start
+#: with a capital and its first word must not be a determiner/pronoun (see _FRAG_FIRST), so wrapped sentence
+#: fragments such as 'these results' or 'The experiments' never count. A loose heading ranks below a strict one
+#: in the paper doctype's sanity rules (a strict 'Methods' after a loose 'Previous results' wins).
+_ADJ = (r"(?:proposed|computational|numerical|experimental|statistical|research|general|overall|theoretical|"
+        r"mathematical|analytical|simulation|finite element|fe|clinical|empirical|synthetic|benchmark|"
+        r"illustrative|main|key|preliminary|detailed|basic|modelling|modeling|surgical|biomechanical|"
+        r"in vitro|in vivo|in silico)")
+HEADINGS_LOOSE: dict[str, str] = {
+    r"background( and (preliminaries|related works?|motivation))?|motivation|related works?|"
+    r"literature (review|survey)|preliminaries|state of the art|prior work|overview|"
+    r"(theoretical |clinical |historical )?background": "introduction",
+    rf"(?:{_ADJ} )?(methodology|methods?|approach(es)?|framework)( and [a-z\-]+( [a-z\-]+)?)?|"
+    r"[a-z][a-z\-]* (methodology|methods?)|"
+    r"experimental (design|setup|procedures?|section|details|protocol|study|methods?|techniques?)|"
+    r"study (design|population|protocol)|participants|(problem|model) (statement|formulation|setting|definition|"
+    r"description|setup)|"
+    rf"(?:{_ADJ} )?(model(l?ing)?|implementation|procedures?|formulation|setup|algorithms?|protocol)( details)?|"
+    r"theory|implementation( details)?|model development|"
+    r"proposed (method|approach|model|framework|algorithm|scheme|technique)( [a-z\-]+)?": "methods",
+    rf"(?:{_ADJ} )?results?( and (discussions?|analysis|comparisons?|evaluation|validation|interpretation))?|"
+    r"[a-z][a-z\-]* results|results of [a-z][a-z\- ]{2,40}|"
+    r"experiments?( and (results?|discussions?|evaluation|analysis))?|"
+    rf"(?:{_ADJ} )?(experiments?|examples?|studies|study|tests?|investigations?|evaluations?|validation|"
+    r"comparisons?|applications?)|"
+    r"evaluation( and results)?|case stud(y|ies)|applications?( and results)?|(model )?validation( and verification)?|"
+    r"verification and validation|performance (evaluation|comparison|analysis|assessment)|findings": "results",
+    r"(general )?discussions?( and (future work|outlook|limitations?|implications))?|"
+    r"limitations?( and future (work|research|directions))?|limitations? of (this|our) study": "discussion",
+    r"conclusions?( and (discussion|outlook|future (work|directions|research)))?|closing remarks|final remarks|"
+    r"(conclusions?,? )?(and )?future (work|directions|research|perspectives)|summary and (outlook|future work)|"
+    r"conclusions? and perspectives?": "conclusion",
+    r"ethics (statement|approval)|ethical (approval|statement)|informed consent|credit authorship contribution statement|"
+    r"declarations?( of interests?)?|disclosures?( statement)?|funding (statement|sources?|information)|"
+    r"availability of data( and materials?)?|(data and )?code availability|authors'? contributions?": "acknowledgements",
+    r"references and notes|reference list": "references",
+}
+_HEADING_LOOSE_RES: list[tuple[re.Pattern[str], str]] = [(re.compile(p, re.I), s) for p, s in HEADINGS_LOOSE.items()]
+#: First words that mark a wrapped sentence fragment rather than a heading ('these results', 'our method').
+_FRAG_FIRST = frozenset("""the these those our their its this such all and or of in on for with to from as by a an some no
+both other similar same different more most many several which whose previous prior earlier above following further
+additional recent new two three four five consistent comparable good better best poor promising first second third
+each any every either neither few various certain alternative current existing present standard conventional traditional
+typical common popular so very not only also then when where while whereas because since although""".split())
+
+#: Keyword → section for numbered structural headings ('IV. Computational Methodology'); first hit in this
+#: order wins ('Results and discussion' → results, 'Discussion and conclusions' → discussion).
+_CLASSIFY: list[tuple[re.Pattern[str], str]] = [(re.compile(p, re.I), s) for p, s in (
+    (r"\bresults?\b|\bexperiments?\b|\bexperimental (results|evaluation|validation|stud(y|ies)|comparison)|"
+     r"\bevaluations?\b|\bcase stud|\bnumerical (examples?|stud(y|ies)|tests?|investigations?|simulations?)|"
+     r"\bvalidation\b|\bbenchmark|\bperformance\b|\bfindings\b|\bapplications?\b|\bexamples?\b|\bcomparisons?\b",
+     "results"),
+    (r"\bdiscussion|\blimitations?\b", "discussion"),
+    (r"\bconclu|\bsummary\b|\boutlook\b|\bfuture (work|directions|research|perspectives)|\bfinal remarks|"
+     r"\bclosing remarks|\bperspectives\b", "conclusion"),
+    (r"\bmethod|\bmaterials?\b|\bapproach|\bframework|\bformulation|\bmodel(l?ing)?\b|\bmodels?\b|\balgorithm|"
+     r"\bimplementation|\bsetup\b|\bdesign\b|\btheor|\bprocedure|\bprotocol|\bproposed\b|\bproblem (statement|"
+     r"setting|definition|formulation|description)|\bparticipants|\bpatients|\bsubjects\b|\bmeasurements?\b|"
+     r"\bsimulations?\b|\bstatistical analysis|\bdata (collection|acquisition|processing|preparation)|"
+     r"\bexperimental\b|\bsystem description|\bnotation\b|\bdefinitions?\b", "methods"),
+    (r"\bintroduction|\bbackground|\bmotivation|\brelated work|\bliterature|\bpreliminaries|\bstate of the art|"
+     r"\boverview\b|\bprior work", "introduction"),
+    (r"\breferences?\b|\bbibliography", "references"),
+    (r"\backnowledg|\bfunding\b|\bconflicts? of interest|\bdeclaration|\bauthor contributions|\bdata availability",
+     "acknowledgements"),
+    (r"\bappendi|\bsupplement", "appendix"),
+    (r"\babstract\b", "abstract"),
+    (r"\bkey ?words\b|\bindex terms\b", "keywords"),
+)]
+
+
+def classify_heading_text(text: str) -> str | None:
+    """Section for the text of a known heading by keyword anywhere in it (used for numbered structural
+    headings whose shape is already established); None when no keyword matches ('Nomenclature',
+    'Extrapolating from a pretrained PRNN')."""
+    s = " ".join(unicodedata.normalize("NFKC", text or "").split())
+    for rx, section in _CLASSIFY:
+        if rx.search(s):
+            return section
+    return None
+
 
 # ---- sentence splitting -----------------------------------------------------------------------------------
 
@@ -139,10 +226,17 @@ _LETTER_SPACED_RE = re.compile(r"^(?:[A-Za-z] )+[A-Za-z]$")
 
 
 def detect_heading(line: str) -> str | None:
-    """Canonical section for a line that is a heading, else None. A heading is a short line (≤ 8 words, ≤ 60
-    chars) without a terminal period that matches HEADINGS after numbering is stripped; 'Results and discussion'
-    → 'results'; ALL-CAPS variants count. Lines that are clearly sentences (contain ' the ' … or end with '.') are
-    not headings."""
+    """Canonical section for a line that is a heading, else None (see detect_heading_ex)."""
+    hit = detect_heading_ex(line)
+    return hit[0] if hit else None
+
+
+def detect_heading_ex(line: str) -> tuple[str, str] | None:
+    """(section, strength) for a heading line, else None. A heading is a short line (≤ 8 words, ≤ 60 chars)
+    without a terminal period that matches HEADINGS (strength 'strict') or HEADINGS_LOOSE (strength 'loose')
+    after numbering and a short trailing parenthesis are stripped; 'Results and discussion' → 'results';
+    ALL-CAPS variants count. Lines that are clearly sentences (contain ' the ' …, end with '.' or start in lower
+    case) are not headings; loose forms also need a non-fragment first word ('these results')."""
     s = " ".join(unicodedata.normalize("NFKC", line or "").split())
     if not s or len(s) > 60 or len(s.split()) > 8:
         return None
@@ -150,14 +244,62 @@ def detect_heading(line: str) -> str | None:
     if not core or core.endswith("."):
         return None
     core = core.rstrip(" :;,-–—")
+    core = _TRAIL_PAREN_RE.sub("", core).rstrip(" :;,-–—")      # 'Kriging method (KG)'
     if _LETTER_SPACED_RE.match(core):      # 'A B S T R A C T' (letter-spaced Elsevier headings)
         core = core.replace(" ", "")
-    if re.search(r"\bthe\b", core, re.I):
+    if not core or re.search(r"\bthe\b", core, re.I):
+        return None
+    if not (core[0].isupper() or core[0].isdigit()):     # 'results' alone on a line is a wrapped sentence's last word
         return None
     for rx, section in _HEADING_RES:
         if rx.fullmatch(core):
-            return section
+            return section, "strict"
+    if core.split()[0].lower() in _FRAG_FIRST:
+        return None
+    for rx, section in _HEADING_LOOSE_RES:
+        if rx.fullmatch(core):
+            return section, "loose"
     return None
+
+
+# ---- numbered structural headings ------------------------------------------------------------------------------
+
+_NUM_HEAD_RE = re.compile(r"^(?:(\d{1,2})|([IVX]{1,6}))(?:\.|\s*\|)?\s+(\S.*)$")
+_ROMAN_INT = {r: n for n, r in enumerate(
+    "I II III IV V VI VII VIII IX X XI XII XIII XIV XV XVI XVII XVIII XIX XX".split(), start=1)}
+_TRAIL_PAREN_RE = re.compile(r"\s*\([^()]{1,15}\)$")
+_RUNIN_RE = re.compile(r"(.{3,70}?)\.\s+[A-Z(\"'“]")
+_NOT_HEAD_RE = re.compile(r"[=<>{}\[\]∑∫≤≥±]|^(fig|figure|table|tab|eq|equation)\b\.?", re.I)
+NUMBERED_MAX = 30
+
+
+def split_numbered_heading(line: str) -> tuple[int, str] | None:
+    """(number, heading text) for a top-level numbered heading line: '3 Extrapolating from a pretrained PRNN',
+    'IV. Computational Methodology', '2 | METHODS' and the run-in form '1. Introduction. Operator learning has …'
+    (heading = text before the first '. ' that is followed by a capital). None for sub-numbers ('2.1 …'), units
+    ('4 MB', '2 mm thick plates'), formulas, captions and ordinary sentences. The caller decides whether the
+    number fits the sequence of the document."""
+    s = " ".join(unicodedata.normalize("NFKC", line or "").split())
+    m = _NUM_HEAD_RE.match(s)
+    if not m:
+        return None
+    n = int(m.group(1)) if m.group(1) else _ROMAN_INT.get(m.group(2), 0)
+    rest = m.group(3)
+    if not 1 <= n <= NUMBERED_MAX or not rest[0].isupper() or _NOT_HEAD_RE.search(rest):
+        return None
+    if mm := _RUNIN_RE.match(rest):          # run-in heading: 'Introduction. Operator learning …'
+        head = mm.group(1)
+        if len(head.split()) > 8 or "," in head:     # '12. Smith J, Jones K. Title …' (a reference entry)
+            return None
+    elif rest.endswith(".") or len(rest) > 80 or len(rest.split()) > 10:
+        return None
+    else:
+        head = rest
+    head = head.rstrip(" :;,-–—")
+    words = head.split()
+    if sum(c.isalpha() for c in head) < 4 or not any(len(w.strip(".,;:()")) >= 4 and w[0].isalpha() for w in words):
+        return None
+    return n, head
 
 
 # ---- rule tags --------------------------------------------------------------------------------------------
