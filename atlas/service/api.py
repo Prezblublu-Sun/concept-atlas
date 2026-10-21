@@ -196,15 +196,14 @@ class AtlasService:
         return d
 
     def page(self, doc_id: str, page_no: int) -> dict:
-        """EvidenceStore.page() + for each sentence the number of notes targeting it (and its text)."""
+        """EvidenceStore.page() (sentences carry their stored text) + for each sentence the number of notes
+        targeting it."""
         d = self._doc(doc_id)
         p = self.evidence().page(doc_id, int(page_no))
         if p is None:
             raise KeyError(f"no page {page_no} in {doc_id!r}")
-        text = p.get("text") or ""
         counts = self.user().note_counts([f"S:{s['sid']}" for s in p["sentences"]])
         for s in p["sentences"]:
-            s["text"] = text[s["cstart"]:s["cend"]]
             s["notes"] = counts.get(f"S:{s['sid']}", 0)
         p["n_pages"] = int(d.get("n_pages") or 0)
         p["title"] = d.get("title")

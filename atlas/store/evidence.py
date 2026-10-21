@@ -336,7 +336,8 @@ class EvidenceStore:
 
     def page(self, doc_id: str, page_no: int) -> dict | None:
         """{doc_id, ext_id, page_no, text, width, height, masks:[{cstart,cend,reason}],
-        sentences:[{sid, seq, cstart, cend, section, is_body, tags:[...], flags:[...]}]}"""
+        sentences:[{sid, seq, cstart, cend, section, is_body, tags:[...], flags:[...], text}]} — `text` of a
+        sentence is the stored (normalised) sentence text, not the raw page slice."""
         ext_id = self._current_ext_id(doc_id)
         if ext_id is None:
             return None
@@ -348,15 +349,17 @@ class EvidenceStore:
         masks = self.conn.execute("SELECT cstart, cend, reason FROM line_masks WHERE ext_id=? AND page_no=? "
                                   "ORDER BY cstart", (ext_id, int(page_no))).fetchall()
         sents = self.conn.execute(
-            "SELECT sid, seq, cstart, cend, section, is_body, tags, flags FROM extraction_sentences "
-            "WHERE ext_id=? AND page_no=? ORDER BY cstart, seq", (ext_id, int(page_no))).fetchall()
+            "SELECT es.sid, es.seq, es.cstart, es.cend, es.section, es.is_body, es.tags, es.flags, s.text "
+            "FROM extraction_sentences es JOIN sentences s ON s.sid = es.sid "
+            "WHERE es.ext_id=? AND es.page_no=? ORDER BY es.cstart, es.seq", (ext_id, int(page_no))).fetchall()
         return {
             "doc_id": doc_id, "ext_id": ext_id, "page_no": int(p["page_no"]), "text": p["text"],
             "width": p["width"], "height": p["height"],
             "masks": [dict(m) for m in masks],
             "sentences": [{"sid": s["sid"], "seq": s["seq"], "cstart": s["cstart"], "cend": s["cend"],
                            "section": s["section"], "is_body": bool(s["is_body"]),
-                           "tags": _unwrap(s["tags"]), "flags": _unwrap(s["flags"])} for s in sents],
+                           "tags": _unwrap(s["tags"]), "flags": _unwrap(s["flags"]), "text": s["text"]}
+                          for s in sents],
         }
 
     def resolve_sid(self, sid: str) -> tuple[str, str]:

@@ -52,9 +52,19 @@ def _clean(text: str | None) -> str:
     return s
 
 
+def _quiet_mupdf() -> None:
+    """MuPDF prints 'syntax error: cannot find ExtGState …' to stderr for damaged PDFs; keep the CLI output clean
+    (the extraction still succeeds, and real failures raise)."""
+    try:
+        fitz.TOOLS.mupdf_display_errors(False)
+    except Exception:       # older/newer PyMuPDF without the switch
+        pass
+
+
 def extract_pages(path: str | Path) -> list[PageText]:
     """page.get_text('text') for every page, 1-based page_no, width/height in points. The text is stored verbatim
     (offsets index into it); only '\\x00' and '\\r' are removed."""
+    _quiet_mupdf()
     out: list[PageText] = []
     with fitz.open(str(path)) as doc:
         for i in range(doc.page_count):
