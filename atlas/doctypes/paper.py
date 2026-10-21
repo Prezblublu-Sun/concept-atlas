@@ -19,7 +19,10 @@ Section marks (label_sections):
     tail sections (acknowledgements, references, appendix) are only accepted after a 'results' or later
     section has been seen; 'keywords' only before the introduction.
   * No 'abstract' heading but an 'introduction' heading: the first paragraph on page 1 with >= 40 unmasked
-    words (before the introduction) starts the 'abstract'.
+    words (before the introduction) starts the 'abstract'. Since PDF text carries no blank lines, a paragraph
+    is a run of lines that starts after the last masked / short / author-looking line (see
+    _first_long_paragraph); the title and author lines therefore stay 'front', and a synthetic abstract never
+    starts at (1, 0).
   * A 'Keywords:'/'Key words' line (or a bare 'Keywords' heading) starts a 'keywords' mark that ends at the
     next blank line, heading or page end; after a blank line / page end the section returns to 'front'
     (a heading at the end point simply takes over).
@@ -54,9 +57,14 @@ SENT_VERB = re.compile(r"\b(we|was|were|is|are|has|have|had|been|this|these|our|
                        r"obtained|approved)\b", re.I)
 #: publication / copyright information; deliberately no bare http/www pattern (URLs occur in body text)
 PUB = re.compile(r"©|\bcopyright\b|all rights reserved|creative commons|licen[cs]ed under|open access article|"
-                 r"doi\.org/|\bdoi:\s*10\.|journal homepage|\breceived:?\s.{0,40}\b(?:19|20)\d\d|"
-                 r"\baccepted:?\s.{0,40}\b(?:19|20)\d\d|available online|corresponding author|e-?mail|"
+                 r"doi\.org/|\bdoi:\s*10\.|journal homepage|available online|corresponding author|e-?mail|"
                  r"@[a-z0-9\-]+\.[a-z]", re.I)
+#: 'Received 3 March 2019', 'Accepted: March 3, 2019', 'Received in revised form 2019-03-03' — capitalised and
+#: followed by a day/month token, so a body sentence like 'each specimen received a coating between 2015 and
+#: 2019' is not publication info (review fix)
+_MONTH = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?"
+PUB_DATE = re.compile(rf"\b(?:Received|Accepted|Revised)(?: in revised form)?:?\s+"
+                      rf"(?:\d{{1,2}}(?:st|nd|rd|th)?\s+{_MONTH}|{_MONTH}\s+\d{{1,2}},?|(?:19|20)\d\d-\d\d-\d\d)")
 INTRO_HEAD = re.compile(r"^\s*(?:\d+\.?\s*|I\.\s*)?(introduction|background)\b", re.I)
 FIGTAB = re.compile(r"^\s*(fig\.?|figure|table|tab\.)\s*\d", re.I)
 REFSTART = re.compile(r"^\s*(?:\[\d{1,3}\]|\(\d{1,3}\)|\d{1,3}\.\s|[A-Z][A-Za-z'\-]+,\s*(?:[A-Z]\.|[A-Z][a-z]+)|"
@@ -71,8 +79,11 @@ KEYWORDS_LINE = re.compile(r"^(?:key\s?words|index terms)\b\s*[:：\-–—]?\s*
 ACK_MAX_LINES = 60          # an acknowledgement/declaration heading in the second half masks at most this many lines
 HF_EDGE = 4                 # header/footer candidates: first/last 4 non-empty lines of a page
 HF_MIN_PAGES = 3            # ... that recur on at least 3 pages
-HF_MIN_DOC_PAGES = 4        # ... in documents of at least 4 pages
+HF_MIN_DOC_PAGES = HF_MIN_PAGES   # ... so documents of 3 pages (letters, conference papers) qualify (review fix)
 ABSTRACT_MIN_WORDS = 40
+PROSE_MIN_WORDS = 8         # a page-1 line of >= 8 words ending with .?! closes the affiliation window
+SHORT_LINE_CHARS = 40       # lines shorter than this cannot start the synthetic abstract (title / author lines)
+AFFIL_MIN_TITLECASE = 0.5   # an affiliation line that ends with a period must be mostly Title Case
 
 # IMRaD ranks for the heading sanity rules; tail sections share one rank and need a results-or-later section first
 _RANK = {"abstract": 1, "introduction": 2, "methods": 3, "results": 4, "discussion": 5, "conclusion": 6,
@@ -147,16 +158,45 @@ def _headingish(s: str) -> bool:
     return bool(alpha) and all(w[0].isupper() or w.lower() in SMALL for w in alpha)
 
 
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'\-]*")
+
+
+def _titlecase_ratio(s: str) -> float:
+    """Share of capitalised words among the words of >= 3 letters that are not stop words."""
+    words = [w for w in _WORD_RE.findall(s) if len(w) >= 3 and w.lower() not in SMALL]
+    if not words:
+        return 0.0
+    return sum(1 for w in words if w[0].isupper()) / len(words)
+
+
+def _affiliation_shape(s: str) -> bool:
+    """Affiliation lines are name lists ('Department of X, University of Y, City, Country'); a line that ends like a
+    sentence must at least be mostly Title Case, so an abstract sentence mentioning a hospital is kept (review
+    fix)."""
+    if s[-1] not in ".?!":
+        return True
+    return _titlecase_ratio(s) >= AFFIL_MIN_TITLECASE
+
+
+def _prose_line(s: str) -> bool:
+    """A page-1 line that reads like body/abstract prose: >= PROSE_MIN_WORDS words, terminal punctuation, and
+    neither an affiliation, publication-info nor keywords line."""
+    return (len(s.split()) >= PROSE_MIN_WORDS and s[-1] in ".?!" and not PUB.search(s)
+            and not PUB_DATE.search(s) and not KEYWORDS_LINE.match(s)
+            and not (AFF.search(s) and _affiliation_shape(s)))
+
+
 def _classify_line(s: str, hf: set[str], front: bool) -> str | None:
-    """Mask reason for a non-body line, else None. `front` = before the Introduction heading."""
+    """Mask reason for a non-body line, else None. `front` = inside the affiliation window (see _front_end)."""
     L = len(s)
     if not s:
         return None
     if 4 <= L <= 200 and _line_key(s) in hf:
         return "header_footer"
-    if L < 300 and PUB.search(s):
+    if L < 300 and (PUB.search(s) or PUB_DATE.search(s)):
         return "pub_info"
-    if front and L < 250 and AFF.search(s) and not SENT_VERB.search(s) and not FIGTAB.match(s):
+    if (front and L < 250 and AFF.search(s) and not SENT_VERB.search(s) and not FIGTAB.match(s)
+            and _affiliation_shape(s)):
         return "affiliation"
     if 30 <= L <= 400 and REFSTART.match(s) and YEAR.search(s) and sum(1 for _ in REFCUE.finditer(s)) >= 2:
         return "residual_ref"
@@ -164,14 +204,23 @@ def _classify_line(s: str, hf: set[str], front: bool) -> str | None:
 
 
 def _front_end(lines: Sequence[_Line], pages: Sequence[PageText]) -> int:
-    """Index of the first line that is no longer front matter: the Introduction/Background heading, else the
-    first line of page 2, else line 80."""
+    """Index of the first line that is no longer front matter (the end of the affiliation window): the
+    Introduction/Background heading, else the first line of page 2, else line 80 — but never beyond the first
+    prose line of page 1 (the abstract has started there; review fix)."""
+    end: int | None = None
     for i, ln in enumerate(lines):
         if ln.text and len(ln.text) < 80 and INTRO_HEAD.match(ln.text):
+            end = i
+            break
+    if end is None:
+        end = sum(1 for ln in lines if ln.page_no == pages[0].page_no) if len(pages) > 1 else min(len(lines), 80)
+    first_page = pages[0].page_no if pages else 1
+    for i, ln in enumerate(lines[:end]):
+        if ln.page_no != first_page:
+            break
+        if ln.text and _prose_line(ln.text):
             return i
-    if len(pages) > 1:
-        return sum(1 for ln in lines if ln.page_no == pages[0].page_no)
-    return min(len(lines), 80)
+    return end
 
 
 def _ack_reason(s: str) -> str:
@@ -354,29 +403,68 @@ class PaperDocType:
 
 # ---- helpers for label_sections / topic_fields ---------------------------------------------------------------
 
+_FRONT_MARKERS = re.compile(r"[*†‡§¶]|[¹²³⁰-⁹]")    # author affiliation markers
+_AUTHOR_SPLIT = re.compile(r",|;|&|\band\b")
+
+
+def _author_list(s: str) -> bool:
+    """'Alice Northwood, Dmitri Volkov and Farid Haddad': >= 2 short name chunks, Title Case, no verb, no period."""
+    if len(s) > 200 or s[-1] in ".?!" or SENT_VERB.search(s):
+        return False
+    chunks = [c.split() for c in _AUTHOR_SPLIT.split(s)]
+    if len(chunks) < 2 or any(not c or len(c) > 4 for c in chunks):
+        return False
+    return _titlecase_ratio(s) >= 0.6
+
+
+def _frontish(s: str) -> bool:
+    """A page-1 line that cannot start the abstract paragraph: short (title / author / label lines), carrying author
+    markers, or shaped like an author list."""
+    return len(s) < SHORT_LINE_CHARS or bool(_FRONT_MARKERS.search(s)) or _author_list(s)
+
+
 def _first_long_paragraph(lines: Sequence[_Line], masked: set[tuple[int, int]], before: int,
                           min_words: int) -> int | None:
-    """Index of the first line of the first page-1 paragraph (run of non-empty lines) before line `before`
-    whose unmasked lines hold at least `min_words` words."""
+    """Index of the first line of the first page-1 paragraph before line `before` whose unmasked lines hold at
+    least `min_words` words.
+
+    PDF text has no blank lines between blocks (review fix), so a paragraph is a run of lines that starts after
+    the last masked, empty or front-matter-looking line (see _frontish) and ends at the next masked or empty
+    line, at an author-marker / author-list line, at a short line (the last line of a wrapped paragraph) or at
+    `before`. A run can never start at offset 0 of page 1 (that position is the mandatory 'front' mark)."""
     start: int | None = None
     words = 0
     first_page = lines[0].page_no if lines else 1
 
     def flush() -> int | None:
-        return start if start is not None and words >= min_words else None
+        if start is not None and words >= min_words and lines[start].cstart > 0:
+            return start
+        return None
 
     for i, ln in enumerate(lines):
         if i >= before or ln.page_no != first_page:
             break
-        if not ln.text:
+        s = ln.text
+        if not s or (ln.page_no, ln.cstart) in masked:
             if (hit := flush()) is not None:
                 return hit
             start, words = None, 0
             continue
         if start is None:
-            start = i
-        if (ln.page_no, ln.cstart) not in masked:
-            words += len(ln.text.split())
+            if _frontish(s):
+                continue
+            start, words = i, len(s.split())
+            continue
+        if _FRONT_MARKERS.search(s) or _author_list(s):
+            if (hit := flush()) is not None:
+                return hit
+            start, words = None, 0
+            continue
+        words += len(s.split())
+        if len(s) < SHORT_LINE_CHARS:            # a short line closes a wrapped paragraph
+            if (hit := flush()) is not None:
+                return hit
+            start, words = None, 0
     return flush()
 
 
@@ -398,7 +486,8 @@ def _title_candidate(s: str) -> bool:
     words = s.split()
     if len(words) < 3 or "@" in s or not any(c.isalpha() for c in s):
         return False
-    if PUB.search(s) or AFF.search(s) or ACK.match(s) or KEYWORDS_LINE.match(s) or FIGTAB.match(s):
+    if (PUB.search(s) or PUB_DATE.search(s) or AFF.search(s) or ACK.match(s) or KEYWORDS_LINE.match(s)
+            or FIGTAB.match(s)):
         return False
     digits = sum(c.isdigit() for c in s)
     return digits / len(s) <= 0.15

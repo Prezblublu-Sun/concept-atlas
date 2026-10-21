@@ -85,6 +85,17 @@ def test_fixture_facts(corpus: Corpus):
     assert info["micromotion_counts"] == {d["doc_id"]: d["micromotion_sentences"] for d in info["documents"]}
 
 
+def test_fixture_pdf_bytes_are_deterministic(corpus: Corpus, tmp_path: Path):
+    # review fix: MuPDF wrote a fresh trailer /ID per save, so pdf_sha256 (and ext_id) changed between builds
+    from atlas.ingest.pdf import sha256_file
+    again = make_fixture(tmp_path / "again", seed=1)
+    assert [d["doc_id"] for d in again["documents"]] == [d["doc_id"] for d in corpus.info["documents"]]
+    for a, b in zip(corpus.info["documents"], again["documents"]):
+        assert sha256_file(a["path"]) == sha256_file(b["path"]), a["doc_id"]
+    other = make_fixture(tmp_path / "other", seed=2)
+    assert sha256_file(other["documents"][0]["path"]) != sha256_file(again["documents"][0]["path"])
+
+
 # ---- counts, ids, sections ---------------------------------------------------------------------------------------
 
 def test_document_count_and_pages(corpus: Corpus):

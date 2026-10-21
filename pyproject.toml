@@ -28,7 +28,7 @@ atlas = "atlas.cli:main"
 include = ["atlas*"]
 
 [tool.setuptools.package-data]
-atlas = ["defaults.yaml", "store/sql/*.sql", "http/static/**/*", "llm/prompts/*.md"]
+atlas = ["defaults.yaml", "store/sql/*.sql", "store/sql/migrations/*.sql", "http/static/**/*", "llm/prompts/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -26,9 +26,14 @@ so re-running assigns the same ids) and meta from pdf_metadata(). `atlas docs ad
 extracts. The stage logs one line per document to work/logs/ingest.log and returns a Report.
 
 Refinement of step 5 (PDF text has no blank lines between blocks, so a heading would otherwise merge into the
-first sentence of its section): every SectionMark except the implicit (1, 0, 'front') is a hard sentence
-boundary at the mark's offset and at the end of that line; the heading line therefore becomes its own (short,
-flagged) sentence. A masked line leaves its newline behind, so the lines around a mask stay separate.
+first sentence of its section): every SectionMark that is not a 'front' mark (the implicit (1, 0, 'front') and
+the marks that end a keywords block are not headings) is a hard sentence boundary at the mark's offset and at
+the end of that line — including a heading at offset 0 of a page (any page without a running header); the
+heading line therefore becomes its own (short, flagged) sentence. A masked line leaves its newline behind, so
+the lines around a mask stay separate.
+
+`--workers N` > 1 runs steps 3–6 in a process pool (PyMuPDF is not thread-safe, so threads are never used);
+database writes stay in the parent, in doc_id order.
 """
 from __future__ import annotations
 
@@ -37,7 +42,7 @@ import logging
 import re
 from bisect import bisect_right
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -118,9 +123,9 @@ def page_sentence_spans(page: PageText, masks: Sequence[LineMask], marks: Sequen
     bounds: set[int] = {0, len(cleaned)}
     heading_segs: set[tuple[int, int]] = set()
     for m in marks:
-        if m.page_no != page.page_no or (m.page_no == 1 and m.cstart == 0):
-            continue
-        if 0 < m.cstart < len(text):
+        if m.page_no != page.page_no or m.section == "front":
+            continue        # 'front' marks are never headings; a heading at offset 0 of a page still is
+        if 0 <= m.cstart < len(text):
             s, e = to_clean[m.cstart], to_clean[_line_end(text, m.cstart)]
             bounds.update((s, e))
             heading_segs.add((s, e))
@@ -272,7 +277,7 @@ class _Job:
 
 
 def _compute(job: _Job) -> _Job:
-    """Steps 3–6 (no database access; safe in a worker thread)."""
+    """Steps 3–6 (no database access; runs in a worker process when --workers > 1)."""
     try:
         dt = job.doctype
         job.pages = extract_pages(job.path)
@@ -366,9 +371,9 @@ class IngestStage:
                 jobs.append(_Job(doc_id=doc_id, doc_type=doc_type, path=path, pdf_sha256=sha,
                                  extractor_version=version, ext_id=ext_id, doctype=doctype, min_chars=min_chars))
 
-            # ---- steps 3–6: compute (optionally in threads), steps 7–8: write in doc_id order
+            # ---- steps 3–6: compute (optionally in worker processes), steps 7–8: write in doc_id order
             if workers and workers > 1 and len(jobs) > 1:
-                pool = ThreadPoolExecutor(max_workers=int(workers))
+                pool = ProcessPoolExecutor(max_workers=int(workers))
                 results = pool.map(_compute, jobs)
             else:
                 pool = None

@@ -1,5 +1,5 @@
 // concept-atlas SPA entry: header, language toggle, hash router.
-import { api, i18n, t, h, clear, parseHash, go } from "./core.js";
+import { api, i18n, t, h, clear, parseHash, go, replaceHash } from "./core.js";
 import { readerView } from "./reader.js";
 import { documentsView, searchView, notesView, noteView, collectionsView, collectionView, refView } from "./views.js";
 
@@ -31,7 +31,11 @@ function setActiveNav(top) {
 }
 
 async function route() {
-  const { path, params, key } = parseHash();
+  let { path, params, key } = parseHash();
+  if (!path.length) {                 // '#/' is the documents view; settle the hash so views may persist filters
+    replaceHash(["docs"], params);
+    ({ path, params, key } = parseHash());
+  }
   const [top, id] = path;
   if (current.key === key && current.view && current.view.update) {
     current.view.update(params);
@@ -68,7 +72,13 @@ function wireHeader() {
     if (phrase) go(["search"], { phrase });
   });
   document.getElementById("lang-btn").addEventListener("click", () => i18n.toggle());
-  i18n.onChange(() => { applyChrome(); loadInfo(); current = { key: null, view: null }; route(); });
+  i18n.onChange(() => {
+    applyChrome();
+    loadInfo();
+    if (current.view && current.view.destroy) current.view.destroy();   // flush autosave, release object URLs
+    current = { key: null, view: null };
+    route();
+  });
 }
 
 async function boot() {

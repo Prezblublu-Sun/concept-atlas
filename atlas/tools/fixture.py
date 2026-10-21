@@ -13,13 +13,15 @@
   'The threshold was 150 μm.' and one with 'a gap of 2 mm' (unit traps), one '±45°' sentence, 'Fig. 3 shows'
   mid-sentence abbreviation, 'et al. (2019) reported' mid-sentence, a sentence duplicated verbatim twice in one
   paper (duplicate-ordinal test), and one sentence split across two lines by a hyphen ('micro-\\nmotion');
-- deterministic given `seed` (fixed strings + seeded shuffles) so ids are stable across runs.
+- deterministic given `seed` (fixed strings + seeded shuffles, fixed PDF dates and a fixed trailer /ID derived
+  from seed + doc_id) so sentence ids, pdf_sha256 and extraction ids are all stable across runs.
 Theses are added in increment 2.
 
 Layout notes (verified against PyMuPDF text extraction): text is written with the bundled Unicode fallback font
 (so μ, ± and ° survive), every line is wrapped to the column width (PyMuPDF clips glyphs outside the page), a
 paragraph is never split across pages (so no planted sentence crosses a page), and every paper is padded with
-filler paragraphs until it has at least 4 pages, which the paper doctype needs for header/footer detection.
+filler paragraphs until it has at least 4 pages (the paper doctype detects headers/footers from 3 pages on;
+4 keeps a margin and the planted page counts stable).
 The word 'micromotion' (lower-case) occurs only in the planted sentences that are counted, never in titles,
 keywords, headers, references or the figure caption ('Micromotion').
 
@@ -32,6 +34,7 @@ hyphen: {doc_id, text[, lines]}}}.
 from __future__ import annotations
 
 import csv
+import hashlib
 import logging
 import random
 from dataclasses import dataclass
@@ -214,7 +217,9 @@ def _paginate(blocks: list[list[_Line]]) -> list[list[tuple[float, _Line]]]:
 
 
 def _write_pdf(path: Path, pages: list[list[tuple[float, _Line]]], header: str, font: fitz.Font,
-               meta: dict) -> int:
+               meta: dict, id_key: str = "") -> int:
+    """Write the pages; `id_key` seeds the PDF trailer /ID so the bytes are identical across runs (MuPDF would
+    otherwise write a fresh random /ID on every save)."""
     doc = fitz.open()
     n = len(pages)
     for i, lines in enumerate(pages, 1):
@@ -229,7 +234,9 @@ def _write_pdf(path: Path, pages: list[list[tuple[float, _Line]]], header: str, 
                       "keywords": meta["keywords"], "creator": "concept-atlas fixture", "producer": "PyMuPDF",
                       "creationDate": FIXED_DATE, "modDate": FIXED_DATE})
     path.parent.mkdir(parents=True, exist_ok=True)
-    doc.save(str(path), garbage=1, deflate=True)
+    fid = hashlib.sha256(id_key.encode("utf-8")).hexdigest()[:32]
+    doc.xref_set_key(-1, "ID", f"[<{fid}><{fid}>]")
+    doc.save(str(path), garbage=1, deflate=True, no_new_id=True)
     doc.close()
     return n
 
@@ -405,7 +412,8 @@ def make_fixture(out_dir: str | Path, seed: int = 1) -> dict:
         file = f"{paper.doc_id}_{first_last}_{paper.year}.pdf"
         path = pdf_dir / file
         n_pages = _write_pdf(path, pages, paper.header, font,
-                             {"title": paper.title, "authors": paper.authors, "keywords": ", ".join(paper.keywords)})
+                             {"title": paper.title, "authors": paper.authors, "keywords": ", ".join(paper.keywords)},
+                             id_key=f"concept-atlas fixture {seed} {paper.doc_id}")
         sentences = paper.sentences()
         n_mm = sum(1 for s in sentences if "micromotion" in s)
         counts[paper.doc_id] = n_mm

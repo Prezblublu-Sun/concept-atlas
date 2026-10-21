@@ -69,7 +69,9 @@ export async function readerView(docId, params) {
     h("button.btn.small", { type: "button", title: t("reader.zoomIn"), on: { click: () => setZoom(state.zoom * 1.25) } }, "+"),
     hlInput, hlInfo,
     h("span.spacer"),
-    h("a.btn.small", { href: "#/search?" + new URLSearchParams({ phrase: state.hl || "", doc: doc.doc_id }) }, t("reader.searchInDoc")),
+    h("button.btn.small", { type: "button", title: t("reader.searchInDocTitle"),
+      on: { click: () => go(["search"], { phrase: hlInput.value.trim() || state.hl || undefined, doc: doc.doc_id }) } },
+      t("reader.searchInDoc")),
     pdfLink,
   );
   const viewer = h("div.viewer");
@@ -171,10 +173,17 @@ export async function readerView(docId, params) {
     clear(viewer).appendChild(box);
     viewer.insertBefore(h("div.muted", { style: "font-size:12px;margin:0 0 6px 4px" }, t("reader.selectHint"), " · ", t("reader.sentences", { n: pd.sentences.length })), box);
     if (selectedEl) selectedEl.scrollIntoView({ block: "center" });
-    if (state.sid) {
-      const s = pd.sentences.find((x) => x.sid === state.sid);
-      if (s) panel.setSelection(s, false);
-    }
+  }
+
+  /** Push the sentence named by state.sid (or nothing) to the notes panel — independent of the view mode. */
+  function syncSelection() {
+    if (!state.sid) { panel.setSelection(null); return; }
+    const sid = state.sid;
+    pageData(state.page).then((pd) => {
+      if (state.sid !== sid) return;
+      const s = pd.sentences.find((x) => x.sid === sid);
+      panel.setSelection(s || null, false);
+    }).catch(() => {});
   }
 
   function select(s, row) {
@@ -187,22 +196,19 @@ export async function readerView(docId, params) {
   }
 
   // initial selection → notes panel (works in both modes)
-  if (state.sid) {
-    pageData(state.page).then((pd) => {
-      const s = pd.sentences.find((x) => x.sid === state.sid);
-      if (s) panel.setSelection(s, false);
-    }).catch(() => {});
-  }
+  if (state.sid) syncSelection();
   render();
 
   return {
     el,
     update(p) {
       const page = clampPage(Number(p.page) || 1, nPages);
-      const changed = page !== state.page || (p.hl || "") !== state.hl || (p.sid || null) !== state.sid;
-      state.page = page; state.hl = p.hl || ""; state.sid = p.sid || null;
+      const sid = p.sid || null;
+      const changed = page !== state.page || (p.hl || "") !== state.hl || sid !== state.sid;
+      const sidChanged = sid !== state.sid;
+      state.page = page; state.hl = p.hl || ""; state.sid = sid;
       hlInput.value = state.hl;
-      if (changed) { render(); if (!state.sid) panel.setSelection(null); }
+      if (changed) { render(); if (sidChanged) syncSelection(); }
     },
     destroy() { if (state.objectUrl) URL.revokeObjectURL(state.objectUrl); panel.flush(); },
   };
@@ -298,8 +304,11 @@ function createNotesPanel(doc, state) {
   function setSelection(s, resetEditor = true) {
     selection = s || null;
     renderTarget();
-    editor.setTargets([ref()]);
-    if (resetEditor && editor.noteId === null) editor.reset([ref()]);
+    // a user-made selection change always starts a fresh draft for the new target — also when an existing note
+    // was loaded through "Edit" (its pending changes are flushed first), so keystrokes never land on the old
+    // target; hash/initial selections (resetEditor = false) only retarget a new draft
+    if (resetEditor) editor.reset([ref()]);
+    else editor.setTargets([ref()]);
     reloadList();
   }
 

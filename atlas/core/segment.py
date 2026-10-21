@@ -16,7 +16,7 @@ import unicodedata
 
 from atlas.core.schemas import TAGS
 
-SEGMENT_VERSION = "seg1"
+SEGMENT_VERSION = "seg2"   # seg2: caption labels ('Fig. 2.' at a line start) and 'Appendix A' headings
 
 #: Canonical headings → section. Matching is case-insensitive on the whole line after stripping numbering
 #: ('2.', '2', 'II.', 'Chapter 3', '3.1') and trailing punctuation; the line must be ≤ 8 words.
@@ -30,7 +30,7 @@ HEADINGS: dict[str, str] = {
     r"conclusions?( and (future work|outlook|perspectives?|recommendations?))?|concluding remarks|summary and conclusions?|outlook": "conclusion",
     r"acknowledge?ments?|funding|acknowledgments|conflicts? of interests?|declaration of (competing )?interests?|competing interests?|author contributions?|data availability( statement)?": "acknowledgements",
     r"references?|bibliography|literature cited|works cited": "references",
-    r"appendi(x|ces)|supplementary( material| materials| information| data)?|supporting information": "appendix",
+    r"appendi(x|ces)(\s+[a-z0-9]{1,2})?(\.\s+.*)?|supplementary( material| materials| information| data)?|supporting information": "appendix",
 }
 _HEADING_RES: list[tuple[re.Pattern[str], str]] = [(re.compile(p, re.I), s) for p, s in HEADINGS.items()]
 
@@ -46,6 +46,27 @@ ABBREVIATIONS: frozenset[str] = frozenset(
 _INITIAL_RE = re.compile(r"^(?:[A-Za-z]{1,2}\.)*[A-Z]$")
 _LAST_TOKEN_RE = re.compile(r"(\S+)$")
 _OPENERS = "([{\"'“‘"
+#: Caption / label words: a period after a bare number that follows one of these at the START of a line is the
+#: caption numbering ('Fig. 2. Micromotion versus load.'), not a sentence end. Mid-line ('shown in Fig. 3. The
+#: next…') the period still ends the sentence.
+CAPTION_LABELS: frozenset[str] = frozenset("fig figs figure figures table tables tab eq eqn equation scheme".split())
+_LABEL_NUMBER_RE = re.compile(r"^\d{1,3}[a-z]?$")
+
+
+def _caption_number(para: str, dot: int, tok_start: int, tok: str) -> bool:
+    """True when `tok` (the token before the period at `dot`) is a caption number and the token before it is a
+    caption label standing at the start of a line."""
+    if not _LABEL_NUMBER_RE.match(tok):
+        return False
+    head = para[:tok_start].rstrip()
+    m = _LAST_TOKEN_RE.search(head)
+    if not m:
+        return False
+    label = m.group(1).lstrip(_OPENERS).rstrip(".").lower()
+    if label not in CAPTION_LABELS:
+        return False
+    before = head[:m.start(1)]
+    return not before.strip() or before.rstrip(" \t").endswith("\n")
 #: A sentence terminator with its closing quotes/brackets and the whitespace after it, when the next character
 #: can start a sentence; CJK terminators always end a sentence (no whitespace needed).
 _SENT_END_RE = re.compile(r"[.!?][\"'”’)\]]*\s+(?=[A-Z0-9(\[\"“‘\u4e00-\u9fff])|[。！？][\"'”’)\]」』]*\s*")
@@ -61,7 +82,9 @@ def _protected(para: str, dot: int) -> bool:
     tok = m.group(1).lstrip(_OPENERS)
     if not tok:
         return False
-    return tok.lower() in ABBREVIATIONS or bool(_INITIAL_RE.match(tok))
+    if tok.lower() in ABBREVIATIONS or _INITIAL_RE.match(tok):
+        return True
+    return _caption_number(para, dot, m.start(1), tok)
 
 
 def _paragraphs(text: str) -> list[tuple[int, int]]:

@@ -1,8 +1,11 @@
 """Route table: (method, path pattern) → service call. Implemented by: increment 1, agent "service+http".
 
 All routes under /api/v1/. Path parameters in {braces}. JSON in/out (UTF-8), errors as {"error": msg} with
-4xx/5xx. Query parameters are strings; the adapter converts ints/bools. Every response carries
-`X-Atlas-Build: evidence` (increment 1) and `Cache-Control: no-cache` except PNG/PDF (max-age=600).
+4xx/5xx (also for unsupported methods such as OPTIONS/PATCH → 405). Query parameters are strings; the adapter
+converts ints/bools and type-checks JSON body values (wrong type → 400); `limit` is clamped to 1..1000 and
+`offset` to >= 0. POST/PUT take their parameters from the JSON body only (query parameters are ignored), with
+`Content-Type: application/json` (else 415). Every response carries `X-Atlas-Build: evidence` (increment 1)
+and `Cache-Control: no-cache` except PNG/PDF (max-age=600).
 
 GET  info                                    -> service.info()
 GET  i18n                                    -> service.i18n()

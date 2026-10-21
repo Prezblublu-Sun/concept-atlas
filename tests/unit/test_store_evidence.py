@@ -91,6 +91,14 @@ def test_file_uri_windows_shapes(tmp_path: Path):
         db.file_uri(p, "bogus")
 
 
+def test_file_uri_unc_path_has_empty_authority():
+    # review fix: Path.as_uri() put the server into the URI authority, which SQLite rejects
+    uri = db.file_uri(Path(r"\\DESKTOP-NOPE\share\sub dir\x.sqlite"), "ro")
+    assert uri == "file:////DESKTOP-NOPE/share/sub%20dir/x.sqlite?mode=ro"
+    assert db.file_uri(Path(r"\\srv\证据\x.sqlite"), "rw").startswith("file:////srv/%E8%AF%81%E6%8D%AE/x.sqlite")
+    assert db.file_uri(Path(r"C:\data\x.sqlite"), "ro").startswith("file:///C:/data/x.sqlite")
+
+
 def test_connect_sets_pragmas_and_migrates(store: EvidenceStore):
     c = store.conn
     assert c.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
@@ -135,6 +143,12 @@ def test_add_document_idempotent_and_new_file(store: EvidenceStore, tmp_path: Pa
     assert [(f[0][0], f[1]) for f in files] == [("a", 0), ("b", 1)]
     assert store.get_document(DOC)["rel_path"] == "p001_v2.pdf"
     assert store.conn.execute("SELECT COUNT(*) FROM document_fts WHERE doc_id=?", (DOC,)).fetchone()[0] == 1
+    # review fix: the file reverted to the earlier sha (possibly under a new name) becomes current again
+    store.add_document(DOC, "paper", "manifest", tmp_path / "missing.pdf", "p001_back.pdf", SHA)
+    files = store.conn.execute("SELECT pdf_sha256, is_current, rel_path FROM document_files ORDER BY added, rowid").fetchall()
+    assert [(f[0][0], f[1], f[2]) for f in files] == [("a", 1, "p001_back.pdf"), ("b", 0, "p001_v2.pdf")]
+    assert store.get_document(DOC)["rel_path"] == "p001_back.pdf" and store.get_document(DOC)["pdf_sha256"] == SHA
+    assert store.conn.execute("SELECT COUNT(*) FROM document_files").fetchone()[0] == 2
 
 
 def test_upsert_meta_merges_and_list_documents(store: EvidenceStore, tmp_path: Path):
@@ -284,6 +298,28 @@ def test_page_search(store: EvidenceStore):
     _ingest_v2(store)  # page 1 text shared by both extractions → still one hit
     assert store.page_search("Running head")["total"] == 1
     assert store.page_search("periprosthetic")["total"] == 0
+
+
+def test_fts_follows_deletes_and_survives_vacuum_with_rebuild(store: EvidenceStore):
+    e1 = _ingest_v1(store)
+    gone = sentence_id(DOC, "The femoral stem transfers load to the calcar.")
+    assert store.phrase_search("femoral stem")["total"] == 1
+    # the AFTER DELETE triggers keep the external-content FTS tables in step with their content tables
+    store.conn.execute("DELETE FROM extraction_sentences WHERE sid=?", (gone,))
+    store.conn.execute("DELETE FROM sentences WHERE sid=?", (gone,))
+    assert store.phrase_search("femoral stem")["total"] == 0
+    assert store.conn.execute("SELECT COUNT(*) FROM sentence_fts WHERE sentence_fts MATCH '\"femoral stem\"'").fetchone()[0] == 0
+    store.conn.execute("DELETE FROM pages WHERE ext_id=? AND page_no=1", (e1,))
+    store.conn.execute("DELETE FROM page_text WHERE text_sha256=?", (text_sha256(PAGE1_V1),))
+    assert store.page_search("Running head")["total"] == 0
+    # VACUUM may renumber rowids of TEXT-keyed tables; rebuild_fts() restores a consistent index
+    store.conn.execute("VACUUM")
+    store.rebuild_fts()
+    r = store.phrase_search("bone")
+    assert r["total"] == 2 and {x["sid"] for x in r["rows"]} == {
+        sentence_id(DOC, "Bone remodelling is governed by strain."),
+        sentence_id(DOC, "Stress shielding reduces periprosthetic bone density.")}
+    assert store.page_search("Shorter stems")["rows"][0]["page_no"] == 2
 
 
 def test_text_sha_shared_between_extractions(store: EvidenceStore):

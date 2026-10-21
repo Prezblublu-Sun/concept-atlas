@@ -11,6 +11,7 @@ import json
 import logging
 import sqlite3
 import time
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -84,9 +85,15 @@ def _loads(s: str | None):
         return None
 
 
+def _chunks(items: list, n: int):
+    for i in range(0, len(items), n):
+        yield items[i:i + n]
+
+
 class UserStore:
     HISTORY_THROTTLE_MIN = 10
     ANNOTATION_VERSIONS = 10
+    IN_CHUNK = 300              # refs/ids per IN (...) list (well under SQLite's bound-variable limit)
 
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
@@ -133,17 +140,37 @@ class UserStore:
         assert note is not None
         return note
 
+    @staticmethod
+    def _target_dict(r: sqlite3.Row) -> dict:
+        return {"ref": r["ref"], "snapshot_text": r["snapshot_text"], "snapshot_json": _loads(r["snapshot_json"]),
+                "snapshot_build": r["snapshot_build"], "status": r["status"], "resolved_ref": r["resolved_ref"]}
+
     def _targets(self, note_id: str) -> list[dict]:
         rows = self.conn.execute(
             "SELECT ref, snapshot_text, snapshot_json, snapshot_build, status, resolved_ref FROM note_targets "
             "WHERE note_id=? ORDER BY rowid", (note_id,)).fetchall()
-        return [{"ref": r["ref"], "snapshot_text": r["snapshot_text"], "snapshot_json": _loads(r["snapshot_json"]),
-                 "snapshot_build": r["snapshot_build"], "status": r["status"], "resolved_ref": r["resolved_ref"]}
-                for r in rows]
+        return [self._target_dict(r) for r in rows]
 
-    def _note_dict(self, r: sqlite3.Row, with_body: bool = True) -> dict:
+    def _targets_many(self, note_ids: list[str]) -> dict[str, list[dict]]:
+        """{note_id: targets} for a page of notes in one query per IN_CHUNK ids (no per-note round trips)."""
+        out: dict[str, list[dict]] = {n: [] for n in note_ids}
+        for chunk in _chunks(note_ids, self.IN_CHUNK):
+            marks = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                "SELECT note_id, ref, snapshot_text, snapshot_json, snapshot_build, status, resolved_ref "
+                f"FROM note_targets WHERE note_id IN ({marks}) ORDER BY rowid", chunk).fetchall()
+            for r in rows:
+                out[r["note_id"]].append(self._target_dict(r))
+        return out
+
+    def _note_dicts(self, rows: list[sqlite3.Row], with_body: bool = True) -> list[dict]:
+        targets = self._targets_many([r["note_id"] for r in rows])
+        return [self._note_dict(r, with_body, targets[r["note_id"]]) for r in rows]
+
+    def _note_dict(self, r: sqlite3.Row, with_body: bool = True, targets: list[dict] | None = None) -> dict:
         d = {"note_id": r["note_id"], "title": r["title"], "tags": _tags_list(r["tags"]), "rev": r["rev"],
-             "created": r["created"], "updated": r["updated"], "targets": self._targets(r["note_id"])}
+             "created": r["created"], "updated": r["updated"],
+             "targets": self._targets(r["note_id"]) if targets is None else targets}
         if with_body:
             d["body_md"] = r["body_md"]
             d["links"] = [x[0] for x in self.conn.execute(
@@ -233,7 +260,25 @@ class UserStore:
             "  SELECT note_id FROM note_targets WHERE ref=? OR resolved_ref=? "
             "  UNION SELECT note_id FROM note_links WHERE ref=?) "
             "ORDER BY n.updated DESC, n.note_id DESC", (ref, ref, ref)).fetchall()
-        return [self._note_dict(r) for r in rows]
+        return self._note_dicts(rows)
+
+    def note_counts(self, refs: Iterable[str]) -> dict[str, int]:
+        """{ref: number of live notes that target it (ref or resolved_ref) or link to it} for every ref given
+        (zero included) — one query per IN_CHUNK refs instead of a notes_for_ref() call per ref (review fix)."""
+        wanted = list(dict.fromkeys(r for r in refs if r))
+        out: dict[str, int] = {r: 0 for r in wanted}
+        for chunk in _chunks(wanted, self.IN_CHUNK):
+            marks = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                "SELECT x.ref AS ref, COUNT(DISTINCT x.note_id) AS n FROM ("
+                f"  SELECT t.ref AS ref, t.note_id FROM note_targets t WHERE t.ref IN ({marks})"
+                f"  UNION SELECT t.resolved_ref, t.note_id FROM note_targets t WHERE t.resolved_ref IN ({marks})"
+                f"  UNION SELECT l.ref, l.note_id FROM note_links l WHERE l.ref IN ({marks})"
+                ") x JOIN notes n ON n.note_id = x.note_id AND n.deleted = 0 GROUP BY ref",
+                (*chunk, *chunk, *chunk)).fetchall()
+            for r in rows:
+                out[r["ref"]] = int(r["n"])
+        return out
 
     def list_notes(self, q: str | None = None, tag: str | None = None, limit: int = 50, offset: int = 0) -> dict:
         """{'rows': [note summaries with targets], 'total': n}; `q` uses note_fts, `tag` filters tags."""
@@ -256,7 +301,7 @@ class UserStore:
         except sqlite3.OperationalError as e:
             log.warning("list_notes failed for q=%r: %s", q, e)
             return {"rows": [], "total": 0}
-        return {"rows": [self._note_dict(r, with_body=False) for r in rows], "total": int(total)}
+        return {"rows": self._note_dicts(rows, with_body=False), "total": int(total)}
 
     def history(self, note_id: str) -> list[dict]:
         rows = self.conn.execute("SELECT id, note_id, rev, title, body_md, tags, saved, reason FROM note_history "

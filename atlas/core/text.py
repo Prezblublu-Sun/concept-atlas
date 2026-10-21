@@ -52,8 +52,11 @@ def strip_inline_ids(s: str | None) -> str:
 # ---- number extraction ------------------------------------------------------------------------------------
 
 _SUPERSCRIPT_TR = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻", "0123456789+-")
-#: '10³' / '10⁻³' → '10^3' / '10^-3' (only when the superscript follows a digit; 'mm²' is left to NFKC).
+#: '10³' / '10⁻³' → '10^3' / '10^-3' (only when the superscript follows a digit).
 _SUP_AFTER_DIGIT_RE = re.compile(r"(?<=\d)([⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻]+)")
+#: Unit exponents and author markers ('mm²', 's⁻¹', 'Smith¹') are dropped before NFKC, which would otherwise turn
+#: them into plain digits ('mm2' → 2).
+_SUP_NOT_AFTER_DIGIT_RE = re.compile(r"(?<!\d)[⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻]+")
 
 _TENS = "twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety"
 _UNITS = "one|two|three|four|five|six|seven|eight|nine"
@@ -84,6 +87,7 @@ _NUM_RE = re.compile(
 def _fold(s: str | None) -> str:
     """NFKC fold for number parsing: full-width digits/percent, superscript exponents, Unicode minus."""
     s = _SUP_AFTER_DIGIT_RE.sub(lambda m: "^" + m.group(1).translate(_SUPERSCRIPT_TR), s or "")
+    s = _SUP_NOT_AFTER_DIGIT_RE.sub("", s)
     return nfkc(s).replace("−", "-")
 
 

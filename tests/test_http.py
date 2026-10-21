@@ -124,10 +124,11 @@ def served(tmp_path_factory):
     service = AtlasService(project)
     srv, thread = http_server.run_in_thread(service, "127.0.0.1", 0)
     base = "http://127.0.0.1:%d" % srv.server_address[1]
-    yield {"base": base, "project": project, "service": service}
+    yield {"base": base, "project": project, "service": service, "server": srv}
     srv.shutdown()
     srv.server_close()
     thread.join(timeout=5)
+    service.shutdown()
     mp.undo()
 
 
@@ -489,8 +490,7 @@ def test_errors_methods_and_body_limits(api):
     st, _, body = api("DELETE", "info")
     assert st == 405
     st, _, body = api("POST", "collections", {"name": "x", "description": ["not", "a", "string"]})
-    assert st in (201, 400, 500)  # the store coerces or rejects; the adapter must answer JSON either way
-    assert "error" in body or "coll_id" in body
+    assert st == 400 and "description" in body["error"]  # review fix: wrong JSON types are 400, never 500
     # malformed JSON
     req = urllib.request.Request(api.base + "/api/v1/collections", data=b"{not json", method="POST",
                                  headers={"Content-Type": "application/json"})
@@ -542,6 +542,233 @@ def test_service_thread_locality(served):
         t.join()
     assert len({id(v[0]) for v in seen.values()}) == 3 and len({id(v[1]) for v in seen.values()}) == 3
     assert all(v[0].conn is not seen[0][0].conn for k, v in seen.items() if k != 0)
+
+
+# ---- review fixes: bind, body handling, validation, CSRF, static, pool ---------------------------------------
+def _conn(api) -> http.client.HTTPConnection:
+    host, port = api.base[len("http://"):].split(":")
+    return http.client.HTTPConnection(host, int(port), timeout=10)
+
+
+def test_bind_is_exclusive(served):
+    # review fix: with SO_REUSEADDR on Windows a second server could bind a port that is already listening
+    srv2 = http_server.make_server(served["service"], "127.0.0.1", 0)
+    try:
+        port = srv2.server_address[1]
+        with pytest.raises(OSError):
+            http_server.make_server(served["service"], "127.0.0.1", port)
+    finally:
+        srv2.server_close()
+    assert http_server.DEFAULT_PORT == 8770
+    from atlas.config import load_defaults
+    assert load_defaults()["serve"]["port"] == 8770
+
+
+def test_error_responses_drain_the_body_on_keep_alive(api):
+    # review fix: unread body bytes of a 404/405 answer were parsed as the next request line
+    conn = _conn(api)
+    body = b'{"a": "bcde"}'
+    conn.request("POST", "/api/v1/nothing", body=body, headers={"Content-Type": "application/json"})
+    r = conn.getresponse()
+    assert r.status == 404 and json.loads(r.read())["error"]
+    conn.request("GET", "/api/v1/info")
+    r = conn.getresponse()
+    assert r.status == 200 and json.loads(r.read())["build"] == "evidence"
+    conn.request("POST", "/api/v1/info", body=b"{}", headers={"Content-Type": "application/json"})
+    r = conn.getresponse()
+    assert r.status == 405
+    r.read()
+    conn.request("GET", "/api/v1/info")
+    r = conn.getresponse()
+    assert r.status == 200
+    r.read()
+    conn.close()
+    # chunked bodies are refused (411) and the connection closed; negative lengths are 400
+    conn = _conn(api)
+    conn.putrequest("POST", "/api/v1/notes")
+    conn.putheader("Content-Type", "application/json")
+    conn.putheader("Transfer-Encoding", "chunked")
+    conn.endheaders()
+    conn.send(b"2\r\n{}\r\n0\r\n\r\n")
+    r = conn.getresponse()
+    assert r.status == 411 and json.loads(r.read())["error"] and r.getheader("Connection") == "close"
+    conn.close()
+    for bad in ("-5", "abc"):
+        conn = _conn(api)
+        conn.putrequest("POST", "/api/v1/notes")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", bad)
+        conn.endheaders()
+        r = conn.getresponse()
+        assert r.status == 400, bad
+        assert json.loads(r.read())["error"]
+        conn.close()
+
+
+def test_unsupported_methods_and_bad_request_lines_answer_json(api):
+    conn = _conn(api)
+    for method in ("OPTIONS", "PATCH"):
+        conn.request(method, "/api/v1/notes")
+        r = conn.getresponse()
+        assert r.status == 405 and r.getheader("Content-Type").startswith("application/json"), method
+        assert json.loads(r.read())["status"] == 405
+    conn.request("TRACE", "/api/v1/info")
+    r = conn.getresponse()
+    assert r.status == 501 and r.getheader("Content-Type").startswith("application/json")
+    assert json.loads(r.read())["error"]
+    conn.close()
+
+
+def test_json_body_values_are_type_checked(api):
+    sid = _sid("P001", "Bone remodelling is governed by strain.")
+    bad_posts = [
+        {"tags": 5}, {"tags": "abc"}, {"tags": [1, 2]}, {"title": {"a": 1}}, {"body_md": [1, 2]},
+        {"targets": [{"ref": "D:P001"}]}, {"targets": "D:P001"},
+    ]
+    for body in bad_posts:
+        st, _, res = api("POST", "notes", body)
+        assert st == 400 and "parameter" in res["error"], body
+    st, _, note = api("POST", "notes", {"title": "typed", "targets": [f"S:{sid}"]})
+    assert st == 201
+    nid = note["note_id"]
+    for body in [{"rev": [1]}, {"rev": 1.9}, {"rev": "x"}, {"rev": True}, {"rev": 1, "explicit": "maybe"},
+                 {"rev": 1, "tags": "a,b"}]:
+        st, _, res = api("PUT", f"notes/{nid}", body)
+        assert st == 400, body
+    st, _, res = api("PUT", f"notes/{nid}", {"rev": 1.0, "title": "float rev is fine when integral"})
+    assert st == 200 and res["note"]["rev"] == 2
+    # review fix: query parameters do not feed POST/PUT bodies
+    st, _, res = api("PUT", f"notes/{nid}?title=hax", {"rev": 2})
+    assert st == 200 and res["note"]["title"] == "float rev is fine when integral" and res["note"]["rev"] == 3
+    st, _, coll = api("POST", "collections", {"name": "typed"})
+    cid = coll["coll_id"]
+    assert api("POST", f"collections/{cid}/items", {"comment_md": {"a": 1}})[0] == 400
+    assert api("POST", f"collections/{cid}/items", {"ref": 5})[0] == 400
+    st, _, item = api("POST", f"collections/{cid}/items", {"comment_md": "ok"})
+    assert st == 201
+    for body in [{"seq": "nan"}, {"seq": float("inf") if False else "inf"}, {"seq": [1]}, {"seq": True}]:
+        assert api("PUT", f"collections/items/{item['item_id']}", body)[0] == 400, body
+    assert api("PUT", f"collections/items/{item['item_id']}", {"seq": "2.5"})[2]["seq"] == 2.5
+    # out-of-range page numbers and negative limits never reach SQLite
+    assert api("GET", "docs/P001/pages/99999999999999999999")[0] == 400
+    assert api("GET", "docs/P001/pages/99999999999999999999.png")[0] == 400
+    st, _, res = api("GET", "docs?limit=-1")
+    assert st == 200 and len(res["rows"]) == 1          # clamped to 1
+    st, _, res = api("GET", "search?phrase=stem&limit=0&offset=-3")
+    assert st == 200 and len(res["rows"]) == 1
+    assert api("GET", "docs/NOPE/search?phrase=stem")[0] == 404
+    api("DELETE", f"notes/{nid}")
+
+
+def test_cross_site_writes_are_refused(api):
+    conn = _conn(api)
+    # review fix: a text/plain POST (no CORS preflight) from any web page could create collections
+    conn.request("POST", "/api/v1/collections", body=b'{"name":"csrf"}', headers={"Content-Type": "text/plain"})
+    r = conn.getresponse()
+    assert r.status == 415 and json.loads(r.read())["error"]
+    conn.request("POST", "/api/v1/collections", body=b'{"name":"csrf"}',
+                 headers={"Content-Type": "application/json", "Sec-Fetch-Site": "cross-site"})
+    r = conn.getresponse()
+    assert r.status == 403 and json.loads(r.read())["error"]
+    conn.request("POST", "/api/v1/collections", body=b'{"name":"csrf"}',
+                 headers={"Content-Type": "application/json", "Origin": "http://evil.example"})
+    r = conn.getresponse()
+    assert r.status == 403
+    r.read()
+    conn.request("DELETE", "/api/v1/notes/N_nope", headers={"Sec-Fetch-Site": "cross-site"})
+    r = conn.getresponse()
+    assert r.status == 403
+    r.read()
+    # same-origin / fetch-metadata-less requests pass
+    host = api.base[len("http://"):]
+    conn.request("POST", "/api/v1/collections", body=b'{"name":"same origin"}',
+                 headers={"Content-Type": "application/json", "Origin": "http://" + host,
+                          "Sec-Fetch-Site": "same-origin"})
+    r = conn.getresponse()
+    assert r.status == 201
+    r.read()
+    conn.close()
+    st, _, cols = api("GET", "collections")
+    assert "csrf" not in {c["name"] for c in cols} and "same origin" in {c["name"] for c in cols}
+
+
+def test_static_trailing_slash_and_version_injection(api):
+    assert api.page("/static/app.js/")[0] == 404
+    assert api.page("/static/")[0] == 404
+    import atlas
+    st, _, body = api.page("/")
+    assert st == 200
+    html = body.decode("utf-8")
+    assert f"/static/style.css?v={atlas.__version__}" in html and f"/static/app.js?v={atlas.__version__}" in html
+    assert "?v=0.0.0" not in html
+
+
+def test_export_filename_uses_the_collection_name(api):
+    st, _, coll = api("POST", "collections", {"name": "Calcar  loading / 校准"})
+    cid = coll["coll_id"]
+    st, hd, _ = api("GET", f"collections/{cid}/export.md?download=1", raw=True)
+    assert st == 200
+    cd = hd["Content-Disposition"]
+    assert cd.startswith('attachment; filename="Calcar-loading-_.md"'), cd
+    assert "filename*=UTF-8''Calcar-loading-%E6%A0%A1%E5%87%86.md" in cd
+    st, _, coll = api("POST", "collections", {"name": "校准"})
+    st, hd, _ = api("GET", f"collections/{coll['coll_id']}/export.md", raw=True)
+    assert f'inline; filename="{coll["coll_id"]}.md"' in hd["Content-Disposition"]
+
+
+def test_request_threads_reuse_pooled_stores(api, served):
+    svc = served["service"]
+    for _ in range(3):
+        assert api("GET", "info")[0] == 200
+    assert svc.pool_size() >= 1
+    pair = svc._pool[-1]
+    before = {id(st.conn) for p in svc._pool for st in p}
+    for _ in range(3):
+        assert api("GET", "docs")[0] == 200
+    after = {id(st.conn) for p in svc._pool for st in p}
+    assert before == after and len(svc._pool) <= 3
+    assert id(pair[0].conn) in after
+
+
+def test_handler_errors_are_logged_not_printed(served, caplog, capsys):
+    srv = served["server"]
+    import logging
+    with caplog.at_level(logging.DEBUG, logger="atlas.http.server"):
+        try:
+            raise ConnectionAbortedError("client gone")
+        except ConnectionAbortedError:
+            srv.handle_error(None, ("127.0.0.1", 1))
+        try:
+            raise RuntimeError("boom")
+        except RuntimeError:
+            srv.handle_error(None, ("127.0.0.1", 2))
+    assert capsys.readouterr().err == ""
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("dropped" in m for m in msgs) and any("failed" in m for m in msgs)
+
+
+def test_png_of_unrenderable_pdf_is_404_without_path(api, served):
+    project = served["project"]
+    empty = project.pdf_dir / "zero pages 零页.pdf"
+    empty.write_bytes(b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+                      b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n")
+    garbage = project.pdf_dir / "garbage.pdf"
+    garbage.write_bytes(b"%PDF-1.4 not really a pdf")
+    enc = project.pdf_dir / "encrypted.pdf"
+    doc = fitz.open()
+    doc.new_page()
+    doc.save(str(enc), encryption=fitz.PDF_ENCRYPT_AES_256, owner_pw="x", user_pw="x")
+    doc.close()
+    ev = EvidenceStore.open(project.evidence_db)
+    ev.add_document("Z001", "paper", "scan", empty, empty.name, "9" * 64, DocMeta(title="Zero pages"))
+    ev.add_document("Z002", "paper", "scan", garbage, garbage.name, "8" * 64, DocMeta(title="Garbage"))
+    ev.add_document("Z003", "paper", "scan", enc, enc.name, "7" * 64, DocMeta(title="Encrypted"))
+    ev.close()
+    for doc_id, name in (("Z001", "零页"), ("Z002", "garbage.pdf"), ("Z003", "encrypted.pdf")):
+        st, _, body = api("GET", f"docs/{doc_id}/pages/1.png")
+        assert st == 404, (doc_id, st, body)
+        assert name not in body["error"] and str(project.pdf_dir) not in body["error"], body
+    assert api("GET", "docs/Z001/pages/0.png")[0] == 404
 
 
 def test_serve_log_setup(served):

@@ -38,4 +38,4 @@ embedding:
   url: ""                             # e.g. http://my-gpu-box:8790 (atlas embed serve)
 serve:
   host: 127.0.0.1
-  port: 8767
+  port: 8770                          # 8765-8767 belong to the earlier term viewers; binding is exclusive

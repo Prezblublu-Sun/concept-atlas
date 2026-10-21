@@ -302,6 +302,47 @@ def test_masked_lines_do_not_count_towards_the_40_words(dt):
     assert marks[1] == SectionMark(1, off(p1, LONG_1), "abstract")
 
 
+ABS_L1 = "Primary stability of cementless stems is a prerequisite for bone ingrowth and depends on"
+ABS_L2 = "the interface micromotion under physiological loading, which this study quantifies with a"
+ABS_L3 = "validated finite element model of the implanted femur under walking and stair climbing loads"
+ABS_L4 = "for two stem designs and three bone qualities, giving a design rationale for load transfer."
+
+
+def test_synthetic_abstract_without_blank_lines_keeps_title_and_authors_in_front(dt):
+    # review fix: PyMuPDF text has no blank lines; title + author lines must not become the 'abstract'
+    p1 = page(1, ["A Very Fine Title About Stems and Their Stability", "Alice Author, Bob Author",
+                  ABS_L1, ABS_L2, ABS_L3, ABS_L4, "1. Introduction", "Body sentence one here."])
+    p2 = page(2, ["2. Results", "Body sentence two.", "References", "[1] White C. A paper. J Test. 2020;1:1-2."])
+    marks = _marks(dt, [p1, p2])
+    assert marks[:3] == [SectionMark(1, 0, "front"), SectionMark(1, off(p1, ABS_L1), "abstract"),
+                         SectionMark(1, off(p1, "1. Introduction"), "introduction")]
+    units = dt.segment("D1", [p1, p2], dt.drop_non_body([p1, p2]))
+    fields = dt.topic_fields(units[0], [p1, p2], marks, DocMeta())
+    assert fields["title"] == ["A Very Fine Title About Stems and Their Stability"]
+    assert fields["abstract"] == [f"{ABS_L1} {ABS_L2} {ABS_L3} {ABS_L4}"]
+    assert "Alice Author" not in fields["abstract"][0]
+
+
+def test_synthetic_abstract_after_long_author_list_and_affiliations(dt):
+    authors = "Alice Northwood, Dmitri Volkov, Farid Haddad and Keiko Sato"
+    aff = "Department of Biomechanics, University of Northtown, Northtown, United Kingdom"
+    p1 = page(1, ["Finite element analysis of primary stability in cementless femoral stems", authors, aff,
+                  ABS_L1, ABS_L2, ABS_L3, ABS_L4, "Introduction", "Body."])
+    marks = _marks(dt, [p1, page(2, ["Results", "R.", "References"])])
+    assert marks[1] == SectionMark(1, off(p1, ABS_L1), "abstract")
+    # no affiliation line between the author list and the abstract: the author-list shape still ends the run
+    q1 = page(1, ["Finite element analysis of primary stability in cementless femoral stems", authors,
+                  ABS_L1, ABS_L2, ABS_L3, ABS_L4, "Introduction", "Body."])
+    marks = _marks(dt, [q1, page(2, ["Results", "R.", "References"])])
+    assert marks[1] == SectionMark(1, off(q1, ABS_L1), "abstract")
+
+
+def test_synthetic_abstract_never_starts_at_offset_zero(dt):
+    p1 = page(1, [ABS_L1, ABS_L2, ABS_L3, ABS_L4, "Introduction", "Body."])
+    marks = _marks(dt, [p1, page(2, ["Results", "R.", "References"])])
+    assert [m.section for m in marks] == ["front", "introduction", "results", "references"]
+
+
 # ---- heading sanity rules --------------------------------------------------------------------------------------
 
 def test_references_on_page_one_is_ignored_and_later_introduction_is_ignored(dt):
@@ -404,9 +445,15 @@ def test_funding_rule_needs_uppercase_or_digit_start(dt):
 W = {1: "Alpha", 2: "Beta", 3: "Gamma", 4: "Delta"}     # page-specific words (digits alone are normalised away)
 
 
-def test_header_footer_needs_four_pages_and_three_occurrences(dt):
+def test_header_footer_needs_three_pages_and_three_occurrences(dt):
+    # review fix: the docstring rule is 'at least 3 pages'; a 3-page letter gets its running header masked too
+    two = [page(n, ["Running Head", f"{W[n]} body text.", f"Page {n}"]) for n in (1, 2)]
+    assert dt.drop_non_body(two) == []
     three = [page(n, ["Running Head", f"{W[n]} body text.", f"Page {n}"]) for n in (1, 2, 3)]
-    assert dt.drop_non_body(three) == []
+    masks = dt.drop_non_body(three)
+    assert [(m.page_no, three[m.page_no - 1].text[m.cstart:m.cend]) for m in masks] == [
+        (1, "Running Head"), (1, "Page 1"), (2, "Running Head"), (2, "Page 2"), (3, "Running Head"), (3, "Page 3")]
+    assert {m.reason for m in masks} == {"header_footer"}
     four = [page(n, ["Running Head" if n <= 2 else "Other", f"{W[n]} body text.", f"Page {n}"])
             for n in (1, 2, 3, 4)]
     masks = dt.drop_non_body(four)
@@ -438,6 +485,33 @@ def test_front_ends_at_page_one_without_introduction_heading(dt):
     p2 = page(2, ["Department of Surgery, University of Example", "More body."])
     masks = dt.drop_non_body([p1, p2])
     assert masks == [mask(p1, "Department of Surgery, University of Example", "affiliation")]
+
+
+def test_affiliation_rule_spares_abstract_sentences_and_stops_at_prose(dt):
+    # review fix: an abstract sentence that mentions a hospital is not an affiliation line …
+    sent = "Twelve femurs from the University Hospital biobank underwent CT scanning."
+    p1 = page(1, ["Title Of The Paper", "Department of Surgery, University of Example", sent,
+                  "Institute of Orthopaedics, Example Hospital, Stanmore, UK", "Introduction", "Body."])
+    masks = dt.drop_non_body([p1])
+    # … and the affiliation window closes at the first prose line, so the later institute line is body text too
+    assert masks == [mask(p1, "Department of Surgery, University of Example", "affiliation")]
+    # an affiliation line ending with a period is still masked when it is Title Case
+    q1 = page(1, ["Title Of The Paper", "Department of Mechanical Engineering, University of Example, London, UK.",
+                  "Introduction", "Body."])
+    assert [m.reason for m in dt.drop_non_body([q1])] == ["affiliation"]
+
+
+def test_received_accepted_dates_only_when_capitalised_with_a_date(dt):
+    # review fix: 'received … 2019' inside a body sentence is not publication info
+    body = "Each specimen received a porous coating between 2015 and 2019."
+    p1 = page(1, ["Title Of The Paper", "Received 3 March 2019; accepted 5 May 2019",
+                  "Accepted: March 3, 2019", "Received in revised form 2019-03-03", "Introduction", body,
+                  "Accepted values were taken from the literature of 2019."])
+    masks = dt.drop_non_body([p1])
+    assert [p1.text[m.cstart:m.cend] for m in masks] == ["Received 3 March 2019; accepted 5 May 2019",
+                                                         "Accepted: March 3, 2019",
+                                                         "Received in revised form 2019-03-03"]
+    assert {m.reason for m in masks} == {"pub_info"}
 
 
 def test_pub_info_rule_has_no_bare_url_pattern(dt):

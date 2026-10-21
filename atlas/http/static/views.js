@@ -1,40 +1,69 @@
 // Documents, search, notes (list + page) and collections (list + page) views.
-import { api, h, clear, t, i18n, snippetHtml, md, resolveRefLinks, refHref, fmtDate, clip, debounce, go, store } from "./core.js";
+import { api, h, clear, t, i18n, snippetHtml, md, resolveRefLinks, refHref, fmtDate, clip, debounce, go, store, replaceHash } from "./core.js";
 import { createEditor } from "./editor.js";
 import { sectionBadge } from "./reader.js";
 
 const errBox = (e) => h("div.error-box", `${t("common.error")}: ${e.message}`);
 
+/** Re-render the children of a scroll container without losing its scroll position. */
+function rerender(el, fill) {
+  const top = el.scrollTop;
+  clear(el);
+  fill();
+  el.scrollTop = top;
+}
+
 // ---------------------------------------------------------------- documents
 export async function documentsView(params) {
+  const LIMIT = 200;
   const input = h("input", { type: "search", placeholder: t("docs.filter"), value: params.q || "", style: "flex:1;max-width:520px" });
   const total = h("span.muted");
   const table = h("div.tw");
-  const el = h("div.page", h("h1", t("docs.title")), h("div.row", { style: "margin:8px 0 12px" }, input, total), table);
+  const more = h("button.btn", { type: "button", hidden: true, on: { click: () => load(false) } }, t("search.more"));
+  const el = h("div.page", h("h1", t("docs.title")), h("div.row", { style: "margin:8px 0 12px" }, input, total), table, h("div.pager", more));
+  let offset = 0, tbody = null, seq = 0;
 
-  async function load() {
-    clear(table).appendChild(h("div.loading", t("common.loading")));
-    try {
-      const res = await api.get("docs", { q: input.value.trim() || undefined, limit: 500 });
-      total.textContent = t("docs.total", { n: res.total });
-      clear(table);
-      if (!res.rows.length) { table.appendChild(h("div.empty", t("docs.empty"))); return; }
-      const tbl = h("table.t",
-        h("thead", h("tr", h("th", t("docs.col.title")), h("th.num", t("docs.col.year")), h("th", t("docs.col.authors")),
-          h("th", t("docs.col.id")), h("th.num", t("docs.col.pages")), h("th.num", t("docs.col.sentences")), h("th.num", t("docs.col.notes")))),
-        h("tbody", res.rows.map((d) => h("tr.click", { on: { click: () => go(["docs", d.doc_id]) } },
-          h("td", d.title || h("span.muted", t("common.untitled"))),
-          h("td.num", d.year ?? ""),
-          h("td", clip(d.authors || "", 60)),
-          h("td.mono", d.doc_id),
-          h("td.num", d.n_pages ? String(d.n_pages) : h("span.badge.warn", t("docs.notIngested"))),
-          h("td.num", String(d.n_sentences || 0)),
-          h("td.num", d.notes_count ? h("span.badge.accent", String(d.notes_count)) : "")))));
-      table.appendChild(tbl);
-    } catch (e) { clear(table).appendChild(errBox(e)); }
+  function row(d) {
+    return h("tr.click", { on: { click: () => go(["docs", d.doc_id]) } },
+      h("td", d.title || h("span.muted", t("common.untitled"))),
+      h("td.num", d.year ?? ""),
+      h("td", clip(d.authors || "", 60)),
+      h("td.mono", d.doc_id),
+      h("td.num", d.n_pages ? String(d.n_pages) : h("span.badge.warn", t("docs.notIngested"))),
+      h("td.num", String(d.n_sentences || 0)),
+      h("td.num", d.notes_count ? h("span.badge.accent", String(d.notes_count)) : ""));
   }
-  input.addEventListener("input", debounce(load, 250));
-  load();
+
+  async function load(first = true) {
+    const mySeq = ++seq;
+    const q = input.value.trim();
+    if (first) {
+      offset = 0; tbody = null;
+      clear(table).appendChild(h("div.loading", t("common.loading")));
+      replaceHash(["docs"], { q: q || undefined });
+    }
+    more.disabled = true;
+    try {
+      const res = await api.get("docs", { q: q || undefined, limit: LIMIT, offset });
+      if (mySeq !== seq) return;
+      total.textContent = t("docs.total", { n: res.total });
+      if (first) {
+        clear(table);
+        if (!res.rows.length) { table.appendChild(h("div.empty", t("docs.empty"))); more.hidden = true; return; }
+        tbody = h("tbody");
+        table.appendChild(h("table.t",
+          h("thead", h("tr", h("th", t("docs.col.title")), h("th.num", t("docs.col.year")), h("th", t("docs.col.authors")),
+            h("th", t("docs.col.id")), h("th.num", t("docs.col.pages")), h("th.num", t("docs.col.sentences")), h("th.num", t("docs.col.notes")))),
+          tbody));
+      }
+      for (const d of res.rows) tbody.appendChild(row(d));
+      offset += res.rows.length;
+      more.hidden = !res.rows.length || offset >= res.total;
+    } catch (e) { if (mySeq === seq) clear(table).appendChild(errBox(e)); }
+    more.disabled = false;
+  }
+  input.addEventListener("input", debounce(() => load(true), 250));
+  load(true);
   return { el };
 }
 
@@ -43,7 +72,23 @@ export async function searchView(params) {
   const phrase = (params.phrase || "").trim();
   const docId = params.doc || "";
   const el = h("div.page", h("h1", t("search.title")));
-  if (!phrase) { el.appendChild(h("div.empty", t("search.hint"))); return { el }; }
+  if (docId) {
+    // in-document search: its own phrase box (the header box searches the whole corpus)
+    const inp = h("input", { type: "search", value: phrase, placeholder: t("search.inDocPh"), style: "flex:1;max-width:520px" });
+    const form = h("form.row", { style: "margin:4px 0 12px", on: { submit: (ev) => {
+      ev.preventDefault();
+      const v = inp.value.trim();
+      if (v) go(["search"], { phrase: v, doc: docId });
+    } } }, h("span.badge.accent", t("search.inDoc") + " " + docId), inp,
+      h("button.btn.primary", { type: "submit" }, t("search.button")),
+      h("a.btn", { href: `#/docs/${encodeURIComponent(docId)}` }, t("common.back")),
+      phrase ? h("a.btn", { href: "#/search?" + new URLSearchParams({ phrase }) }, t("search.allDocs")) : null);
+    el.appendChild(form);
+    if (!phrase) { el.appendChild(h("div.empty", t("search.hint"))); return { el, focus: () => inp.focus() }; }
+  } else if (!phrase) {
+    el.appendChild(h("div.empty", t("search.hint")));
+    return { el };
+  }
   const summary = h("div.stats");
   const box = h("div.results");
   const more = h("button.btn", { type: "button", hidden: true, on: { click: () => load(false) } }, t("search.more"));
@@ -58,7 +103,6 @@ export async function searchView(params) {
       const res = await api.get(path, { phrase, limit: LIMIT, offset });
       if (first) clear(box);
       clear(summary).appendChild(h("span", t("search.summary", { phrase, total: res.total, docs: res.documents })));
-      if (docId) summary.appendChild(h("span.badge.accent", t("search.inDoc") + " " + docId));
       if (!res.rows.length && first) box.appendChild(h("div.empty", t("search.empty")));
       for (const r of res.rows) {
         box.appendChild(h("div.hit", { on: { click: () => go(["docs", r.doc_id], { page: r.page, hl: phrase, sid: r.sid }) } },
@@ -77,33 +121,50 @@ export async function searchView(params) {
 
 // ---------------------------------------------------------------- notes list
 export async function notesView(params) {
+  const LIMIT = 100;
   const q = h("input", { type: "search", placeholder: t("notes.searchPh"), value: params.q || "", style: "flex:1;max-width:420px" });
   const tag = h("input", { type: "text", placeholder: t("notes.tagPh"), value: params.tag || "", style: "width:150px" });
   const total = h("span.muted");
   const list = h("div.list");
-  const el = h("div.page.narrow", h("h1", t("notes.title")), h("div.row", { style: "margin:8px 0 12px" }, q, tag, total), list);
-  async function load() {
-    clear(list).appendChild(h("div.loading", t("common.loading")));
-    try {
-      const res = await api.get("notes", { q: q.value.trim() || undefined, tag: tag.value.trim() || undefined, limit: 200 });
-      total.textContent = t("notes.total", { n: res.total });
-      clear(list);
-      if (!res.rows.length) { list.appendChild(h("div.empty", t("notes.listEmpty"))); return; }
-      for (const n of res.rows) {
-        list.appendChild(h("div.card.click", { on: { click: () => go(["notes", n.note_id]) } },
-          h("div.card-h", n.title || t("common.untitled")),
-          h("div.muted", { style: "white-space:pre-wrap" }, clip(n.excerpt || "", 200)),
-          h("div.row.tight", { style: "margin-top:4px;font-size:12px" },
-            h("span.badges", (n.tags || []).map((tg) => h("span.badge.tag", tg))),
-            h("span.muted", fmtDate(n.updated)),
-            (n.targets || []).length ? h("span.badge", `${n.targets.length} ${t("notes.targets")}`) : h("span.badge", t("notes.noTargets")))));
-      }
-    } catch (e) { clear(list).appendChild(errBox(e)); }
+  const more = h("button.btn", { type: "button", hidden: true, on: { click: () => load(false) } }, t("search.more"));
+  const el = h("div.page.narrow", h("h1", t("notes.title")), h("div.row", { style: "margin:8px 0 12px" }, q, tag, total), list, h("div.pager", more));
+  let offset = 0, seq = 0;
+
+  function card(n) {
+    return h("div.card.click", { on: { click: () => go(["notes", n.note_id]) } },
+      h("div.card-h", n.title || t("common.untitled")),
+      h("div.muted", { style: "white-space:pre-wrap" }, clip(n.excerpt || "", 200)),
+      h("div.row.tight", { style: "margin-top:4px;font-size:12px" },
+        h("span.badges", (n.tags || []).map((tg) => h("span.badge.tag", tg))),
+        h("span.muted", fmtDate(n.updated)),
+        (n.targets || []).length ? h("span.badge", `${n.targets.length} ${t("notes.targets")}`) : h("span.badge", t("notes.noTargets"))));
   }
-  const reload = debounce(load, 250);
+
+  async function load(first = true) {
+    const mySeq = ++seq;
+    const qv = q.value.trim(), tv = tag.value.trim();
+    if (first) {
+      offset = 0;
+      clear(list).appendChild(h("div.loading", t("common.loading")));
+      replaceHash(["notes"], { q: qv || undefined, tag: tv || undefined });
+    }
+    more.disabled = true;
+    try {
+      const res = await api.get("notes", { q: qv || undefined, tag: tv || undefined, limit: LIMIT, offset });
+      if (mySeq !== seq) return;
+      total.textContent = t("notes.total", { n: res.total });
+      if (first) clear(list);
+      if (!res.rows.length && first) { list.appendChild(h("div.empty", t("notes.listEmpty"))); more.hidden = true; return; }
+      for (const n of res.rows) list.appendChild(card(n));
+      offset += res.rows.length;
+      more.hidden = !res.rows.length || offset >= res.total;
+    } catch (e) { if (mySeq === seq) clear(list).appendChild(errBox(e)); }
+    more.disabled = false;
+  }
+  const reload = debounce(() => load(true), 250);
   q.addEventListener("input", reload);
   tag.addEventListener("input", reload);
-  load();
+  load(true);
   return { el };
 }
 
@@ -129,38 +190,39 @@ export async function noteView(noteId) {
   }
 
   function render() {
-    clear(el);
-    el.appendChild(h("div.crumb", h("a", { href: "#/notes" }, t("nav.notes")), " / ", h("span.mono", note.note_id)));
-    el.appendChild(h("h1", note.title || t("common.untitled")));
-    el.appendChild(h("div.stats", h("span", t("notes.rev", { rev: note.rev })), h("span", t("notes.updated", { t: fmtDate(note.updated) })),
-      h("span", t("notes.created", { t: fmtDate(note.created) })), h("span.badges", (note.tags || []).map((tg) => h("span.badge.tag", tg)))));
-    const body = h("div.card.md", { html: md(note.body_md || "") });
-    el.appendChild(h("div.row", { style: "margin-bottom:10px" },
-      h("button.btn", { type: "button", on: { click: toggleEdit } }, t("notes.edit")),
-      collectionAdder(`N:${note.note_id}`),
-      h("span.spacer"),
-      h("button.btn.danger", { type: "button", on: { click: del } }, t("notes.delete"))));
-    el.appendChild(editorHost);
-    el.appendChild(body);
-    resolveRefLinks(body);
-    el.appendChild(h("h2", t("notes.targets")));
-    el.appendChild(h("div.card", note.targets.length ? note.targets.map(targetRow) : h("span.muted", t("notes.noTargets"))));
-    if (note.links && note.links.length) {
-      el.appendChild(h("h2", t("notes.links")));
-      el.appendChild(h("div.card", note.links.map((r) => h("div", h("a.reflink", { href: "#/ref/" + encodeURIComponent(r), data: { ref: r } }, r)))));
-      resolveRefLinks(el.lastChild);
-    }
-    const hist = h("div.card.hist");
-    const det = h("details", h("summary", t("notes.history")), hist);
-    det.addEventListener("toggle", async () => {
-      if (!det.open || hist.childElementCount) return;
-      try {
-        const rows = await api.get(`notes/${encodeURIComponent(note.note_id)}/history`);
-        for (const r of rows) hist.appendChild(h("details", h("summary", `${t("notes.rev", { rev: r.rev })} · ${fmtDate(r.saved)} · ${r.reason || ""} · ${r.title || ""}`), h("pre", r.body_md || "")));
-      } catch (e) { hist.appendChild(errBox(e)); }
+    rerender(el, () => {
+      el.appendChild(h("div.crumb", h("a", { href: "#/notes" }, t("nav.notes")), " / ", h("span.mono", note.note_id)));
+      el.appendChild(h("h1", note.title || t("common.untitled")));
+      el.appendChild(h("div.stats", h("span", t("notes.rev", { rev: note.rev })), h("span", t("notes.updated", { t: fmtDate(note.updated) })),
+        h("span", t("notes.created", { t: fmtDate(note.created) })), h("span.badges", (note.tags || []).map((tg) => h("span.badge.tag", tg)))));
+      const body = h("div.card.md", { html: md(note.body_md || "") });
+      el.appendChild(h("div.row", { style: "margin-bottom:10px" },
+        h("button.btn", { type: "button", on: { click: toggleEdit } }, t("notes.edit")),
+        collectionAdder(`N:${note.note_id}`),
+        h("span.spacer"),
+        h("button.btn.danger", { type: "button", on: { click: del } }, t("notes.delete"))));
+      el.appendChild(editorHost);
+      el.appendChild(body);
+      resolveRefLinks(body);
+      el.appendChild(h("h2", t("notes.targets")));
+      el.appendChild(h("div.card", note.targets.length ? note.targets.map(targetRow) : h("span.muted", t("notes.noTargets"))));
+      if (note.links && note.links.length) {
+        el.appendChild(h("h2", t("notes.links")));
+        el.appendChild(h("div.card", note.links.map((r) => h("div", h("a.reflink", { href: "#/ref/" + encodeURIComponent(r), data: { ref: r } }, r)))));
+        resolveRefLinks(el.lastChild);
+      }
+      const hist = h("div.card.hist");
+      const det = h("details", h("summary", t("notes.history")), hist);
+      det.addEventListener("toggle", async () => {
+        if (!det.open || hist.childElementCount) return;
+        try {
+          const rows = await api.get(`notes/${encodeURIComponent(note.note_id)}/history`);
+          for (const r of rows) hist.appendChild(h("details", h("summary", `${t("notes.rev", { rev: r.rev })} · ${fmtDate(r.saved)} · ${r.reason || ""} · ${r.title || ""}`), h("pre", r.body_md || "")));
+        } catch (e) { hist.appendChild(errBox(e)); }
+      });
+      el.appendChild(h("h2", t("notes.history")));
+      el.appendChild(det);
     });
-    el.appendChild(h("h2", t("notes.history")));
-    el.appendChild(det);
   }
 
   function toggleEdit() {
@@ -294,25 +356,26 @@ export async function collectionView(collId) {
   }
 
   function render() {
-    clear(el);
-    el.appendChild(h("div.crumb", h("a", { href: "#/collections" }, t("nav.collections")), " / ", h("span.mono", coll.coll_id)));
-    el.appendChild(h("h1", coll.name));
-    if (coll.description) el.appendChild(h("div.muted", coll.description));
-    el.appendChild(h("div.row", { style: "margin:10px 0 14px" },
-      h("span.badge.accent", t("coll.items", { n: coll.items.length })),
-      h("a.btn", { href: api.url(`collections/${encodeURIComponent(coll.coll_id)}/export.md`, { download: 1 }) }, t("coll.export")),
-      h("a.btn.small", { href: api.url(`collections/${encodeURIComponent(coll.coll_id)}/export.md`), target: "_blank", rel: "noopener" }, ".md")));
-    const list = h("div.list");
-    if (!coll.items.length) list.appendChild(h("div.empty", t("coll.empty")));
-    coll.items.forEach((it, i) => list.appendChild(itemCard(it, i)));
-    el.appendChild(list);
-    const ta = h("textarea", { placeholder: t("coll.commentPh") });
-    el.appendChild(h("form.card.form", { style: "margin-top:12px", on: { submit: async (ev) => {
-      ev.preventDefault();
-      if (!ta.value.trim()) return;
-      try { await api.post(`collections/${encodeURIComponent(coll.coll_id)}/items`, { comment_md: ta.value }); await load(); }
-      catch (e) { el.prepend(errBox(e)); }
-    } } }, h("div.card-h", t("coll.addComment")), ta, h("div.row", h("button.btn.primary", { type: "submit" }, t("coll.add")))));
+    rerender(el, () => {
+      el.appendChild(h("div.crumb", h("a", { href: "#/collections" }, t("nav.collections")), " / ", h("span.mono", coll.coll_id)));
+      el.appendChild(h("h1", coll.name));
+      if (coll.description) el.appendChild(h("div.muted", coll.description));
+      el.appendChild(h("div.row", { style: "margin:10px 0 14px" },
+        h("span.badge.accent", t("coll.items", { n: coll.items.length })),
+        h("a.btn", { href: api.url(`collections/${encodeURIComponent(coll.coll_id)}/export.md`, { download: 1 }) }, t("coll.export")),
+        h("a.btn.small", { href: api.url(`collections/${encodeURIComponent(coll.coll_id)}/export.md`), target: "_blank", rel: "noopener" }, ".md")));
+      const list = h("div.list");
+      if (!coll.items.length) list.appendChild(h("div.empty", t("coll.empty")));
+      coll.items.forEach((it, i) => list.appendChild(itemCard(it, i)));
+      el.appendChild(list);
+      const ta = h("textarea", { placeholder: t("coll.commentPh") });
+      el.appendChild(h("form.card.form", { style: "margin-top:12px", on: { submit: async (ev) => {
+        ev.preventDefault();
+        if (!ta.value.trim()) return;
+        try { await api.post(`collections/${encodeURIComponent(coll.coll_id)}/items`, { comment_md: ta.value }); await load(); }
+        catch (e) { el.prepend(errBox(e)); }
+      } } }, h("div.card-h", t("coll.addComment")), ta, h("div.row", h("button.btn.primary", { type: "submit" }, t("coll.add")))));
+    });
   }
 
   await load();

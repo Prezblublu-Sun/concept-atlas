@@ -68,7 +68,8 @@ class EvidenceStore:
     def add_document(self, doc_id: str, doc_type: str, source: str, pdf_path: Path, rel_path: str,
                      pdf_sha256: str, meta: DocMeta | None = None) -> None:
         """Insert documents/document_files/document_meta/document_fts (idempotent: a known doc_id with a new
-        pdf_sha256 adds a document_files row and marks it current; identical sha is a no-op)."""
+        pdf_sha256 adds a document_files row and marks it current; a known sha becomes the current file again
+        (its rel_path refreshed) — e.g. when the PDF on disk was reverted to an earlier version)."""
         now = _now()
         size: int | None = None
         try:
@@ -81,10 +82,15 @@ class EvidenceStore:
                       (doc_id, doc_type or "paper", now, source))
             have = c.execute("SELECT 1 FROM document_files WHERE doc_id=? AND pdf_sha256=?",
                              (doc_id, pdf_sha256)).fetchone()
+            # the file with this sha is the current one, whether or not it is already known (review fix)
+            c.execute("UPDATE document_files SET is_current = CASE WHEN pdf_sha256 = ? THEN 1 ELSE 0 END "
+                      "WHERE doc_id=?", (pdf_sha256, doc_id))
             if have is None:
-                c.execute("UPDATE document_files SET is_current=0 WHERE doc_id=?", (doc_id,))
                 c.execute("INSERT INTO document_files(doc_id, pdf_sha256, rel_path, size, added, is_current) "
                           "VALUES (?,?,?,?,?,1)", (doc_id, pdf_sha256, rel_path, size, now))
+            else:
+                c.execute("UPDATE document_files SET rel_path=? WHERE doc_id=? AND pdf_sha256=?",
+                          (rel_path, doc_id, pdf_sha256))
             c.execute("INSERT OR IGNORE INTO document_meta(doc_id, updated) VALUES (?,?)", (doc_id, now))
             if c.execute("SELECT 1 FROM document_fts WHERE doc_id=?", (doc_id,)).fetchone() is None:
                 c.execute("INSERT INTO document_fts(doc_id, title, authors, keywords) VALUES (?,?,?,?)",
@@ -285,6 +291,14 @@ class EvidenceStore:
                 [(ext_id, s.sid, s.seq, s.unit_id, s.page_no, s.cstart, s.cend, s.section,
                   1 if s.is_body else 0, _wrap(s.tags), _wrap(s.flags)) for s in sentences])
         log.info("extraction %s for %s: %d pages, %d sentences", ext_id, doc_id, len(pages), len(sentences))
+
+    def rebuild_fts(self) -> None:
+        """Rebuild sentence_fts and page_fts from their content tables. Only needed after a VACUUM, which may
+        renumber the rowids the external-content FTS tables are keyed on (see evidence.sql)."""
+        with transaction(self.conn) as c:
+            c.execute("INSERT INTO sentence_fts(sentence_fts) VALUES ('rebuild')")
+            c.execute("INSERT INTO page_fts(page_fts) VALUES ('rebuild')")
+        log.info("FTS indexes rebuilt")
 
     def add_aliases(self, rows: Iterable[tuple[str, str, str, str, float]]) -> None:
         """(old_sid, new_sid, from_ext, to_ext, overlap) rows, INSERT OR IGNORE."""

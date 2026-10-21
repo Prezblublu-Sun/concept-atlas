@@ -4,7 +4,10 @@ Every method returns JSON-serialisable dicts/lists. Every evidence pointer is a 
     {"ref": "S:S1…", "doc_id": "P123", "title": "...", "year": 2021, "doi": "...", "unit_id": "P123",
      "page": 4, "sid": "S1…", "text": "...", "status": "live", "flags": []}
 Every label is a {"zh": ..., "en": ...} pair. Thread-safety: one EvidenceStore/UserStore connection per thread
-(use threading.local inside the service); the service is constructed once per server process.
+(threading.local inside the service); the service is constructed once per server process. Because
+ThreadingHTTPServer runs every request on a fresh thread, the HTTP adapter wraps each request in `lease()`,
+which binds a pooled (EvidenceStore, UserStore) pair to the request thread and returns it to the pool
+afterwards, so connections (and the user-schema migration check) are not re-opened per request.
 
 Error convention (the HTTP adapter maps these): KeyError → 404, ValueError → 400, everything else → 500.
 """
@@ -13,6 +16,8 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import atlas
@@ -50,19 +55,26 @@ def _clip(text: str | None, n: int = 240) -> str:
 
 
 class AtlasService:
+    POOL_SIZE = 8           # idle (EvidenceStore, UserStore) pairs kept for request threads
+
     def __init__(self, project: Project):
         self.project = project
         self._local = threading.local()
+        self._pool: list[tuple[EvidenceStore, UserStore]] = []
+        self._pool_lock = threading.Lock()
         self._ui_strings = self._load_ui_strings()
         log.info("service for project %s at %s", project.name, project.root)
 
     # ---- per-thread stores ----------------------------------------------------------------------------------
+    def _open_evidence(self) -> EvidenceStore:
+        path = self.project.evidence_db
+        # the server reads evidence read-only; a project that has not been ingested yet gets an empty DB
+        return EvidenceStore.open(path, "ro") if path.exists() else EvidenceStore.open(path, "rw")
+
     def evidence(self) -> EvidenceStore:
         st = getattr(self._local, "evidence", None)
         if st is None:
-            path = self.project.evidence_db
-            # the server reads evidence read-only; a project that has not been ingested yet gets an empty DB
-            st = EvidenceStore.open(path, "ro") if path.exists() else EvidenceStore.open(path, "rw")
+            st = self._open_evidence()
             self._local.evidence = st
         return st
 
@@ -72,6 +84,39 @@ class AtlasService:
             st = UserStore.open(self.project.user_db, "rw")
             self._local.user = st
         return st
+
+    @contextmanager
+    def lease(self) -> Iterator[None]:
+        """Bind a pooled (EvidenceStore, UserStore) pair to the calling thread for the duration of a request and
+        hand it back afterwards (review fix: ThreadingHTTPServer uses one thread per request, so plain
+        thread-local caching opened two fresh connections per request). A thread that already holds stores
+        keeps them."""
+        if getattr(self._local, "evidence", None) is not None or getattr(self._local, "user", None) is not None:
+            yield
+            return
+        with self._pool_lock:
+            pair = self._pool.pop() if self._pool else None
+        if pair is None:
+            pair = (self._open_evidence(), UserStore.open(self.project.user_db, "rw"))
+        self._local.evidence, self._local.user = pair
+        try:
+            yield
+        finally:
+            self._local.evidence = self._local.user = None
+            with self._pool_lock:
+                keep = len(self._pool) < self.POOL_SIZE
+                if keep:
+                    self._pool.append(pair)
+            if not keep:
+                for st in pair:
+                    try:
+                        st.close()
+                    except Exception:  # pragma: no cover - defensive
+                        log.debug("close pooled store failed", exc_info=True)
+
+    def pool_size(self) -> int:
+        with self._pool_lock:
+            return len(self._pool)
 
     def close(self) -> None:
         """Close this thread's connections (tests; the server's threads close theirs on exit)."""
@@ -83,6 +128,18 @@ class AtlasService:
                 except Exception:  # pragma: no cover - defensive
                     log.debug("close %s failed", name, exc_info=True)
                 setattr(self._local, name, None)
+
+    def shutdown(self) -> None:
+        """Close this thread's connections and every idle pooled pair (server exit)."""
+        self.close()
+        with self._pool_lock:
+            pairs, self._pool = self._pool, []
+        for pair in pairs:
+            for st in pair:
+                try:
+                    st.close()
+                except Exception:  # pragma: no cover - defensive
+                    log.debug("close pooled store failed", exc_info=True)
 
     # ---- meta
     def info(self) -> dict:
@@ -115,12 +172,13 @@ class AtlasService:
 
     # ---- documents and reading
     def _notes_count(self, ref: str) -> int:
-        return len(self.user().notes_for_ref(ref))
+        return self.user().note_counts([ref]).get(ref, 0)
 
     def list_docs(self, q: str | None = None, limit: int = 100, offset: int = 0) -> dict:
         res = self.evidence().list_documents(q, int(limit), int(offset))
+        counts = self.user().note_counts([f"D:{row['doc_id']}" for row in res["rows"]])
         for row in res["rows"]:
-            row["notes_count"] = self._notes_count(f"D:{row['doc_id']}")
+            row["notes_count"] = counts.get(f"D:{row['doc_id']}", 0)
         return res
 
     def _doc(self, doc_id: str) -> dict:
@@ -130,7 +188,7 @@ class AtlasService:
         return d
 
     def get_doc(self, doc_id: str) -> dict:
-        """Document dict + pages:[{page_no, n_sentences}] + notes_count."""
+        """Document dict + pages:[{page_no, n_sentences}] + notes_count + has_pdf."""
         d = self._doc(doc_id)
         d["pages"] = self.evidence().pages_of(doc_id)
         d["notes_count"] = self._notes_count(f"D:{doc_id}")
@@ -144,24 +202,35 @@ class AtlasService:
         if p is None:
             raise KeyError(f"no page {page_no} in {doc_id!r}")
         text = p.get("text") or ""
+        counts = self.user().note_counts([f"S:{s['sid']}" for s in p["sentences"]])
         for s in p["sentences"]:
             s["text"] = text[s["cstart"]:s["cend"]]
-            s["notes"] = self._notes_count(f"S:{s['sid']}")
+            s["notes"] = counts.get(f"S:{s['sid']}", 0)
         p["n_pages"] = int(d.get("n_pages") or 0)
         p["title"] = d.get("title")
         return p
 
     def page_png(self, doc_id: str, page_no: int, highlight: str | None = None,
                  spans: list[tuple[int, int]] | None = None, zoom: float | None = None) -> tuple[bytes, dict]:
+        """PNG of a page; KeyError (404) when the document has no PDF, the page is out of range or the PDF cannot
+        be rendered (empty, encrypted or damaged file — the message never carries the file path)."""
         path = self.pdf_path(doc_id)
         if path is None:
             raise KeyError(f"no PDF for {doc_id!r}")
         n_pages = int(self._doc(doc_id).get("n_pages") or 0)
-        if int(page_no) < 1 or (n_pages and int(page_no) > n_pages):
+        page_no = int(page_no)
+        if page_no < 1 or (n_pages and page_no > n_pages):
             raise KeyError(f"no page {page_no} in {doc_id!r}")
         z = float(zoom) if zoom else float(self.project.get("ingest.page_render_zoom", 1.6))
         z = max(0.2, min(z, 5.0))
-        return pdf_io.render_page(path, int(page_no), zoom=z, highlight=highlight or None, spans=spans or None)
+        try:
+            png, info = pdf_io.render_page(path, page_no, zoom=z, highlight=highlight or None, spans=spans or None)
+        except (ValueError, RuntimeError, OSError) as e:   # fitz.FileDataError is a RuntimeError
+            log.warning("cannot render %s page %s: %s: %s", doc_id, page_no, type(e).__name__, e)
+            raise KeyError(f"page {page_no} of {doc_id!r} cannot be rendered") from e
+        if int(info.get("pages") or 0) and page_no > int(info["pages"]):
+            raise KeyError(f"no page {page_no} in {doc_id!r}")
+        return png, info
 
     def pdf_path(self, doc_id: str) -> str | None:
         d = self._doc(doc_id)
@@ -179,8 +248,11 @@ class AtlasService:
                 "venue": d.get("venue")}
 
     def search(self, phrase: str, doc_id: str | None = None, limit: int = 50, offset: int = 0) -> dict:
-        """Sentence phrase search (EvidenceStore.phrase_search) with each row expanded to a ref object."""
+        """Sentence phrase search (EvidenceStore.phrase_search) with each row expanded to a ref object; an unknown
+        doc_id is a KeyError (404) like every other docs/{id} route."""
         phrase = (phrase or "").strip()
+        if doc_id:
+            self._doc(doc_id)
         res = self.evidence().phrase_search(phrase, doc_id or None, int(limit), int(offset))
         rows = []
         for r in res["rows"]:

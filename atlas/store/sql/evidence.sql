@@ -1,5 +1,8 @@
 -- evidence.sqlite: append-only evidence store. Schema version 1.
 -- Only `document_meta` is ever updated; everything else is insert-only (deletes only via `atlas evidence gc`).
+-- NEVER VACUUM this file (and `atlas evidence gc` must never do it): `page_text` and `sentences` have TEXT primary
+-- keys, so VACUUM may renumber their rowids, on which `page_fts` / `sentence_fts` (external-content FTS5) are
+-- keyed. If a VACUUM ever happens, run EvidenceStore.rebuild_fts() (INSERT INTO x_fts(x_fts) VALUES('rebuild')).
 
 CREATE TABLE IF NOT EXISTS documents (
   doc_id     TEXT PRIMARY KEY,
@@ -56,6 +59,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS page_fts USING fts5(
 CREATE TRIGGER IF NOT EXISTS page_text_ai AFTER INSERT ON page_text BEGIN
   INSERT INTO page_fts(rowid, text) VALUES (new.rowid, new.text);
 END;
+CREATE TRIGGER IF NOT EXISTS page_text_ad AFTER DELETE ON page_text BEGIN
+  INSERT INTO page_fts(page_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+END;
 
 CREATE TABLE IF NOT EXISTS pages (
   ext_id      TEXT NOT NULL REFERENCES extractions(ext_id),
@@ -100,6 +106,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS sentence_fts USING fts5(
 );
 CREATE TRIGGER IF NOT EXISTS sentences_ai AFTER INSERT ON sentences BEGIN
   INSERT INTO sentence_fts(rowid, text) VALUES (new.rowid, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS sentences_ad AFTER DELETE ON sentences BEGIN
+  INSERT INTO sentence_fts(sentence_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
 END;
 
 -- membership of a sentence in one extraction: where it is and what it is

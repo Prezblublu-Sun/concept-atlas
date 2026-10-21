@@ -138,6 +138,61 @@ def test_targets_and_notes_for_ref(store: UserStore, clock):
         store.add_target("N_nope", "S:S1x")
 
 
+def test_note_counts_in_one_query_and_resolved_ref_index(store: UserStore, clock):
+    # review fix: list_docs / page counted notes with one notes_for_ref() call per row (each building full dicts)
+    a = store.create_note(title="a", targets=[{"ref": "S:S1x"}, {"ref": "D:P001"}])
+    b = store.create_note(title="b", body_md="links [[S:S1x]] and [[D:P001]] twice [[D:P001]]")
+    c = store.create_note(title="c", targets=[{"ref": "S:S1y"}])
+    store.set_target_status(c["note_id"], "S:S1y", "aliased", "S:S1z")
+    deleted = store.create_note(title="gone", targets=[{"ref": "S:S1x"}])
+    store.delete_note(deleted["note_id"])
+    refs = ["S:S1x", "D:P001", "S:S1z", "S:S1y", "S:S1none", "S:S1x"]
+    statements: list[str] = []
+    store.conn.set_trace_callback(statements.append)
+    counts = store.note_counts(refs)
+    store.conn.set_trace_callback(None)
+    assert counts == {"S:S1x": 2, "D:P001": 2, "S:S1z": 1, "S:S1y": 1, "S:S1none": 0}
+    assert len(statements) == 1
+    assert store.note_counts([]) == {}
+    # many refs are chunked, still a handful of statements
+    many = [f"S:S1{k:04x}" for k in range(1000)] + ["S:S1x"]
+    store.conn.set_trace_callback(statements.append)
+    counts = store.note_counts(many)
+    store.conn.set_trace_callback(None)
+    assert counts["S:S1x"] == 2 and sum(counts.values()) == 2 and len(statements) <= 1 + 4
+    # schema version 2 added the index the OR-query needs
+    assert user_version(store.conn) == USER_SCHEMA_VERSION == 2
+    names = {r["name"] for r in store.conn.execute("PRAGMA index_list('note_targets')")}
+    assert {"nt_ref", "nt_resolved"} <= names
+
+
+def test_list_notes_fetches_targets_in_one_query(store: UserStore, clock):
+    for k in range(6):
+        store.create_note(title=f"n{k}", targets=[{"ref": f"S:S1{k}"}, {"ref": "D:P001"}])
+        clock["t"] += 1
+    statements: list[str] = []
+    store.conn.set_trace_callback(statements.append)
+    res = store.list_notes(limit=50)
+    store.conn.set_trace_callback(None)
+    assert res["total"] == 6 and all(len(n["targets"]) == 2 for n in res["rows"])
+    assert len(statements) == 3        # count, page, targets for the page
+
+
+def test_migration_from_schema_version_1(tmp_path: Path):
+    from atlas.store import db
+    path = tmp_path / "old.sqlite"
+    conn = db.connect(path, "rw")
+    conn.executescript((db.SQL_DIR / "user.sql").read_text(encoding="utf-8"))
+    conn.execute("PRAGMA user_version = 1")
+    conn.close()
+    s = UserStore.open(path)
+    try:
+        assert user_version(s.conn) == USER_SCHEMA_VERSION
+        assert "nt_resolved" in {r["name"] for r in s.conn.execute("PRAGMA index_list('note_targets')")}
+    finally:
+        s.close()
+
+
 # ---- collections ---------------------------------------------------------------------------------------------
 
 def test_collections_order(store: UserStore):

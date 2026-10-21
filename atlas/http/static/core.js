@@ -214,14 +214,18 @@ function inline(text) {
   const parts = text.split(/(`[^`]*`)/);
   return parts.map((seg, i) => {
     if (i % 2 === 1) return "<code>" + esc(seg.slice(1, -1)) + "</code>";
+    // links and [[refs]] become placeholders first, so the emphasis passes never touch an href / data-ref
+    // ('_' and '*' are common inside URLs and ids)
+    const saved = [];
+    const keep = (html) => { saved.push(html); return `\u0000${saved.length - 1}\u0000`; };
     let s = esc(seg);
-    s = s.replace(REF_RE, (_, ref) => `<a class="reflink" href="#/ref/${encodeURIComponent(ref)}" data-ref="${ref}">${ref}</a>`);
+    s = s.replace(REF_RE, (_, ref) => keep(`<a class="reflink" href="#/ref/${encodeURIComponent(ref)}" data-ref="${ref}">${ref}</a>`));
     s = s.replace(/\[([^\]]+)\]\(((?:https?:\/\/|#\/|\/)[^)\s]+)\)/g, (_, txt, url) =>
-      `<a href="${url}" ${url.startsWith("http") ? 'target="_blank" rel="noopener"' : ""}>${txt}</a>`);
+      keep(`<a href="${url}" ${url.startsWith("http") ? 'target="_blank" rel="noopener"' : ""}>${txt}</a>`));
     s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
     s = s.replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, "$1<em>$2</em>");
     s = s.replace(/(^|[^_\w])_([^_\n]+)_(?!\w)/g, "$1<em>$2</em>");
-    return s;
+    return s.replace(/\u0000(\d+)\u0000/g, (_, n) => saved[Number(n)]);
   }).join("");
 }
 

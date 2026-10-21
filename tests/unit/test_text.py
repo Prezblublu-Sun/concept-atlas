@@ -89,6 +89,17 @@ def test_power_of_ten_keeps_raw_and_value():
     assert extract_numbers("3.2 × 10^3") == {"3.2", "10^3", "1000"}
 
 
+def test_unit_superscripts_are_not_numbers():
+    # review fix: NFKC folds 'mm²' to 'mm2', which used to yield the number 2
+    assert extract_numbers("mm²") == set()
+    assert extract_numbers("an area of 12 mm² and 5 cm³") == {"12", "5"}
+    assert extract_numbers("a rate of 3 s⁻¹ and m⁴") == {"3"}
+    assert extract_numbers("Smith¹ and Jones²") == set()
+    assert extract_numbers("10³ mm²") == {"10^3", "1000"}
+    assert numbers_missing("the stiffness was 4 kN/mm²", ["4 kN/mm²"], ignore=()) == []
+    assert numbers_missing("an area of 7 mm²", ["7 mm"], ignore=()) == []
+
+
 def test_thousands_separator_only_for_groups_of_three():
     assert extract_numbers("1,2,3") == {"1", "2", "3"}
     assert extract_numbers("1,0000") == {"1", "0"}

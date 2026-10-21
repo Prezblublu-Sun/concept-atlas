@@ -91,7 +91,30 @@ def test_ellipsis_and_multiple_terminators():
 
 
 def test_segment_version_is_a_short_tag():
-    assert SEGMENT_VERSION == "seg1"
+    assert SEGMENT_VERSION == "seg2"
+
+
+# ---- caption labels (review fix: 'Fig. 2. Text' was split after '2.') ------------------------------------------
+
+@pytest.mark.parametrize("text", [
+    "Fig. 2. Micromotion versus load.",
+    "Figure 2. Micromotion versus load.",
+    "Table 3. Mean micromotion (μm) for each stem under walking and stair climbing loads.",
+    "Fig. 2a. Micromotion versus load.",
+    "Scheme 1. Synthesis route.",
+])
+def test_caption_number_at_line_start_does_not_split(text):
+    assert sentences(text) == [text]
+
+
+def test_caption_label_mid_line_still_splits_and_line_start_inside_page_is_protected():
+    assert sentences("It is shown in Fig. 3. The next sentence starts here.") == [
+        "It is shown in Fig. 3.", "The next sentence starts here."]
+    page = "Loads were applied in all configurations.\nFig. 2. Micromotion versus load.\nThe shell was modelled."
+    assert sentences(page) == ["Loads were applied in all configurations.", "Fig. 2. Micromotion versus load.",
+                               "The shell was modelled."]
+    # a bare number after a non-label word is an ordinary sentence end
+    assert sentences("The count was 2. Next sentence.") == ["The count was 2.", "Next sentence."]
 
 
 # ---- detect_heading ---------------------------------------------------------------------------------------
@@ -135,7 +158,11 @@ def test_segment_version_is_a_short_tag():
     ("References", "references"),
     ("REFERENCES", "references"),
     ("Bibliography", "references"),
-    ("Appendix A", None),
+    ("Appendix A", "appendix"),
+    ("Appendix B.", None),                        # terminal period → not a heading line
+    ("Appendix A. Supplementary data", "appendix"),
+    ("APPENDIX 1", "appendix"),
+    ("Appendices", "appendix"),
     ("Appendix", "appendix"),
     ("Supplementary material", "appendix"),
     ("Supporting Information", "appendix"),

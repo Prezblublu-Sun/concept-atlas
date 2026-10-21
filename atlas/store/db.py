@@ -6,10 +6,15 @@ Rules (Windows-proof):
 - `mode='rw'`: create if missing, `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`, `synchronous=NORMAL`.
 - `mode='ro'`: `file:...?mode=ro` URI (the file may still grow; used by the server for evidence.sqlite).
 - `mode='immutable'`: `file:...?immutable=1` (frozen build files only; never for WAL databases that still change).
-- Paths are converted to URIs with `Path.as_uri()` semantics on all platforms (drive letters, spaces, CJK).
+- Paths are converted to URIs with `Path.as_uri()` semantics on all platforms (drive letters, spaces, CJK); a UNC
+  path `\\\\server\\share\\db.sqlite` becomes `file:////server/share/db.sqlite` (empty authority — SQLite rejects any
+  other URI authority than localhost).
 - `row_factory = sqlite3.Row`; `check_same_thread=False` (callers keep one connection per thread).
 - `migrate()` executes the .sql file (CREATE … IF NOT EXISTS) and sets `PRAGMA user_version` to the file's
-  version; later versions will add `sql/migrations/<n>.sql` applied in order when user_version < n.
+  version; `sql/migrations/<n>.sql` are applied in order when user_version < n (user.sqlite: 2.sql).
+- Never VACUUM evidence.sqlite: `sentences` and `page_text` have TEXT primary keys, so VACUUM may renumber
+  their rowids, on which the external-content FTS tables are keyed. If it ever happens, run
+  `EvidenceStore.rebuild_fts()`.
 
 Connections are opened in autocommit mode (`isolation_level=None`); the stores wrap each write in an explicit
 `BEGIN IMMEDIATE … COMMIT` through `transaction()`.
@@ -18,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import urllib.parse
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -27,20 +33,29 @@ log = logging.getLogger(__name__)
 SQL_DIR = Path(__file__).with_name("sql")
 MIGRATIONS_DIR = SQL_DIR / "migrations"
 EVIDENCE_SCHEMA_VERSION = 1
-USER_SCHEMA_VERSION = 1
+USER_SCHEMA_VERSION = 2     # 2: index on note_targets.resolved_ref (migrations/2.sql)
 
 _MODES = ("rw", "ro", "immutable")
 
 
+def _is_unc(p: Path) -> bool:
+    return p.drive.startswith("\\\\") or p.drive.startswith("//")
+
+
 def file_uri(path: str | Path, mode: str = "rw") -> str:
     """`file:` URI for an absolute path (percent-encoded: drive letters, spaces and CJK are safe) plus the
-    query string for `mode`: rw → ?mode=rwc, ro → ?mode=ro, immutable → ?immutable=1."""
+    query string for `mode`: rw → ?mode=rwc, ro → ?mode=ro, immutable → ?immutable=1. UNC paths get an empty
+    authority: `file:////server/share/dir/db.sqlite`."""
     if mode not in _MODES:
         raise ValueError(f"unknown connect mode {mode!r} (expected one of {_MODES})")
     p = Path(path)
     if not p.is_absolute():
         p = p.resolve()
-    uri = p.as_uri()
+    if _is_unc(p):
+        segs = [s for s in p.as_posix().split("/") if s]
+        uri = "file:////" + "/".join(urllib.parse.quote(s, safe="") for s in segs)
+    else:
+        uri = p.as_uri()
     if mode == "rw":
         return uri + "?mode=rwc"
     if mode == "ro":

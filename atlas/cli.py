@@ -4,7 +4,7 @@ atlas init <root> [--name N] [--doc-type paper|thesis] [--pdf-dir pdf]
 atlas docs add <root> [--manifest manifest.csv] [--pattern '**/*.pdf']     register PDFs (no extraction)
 atlas docs list <root> [--q text] [--limit 50]
 atlas run ingest <root> [--reextract] [--limit N] [--doc-ids a,b] [--workers 1]
-atlas serve <root> [--host 127.0.0.1] [--port 8767]
+atlas serve <root> [--host 127.0.0.1] [--port 8770]      (a port in use is an error, exit 1)
 atlas fixture make <dir> [--seed 1]
 atlas notes export <root> <collection_id> [-o file.md]
 Exit codes: 0 ok, 1 usage/project error, 2 stage reported failures. Prints Report.summary() for stages.
@@ -198,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_notes_export(a)
         ap.print_usage(sys.stderr)
         return EXIT_USAGE
-    except (FileNotFoundError, FileExistsError, KeyError, ValueError, NotImplementedError) as e:
+    except (FileNotFoundError, FileExistsError, KeyError, ValueError, NotImplementedError, OSError) as e:
         log.debug("command failed", exc_info=True)
         print(f"error: {e}", file=sys.stderr)
         return EXIT_USAGE
