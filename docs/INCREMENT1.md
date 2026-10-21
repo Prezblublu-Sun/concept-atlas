@@ -26,7 +26,7 @@ everywhere; never `print` from library code (use `logging`); Windows paths; keep
 contract says pure. Write files with proper tools (no shell heredocs with backslashes).
 
 ## UI (service+http agent)
-Vanilla JS ES module SPA in `atlas/http/static/`: `index.html`, `app.js`, `style.css`, `i18n.json`.
+Vanilla JS ES module SPA in `atlas/http/static/`: `index.html`, `app.js` (router + shell), `core.js` (API client, i18n, helpers), `views.js` (document list, search, notes, collections), `reader.js` (page image / text reader with highlights), `editor.js` (note editor with autosave and rev conflicts), `style.css`, `i18n.json`.
 - Header: project name, phrase search box, zh/en toggle (persisted in localStorage), links: Documents / Notes / Collections.
 - Documents view: searchable list (title, year, authors, doc_id, pages, notes count) → document view.
 - Document view (reader): page list; center: rendered page PNG (`/pages/{n}.png`) with prev/next and zoom, toggle
