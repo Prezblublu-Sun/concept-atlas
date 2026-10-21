@@ -543,6 +543,6 @@ def test_empty_pages_and_whitespace_lines(dt):
     assert pages[0].text[m.cstart:m.cend] == "Department of Surgery, University of Example"
     assert m.reason == "affiliation"
     units = dt.segment("D2", pages, masks)
-    assert dt.label_sections("D2", pages, masks, units) == [SectionMark(1, 0, "front")]
+    assert dt.label_sections("D2", pages, masks, units) == [SectionMark(1, 0, "front"), SectionMark(1, 0, "other")]  # no headings → whole doc is body ("other")
     assert dt.topic_fields(units[0], pages, [SectionMark(1, 0, "front")], DocMeta()) == {
         "title": ["Title Of The Paper"], "keywords": [], "abstract": []}

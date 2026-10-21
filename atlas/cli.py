@@ -56,6 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("root")
     p.add_argument("--manifest", help="CSV with doc_id,title,year,authors,doi,venue,doc_type,file")
     p.add_argument("--pattern", default="**/*.pdf")
+    p.add_argument("--scan", action="store_true",
+                   help="also scan pdf_dir for PDFs not in the manifest (default only when there is no manifest)")
     p = docs.add_parser("list", help="list registered documents")
     p.add_argument("root")
     p.add_argument("--q", help="filter: title/authors/keywords/doc_id")
@@ -113,7 +115,8 @@ def _cmd_docs_add(a: argparse.Namespace) -> int:
     from atlas.config import load_project
     from atlas.pipeline.stages.ingest import register_documents
     proj = load_project(a.root)
-    return _print_report(register_documents(proj, manifest=a.manifest, pattern=a.pattern))
+    return _print_report(register_documents(proj, manifest=a.manifest, pattern=a.pattern,
+                                            scan=True if a.scan else None))
 
 
 def _cmd_docs_list(a: argparse.Namespace) -> int:

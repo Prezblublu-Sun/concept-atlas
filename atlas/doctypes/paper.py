@@ -346,6 +346,11 @@ class PaperDocType:
                     emit(end[0], end[1], "front")
             else:
                 emit(ln.page_no, ln.cstart, sec)
+        # Fallback: when no body heading was detected at all, the whole document must not vanish as 'front'
+        # (is_body = 0); label it 'other' instead. The mark sits at (1, 0) after the mandatory 'front' mark, and
+        # the ingest stage takes the last mark at a position. The stage reports it as 'no headings detected'.
+        if not any(m.section not in ("front", "keywords") for m in marks):
+            marks.append(SectionMark(1, 0, "other"))
         marks.sort(key=lambda m: (m.page_no, m.cstart))
         return marks
 

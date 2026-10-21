@@ -408,6 +408,8 @@ class IngestStage:
             warns.append(f"drop ratio {job.drop_ratio:.2f} > {th.max_drop_ratio:.2f}")
         if not job.sentences:
             warns.append("no sentences")
+        elif not any(m.section not in ("front", "keywords", "other") for m in job.marks):
+            warns.append("no headings detected (whole document labelled 'other')")
         try:
             prev = store.current_extraction(doc_id)
             aliases: list[tuple[str, str, str, str, float]] = []
@@ -501,9 +503,12 @@ def read_manifest(path: Path) -> list[dict]:
     return rows
 
 
-def register_documents(project: Project, manifest: str | None = None, pattern: str = "**/*.pdf") -> Report:
-    """`atlas docs add`: read manifest.csv (if present or given) and/or scan pdf_dir; add documents and files to
-    the evidence store; never extracts. Report.details = {added, updated, unchanged, missing_files}."""
+def register_documents(project: Project, manifest: str | None = None, pattern: str = "**/*.pdf",
+                       scan: bool | None = None) -> Report:
+    """`atlas docs add`: read manifest.csv (if present or given) and, when `scan` is true, also scan pdf_dir for
+    PDFs not in the manifest; add documents and files to the evidence store; never extracts. `scan` defaults to
+    True only when there is no manifest (a pdf_dir may be a large library folder that contains far more than the
+    corpus). Report.details = {added, updated, unchanged, missing_files}."""
     report = Report(stage="docs add")
     added: list[str] = []
     updated: list[str] = []
@@ -522,6 +527,8 @@ def register_documents(project: Project, manifest: str | None = None, pattern: s
             raise FileNotFoundError(f"manifest not found: {mpath}")
     elif project.manifest_path.is_file():
         mpath = project.manifest_path
+    if scan is None:
+        scan = mpath is None
 
     store = EvidenceStore.open(project.evidence_db, "rw")
     try:
@@ -580,7 +587,7 @@ def register_documents(project: Project, manifest: str | None = None, pattern: s
                     report.items_failed += 1
                     report.warnings.append(f"{doc_id}: {type(e).__name__}: {e}")
 
-        if pdf_dir.is_dir():
+        if scan and pdf_dir.is_dir():
             for path in sorted(p for p in pdf_dir.glob(pattern) if p.is_file()):
                 rel = _rel_path(project, path)
                 if rel in manifest_files:
@@ -599,7 +606,7 @@ def register_documents(project: Project, manifest: str | None = None, pattern: s
                     log.exception("registering %s failed", doc_id)
                     report.items_failed += 1
                     report.warnings.append(f"{doc_id}: {type(e).__name__}: {e}")
-        elif mpath is None:
+        elif scan and mpath is None:
             report.warnings.append(f"pdf_dir does not exist: {pdf_dir}")
     finally:
         store.close()
