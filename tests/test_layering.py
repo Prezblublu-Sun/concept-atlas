@@ -49,7 +49,7 @@ def _imports(path: Path) -> list[str]:
                 if path.name != "__init__.py":
                     pkg = pkg[:-1]
                 base = pkg[: len(pkg) - (node.level - 1)] if node.level > 1 else pkg
-                out.append(".".join(base + [node.module]))
+                out.append("atlas." + ".".join(base + [node.module]))
             else:
                 out.append(node.module)
     return out
