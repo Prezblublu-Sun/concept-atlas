@@ -181,6 +181,23 @@ class EvidenceStore:
                                  (*id_list, limit, offset)).fetchall()
         return {"rows": [self._doc_dict(r) for r in rows], "total": len(ids)}
 
+    def known_files(self) -> dict[str, str]:
+        """{rel_path: doc_id} over document_files (current files only); used by `atlas docs add` to skip PDFs that
+        are already registered."""
+        rows = self.conn.execute("SELECT rel_path, doc_id FROM document_files WHERE is_current=1").fetchall()
+        return {r["rel_path"]: r["doc_id"] for r in rows}
+
+    def max_doc_seq(self, prefix: str = "D") -> int:
+        """Largest numeric suffix among doc_ids of the form <prefix><digits> (0 when none); the next scanned
+        document gets prefix + 4-digit (seq + 1)."""
+        best = 0
+        rows = self.conn.execute("SELECT doc_id FROM documents WHERE doc_id LIKE ?", (prefix + "%",)).fetchall()
+        for r in rows:
+            tail = r["doc_id"][len(prefix):]
+            if tail.isdigit():
+                best = max(best, int(tail))
+        return best
+
     def stats(self) -> dict:
         """{documents, extractions, pages, sentences, body_sentences}"""
         c = self.conn

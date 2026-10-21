@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Concept Atlas</title>
+  <link rel="stylesheet" href="/static/style.css?v=0.1.0">
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="#/docs">
+      <span class="logo">A</span>
+      <span>
+        <div class="title" id="project-name">Concept Atlas</div>
+        <div class="sub" id="project-sub"></div>
+      </span>
+    </a>
+    <form class="search" id="search-form" role="search">
+      <input type="search" id="search-input" data-i18n-ph="search.placeholder" autocomplete="off">
+      <button class="btn primary" type="submit" data-i18n="search.button">Search</button>
+    </form>
+    <nav class="nav">
+      <a href="#/docs" data-view="docs" data-i18n="nav.docs">Documents</a>
+      <a href="#/notes" data-view="notes" data-i18n="nav.notes">Notes</a>
+      <a href="#/collections" data-view="collections" data-i18n="nav.collections">Collections</a>
+      <button class="btn small" type="button" id="lang-btn">EN</button>
+    </nav>
+  </header>
+  <main id="view"><div class="loading">…</div></main>
+  <script type="module" src="/static/app.js?v=0.1.0"></script>
+</body>
+</html>

@@ -1,0 +1,556 @@
+"""HTTP adapter + AtlasService end-to-end: a hand-built evidence/user DB (2 documents × 2 pages, a few sentences)
+plus one real PDF generated with PyMuPDF, served by atlas.http.server on a free port; every route exercised with
+urllib / http.client."""
+from __future__ import annotations
+
+import http.client
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+import fitz  # PyMuPDF
+import pytest
+
+from atlas.config import init_project
+from atlas.core.ids import extraction_id, sentence_id
+from atlas.core.schemas import DocMeta, LineMask, PageText, SentenceRow, Unit
+from atlas.http import server as http_server
+from atlas.ingest import pdf as pdf_io
+from atlas.service.api import AtlasService
+from atlas.store.evidence import EvidenceStore
+from atlas.store.user import UserStore
+
+SHA1 = "1" * 64
+SHA2 = "2" * 64
+
+P1_PAGES = {
+    1: "Stem loading study\nThe femoral stem transfers load to the calcar. Bone remodelling is governed by strain.",
+    2: "Stress shielding reduces periprosthetic bone density. Shorter stems load the metaphysis more.\n"
+       "[1] Smith J. A reference entry. J Biomech. 2019;1:1-2.",
+}
+P1_SENTS = {
+    1: [("The femoral stem transfers load to the calcar.", "introduction", True, ("mech",)),
+        ("Bone remodelling is governed by strain.", "introduction", True, ("mech",))],
+    2: [("Stress shielding reduces periprosthetic bone density.", "results", True, ("result",)),
+        ("Shorter stems load the metaphysis more.", "results", True, ("cmp",)),
+        ("[1] Smith J. A reference entry. J Biomech. 2019;1:1-2.", "references", False, ())],
+}
+P2_PAGES = {
+    1: "Porous coatings\nA porous coating increases osseointegration. The threshold was 150 μm.",
+    2: "Micromotion above the threshold leads to fibrous tissue. The femoral stem design matters.",
+}
+P2_SENTS = {
+    1: [("A porous coating increases osseointegration.", "abstract", True, ("mech",)),
+        ("The threshold was 150 μm.", "abstract", True, ("quant",))],
+    2: [("Micromotion above the threshold leads to fibrous tissue.", "discussion", True, ("mech",)),
+        ("The femoral stem design matters.", "discussion", True, ())],
+}
+
+
+def _rows(doc_id: str, ext_id: str, pages: dict[int, str], sents: dict) -> list[SentenceRow]:
+    out, seq = [], 0
+    for page_no, text in pages.items():
+        for s, section, body, tags in sents[page_no]:
+            cs = text.index(s)
+            out.append(SentenceRow(sid=sentence_id(doc_id, s), doc_id=doc_id, text=s, ext_id=ext_id, seq=seq,
+                                   unit_id=doc_id, page_no=page_no, cstart=cs, cend=cs + len(s), section=section,
+                                   is_body=body, tags=tags, flags=()))
+            seq += 1
+    return out
+
+
+def _write_pdf(path: Path, pages: dict[int, str]) -> None:
+    doc = fitz.open()
+    for _, text in sorted(pages.items()):
+        page = doc.new_page(width=595, height=842)
+        y = 72
+        for line in text.split("\n"):
+            page.insert_text((60, y), line, fontsize=9, fontname="helv")
+            y += 16
+    doc.save(str(path))
+    doc.close()
+
+
+def _fallback_render(path, page_no, zoom=1.6, highlight=None, spans=None):
+    """Used only while atlas.ingest.pdf.render_page is still the ingest agent's stub."""
+    doc = fitz.open(str(path))
+    pg = doc[int(page_no) - 1]
+    rects = pg.search_for(highlight) if highlight else []
+    if spans and not rects:
+        text = pg.get_text("text").replace("\r", "").replace("\x00", "")
+        for a, b in spans:
+            rects += pg.search_for(text[a:b].strip())
+    for r in rects:
+        pg.add_highlight_annot(r)
+    pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom), annots=True)
+    info = {"page": int(page_no), "pages": doc.page_count, "hits": len(rects),
+            "hit_y": (min(r.y0 for r in rects) / pg.rect.height) if rects else None}
+    png = pix.tobytes("png")
+    doc.close()
+    return png, info
+
+
+@pytest.fixture(scope="module")
+def served(tmp_path_factory):
+    root = tmp_path_factory.mktemp("atlas proj 测试")
+    project = init_project(root / "proj", name="HTTP test project")
+    project.pdf_dir.mkdir(parents=True, exist_ok=True)
+    _write_pdf(project.pdf_dir / "p001.pdf", P1_PAGES)
+
+    ev = EvidenceStore.open(project.evidence_db)
+    ev.add_document("P001", "paper", "manifest", project.pdf_dir / "p001.pdf", "p001.pdf", SHA1,
+                    DocMeta(title="Stem loading study", year=2021, authors="Smith J; Li W", doi="10.1000/stem.1",
+                            venue="J Biomech", keywords="stem; calcar"))
+    ev.add_document("P002", "paper", "manifest", project.pdf_dir / "missing.pdf", "missing.pdf", SHA2,
+                    DocMeta(title="Porous coatings and micromotion", year=2019, authors="Wang Q", venue="Bone"))
+    for doc_id, sha, pages, sents in (("P001", SHA1, P1_PAGES, P1_SENTS), ("P002", SHA2, P2_PAGES, P2_SENTS)):
+        ext = extraction_id(doc_id, sha, "test")
+        pt = [PageText(n, t, 595.0, 842.0) for n, t in sorted(pages.items())]
+        ev.add_extraction(ext_id=ext, doc_id=doc_id, pdf_sha256=sha, extractor_version="test", doc_type="paper",
+                          pages=pt, masks=[LineMask(1, 0, pages[1].index("\n"), "header_footer")],
+                          units=[Unit(doc_id, doc_id, "document", 0, None, 1, 2)],
+                          sentences=_rows(doc_id, ext, pages, sents), text_ratio=0.9, drop_ratio=0.05)
+    ev.close()
+    UserStore.open(project.user_db).close()
+
+    mp = pytest.MonkeyPatch()
+    try:
+        pdf_io.render_page(str(project.pdf_dir / "p001.pdf"), 1)
+    except NotImplementedError:
+        mp.setattr(pdf_io, "render_page", _fallback_render)
+
+    service = AtlasService(project)
+    srv, thread = http_server.run_in_thread(service, "127.0.0.1", 0)
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    yield {"base": base, "project": project, "service": service}
+    srv.shutdown()
+    srv.server_close()
+    thread.join(timeout=5)
+    mp.undo()
+
+
+def _req(base: str, method: str, path: str, body=None, raw: bool = False):
+    data = None
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(base + path, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            payload = r.read()
+            status, hdrs = r.status, dict(r.headers)
+    except urllib.error.HTTPError as e:
+        payload = e.read()
+        status, hdrs = e.code, dict(e.headers)
+    if raw:
+        return status, hdrs, payload
+    try:
+        return status, hdrs, json.loads(payload.decode("utf-8"))
+    except ValueError:
+        return status, hdrs, payload
+
+
+@pytest.fixture
+def api(served):
+    base = served["base"]
+
+    def call(method, path, body=None, raw=False):
+        return _req(base, method, "/api/v1/" + path.lstrip("/"), body, raw)
+    call.base = base
+    call.page = lambda path: _req(base, "GET", path, raw=True)
+    return call
+
+
+def _sid(doc_id: str, text: str) -> str:
+    return sentence_id(doc_id, text)
+
+
+# ---- meta -------------------------------------------------------------------------------------------------
+def test_info_and_headers(api):
+    st, hd, body = api("GET", "info")
+    assert st == 200
+    assert body["project"] == "HTTP test project"
+    assert body["build"] == "evidence"
+    assert body["stats"]["documents"] == 2 and body["stats"]["sentences"] == 9
+    assert body["version"]
+    assert hd["X-Atlas-Build"] == "evidence"
+    assert hd["Cache-Control"] == "no-cache"
+    assert hd["Content-Type"].startswith("application/json")
+
+
+def test_i18n(api):
+    st, _, body = api("GET", "i18n")
+    assert st == 200
+    assert body["ui"]["nav.docs"] == {"zh": "文献", "en": "Documents"}
+    assert body["sections"]["abstract"] == {"zh": "摘要", "en": "Abstract"}
+    assert body["tags"]["quant"]["en"] == "Quantitative" and body["tags"]["quant"]["zh"]
+    assert body["kinds"]["S"]["en"] == "Sentence"
+
+
+# ---- documents and reading --------------------------------------------------------------------------------
+def test_docs_list_and_filter(api):
+    st, _, body = api("GET", "docs")
+    assert st == 200 and body["total"] == 2
+    ids = [r["doc_id"] for r in body["rows"]]
+    assert ids == ["P001", "P002"]  # year desc
+    assert all("notes_count" in r for r in body["rows"])
+    st, _, body = api("GET", "docs?q=porous")
+    assert st == 200 and [r["doc_id"] for r in body["rows"]] == ["P002"]
+    st, _, body = api("GET", "docs?q=P00&limit=1&offset=1")
+    assert st == 200 and body["total"] == 2 and len(body["rows"]) == 1
+    st, _, body = api("GET", "docs?limit=abc")
+    assert st == 400 and "limit" in body["error"]
+
+
+def test_get_doc(api):
+    st, _, d = api("GET", "docs/P001")
+    assert st == 200
+    assert d["title"] == "Stem loading study" and d["doi"] == "10.1000/stem.1"
+    assert [p["page_no"] for p in d["pages"]] == [1, 2]
+    assert [p["n_sentences"] for p in d["pages"]] == [2, 3]
+    assert d["notes_count"] == 0 and d["has_pdf"] is True
+    st, _, d = api("GET", "docs/P002")
+    assert st == 200 and d["has_pdf"] is False
+    st, _, body = api("GET", "docs/NOPE")
+    assert st == 404 and "NOPE" in body["error"]
+
+
+def test_page_json(api):
+    st, _, p = api("GET", "docs/P001/pages/2")
+    assert st == 200
+    assert p["page_no"] == 2 and p["n_pages"] == 2 and p["title"] == "Stem loading study"
+    assert p["text"] == P1_PAGES[2]
+    sents = p["sentences"]
+    assert len(sents) == 3
+    assert sents[0]["text"] == "Stress shielding reduces periprosthetic bone density."
+    assert sents[0]["tags"] == ["result"] and sents[0]["is_body"] is True and sents[0]["notes"] == 0
+    assert sents[2]["section"] == "references" and sents[2]["is_body"] is False
+    assert api("GET", "docs/P001/pages/9")[0] == 404
+    assert api("GET", "docs/P001/pages/abc")[0] == 400
+    assert api("GET", "docs/NOPE/pages/1")[0] == 404
+
+
+def test_page_png(api):
+    st, hd, png = api("GET", "docs/P001/pages/1.png?hl=femoral%20stem", raw=True)
+    assert st == 200, png[:200]
+    assert hd["Content-Type"] == "image/png" and png[:8] == b"\x89PNG\r\n\x1a\n"
+    assert hd["Cache-Control"] == "max-age=600"
+    assert hd["X-Atlas-Build"] == "evidence"
+    assert hd["X-Page"] == "1" and hd["X-Pages"] == "2"
+    assert int(hd["X-Hits"]) >= 1
+    assert 0.0 < float(hd["X-Hit-Y"]) < 1.0
+    assert "X-Hit-Y" in hd["Access-Control-Expose-Headers"]
+    # no highlight → no hits, empty X-Hit-Y
+    st, hd, _ = api("GET", "docs/P001/pages/2.png", raw=True)
+    assert st == 200 and hd["X-Hits"] == "0" and hd["X-Hit-Y"] == ""
+    # spans + zoom
+    s = P1_PAGES[1].index("Bone remodelling")
+    st, hd, small = api("GET", f"docs/P001/pages/1.png?spans={s}-{s + 39}&zoom=0.5", raw=True)
+    assert st == 200 and len(small) < len(png)
+    assert api("GET", "docs/P001/pages/1.png?zoom=x")[0] == 400
+    assert api("GET", "docs/P001/pages/1.png?spans=a-b")[0] == 400
+    assert api("GET", "docs/P001/pages/7.png")[0] == 404
+    assert api("GET", "docs/P002/pages/1.png")[0] == 404   # no PDF file
+    assert api("GET", "docs/NOPE/pages/1.png")[0] == 404
+
+
+def test_pdf_route(api, served):
+    st, hd, data = api("GET", "pdf/P001", raw=True)
+    assert st == 200 and hd["Content-Type"] == "application/pdf" and data[:5] == b"%PDF-"
+    assert hd["Content-Disposition"].startswith("inline;") and "P001.pdf" in hd["Content-Disposition"]
+    assert hd["Cache-Control"] == "max-age=600"
+    assert len(data) == (served["project"].pdf_dir / "p001.pdf").stat().st_size
+    st, hd, _ = api("GET", "pdf/P001?download=1", raw=True)
+    assert st == 200 and hd["Content-Disposition"].startswith("attachment;")
+    assert api("GET", "pdf/P002")[0] == 404
+    assert api("GET", "pdf/NOPE")[0] == 404
+
+
+def test_search(api):
+    st, _, res = api("GET", "search?phrase=femoral%20stem")
+    assert st == 200
+    assert res["total"] == 2 and res["documents"] == 2 and res["phrase"] == "femoral stem"
+    for r in res["rows"]:
+        assert r["ref"] == "S:" + r["sid"] and r["kind"] == "S" and r["status"] == "live"
+        assert "<mark>" in r["snippet"] and r["title"] and r["page"] in (1, 2)
+    st, _, res = api("GET", "docs/P001/search?phrase=femoral%20stem")
+    assert st == 200 and res["total"] == 1 and res["rows"][0]["doc_id"] == "P001" and res["doc_id"] == "P001"
+    st, _, res = api("GET", "search?phrase=no%20such%20phrase%20here")
+    assert st == 200 and res["total"] == 0 and res["rows"] == []
+    st, _, res = api("GET", "search?phrase=")
+    assert st == 200 and res["total"] == 0
+    st, _, body = api("GET", "search")
+    assert st == 400 and "phrase" in body["error"]
+    st, _, res = api("GET", "search?phrase=stem&limit=1&offset=1")
+    assert st == 200 and len(res["rows"]) == 1 and res["total"] >= 2
+
+
+def test_sentence(api):
+    sid = _sid("P001", "Bone remodelling is governed by strain.")
+    st, _, s = api("GET", f"sentences/{sid}")
+    assert st == 200
+    assert s["ref"] == f"S:{sid}" and s["doc_id"] == "P001" and s["page"] == 1 and s["title"] == "Stem loading study"
+    assert s["text"] == "Bone remodelling is governed by strain." and s["status"] == "live"
+    assert s["before"] == ["The femoral stem transfers load to the calcar."]
+    assert s["after"] == ["Stress shielding reduces periprosthetic bone density."]
+    assert s["notes"] == [] and s["tags"] == ["mech"] and s["section"] == "introduction"
+    st, _, s0 = api("GET", f"sentences/{sid}?context=0")
+    assert st == 200 and s0["before"] == [] and s0["after"] == []
+    assert api("GET", "sentences/S1deadbeefdeadbeef")[0] == 404
+
+
+def test_resolve(api):
+    sid = _sid("P002", "The threshold was 150 μm.")
+    st, _, r = api("GET", "resolve?ref=S:" + sid)
+    assert st == 200 and r["status"] == "live" and r["doc_id"] == "P002" and r["text"] == "The threshold was 150 μm."
+    assert r["page"] == 1 and r["kind"] == "S"
+    st, _, r = api("GET", "resolve?ref=D:P001")
+    assert st == 200 and r["status"] == "live" and r["title"] == "Stem loading study" and r["kind"] == "D"
+    assert r["text"] == "Stem loading study" and r["doc_id"] == "P001"
+    st, _, r = api("GET", "resolve?ref=U:P001/methods")
+    assert st == 200 and r["status"] == "live" and r["unit_id"] == "P001/methods"
+    st, _, r = api("GET", "resolve?ref=S:S1nope")
+    assert st == 200 and r["status"] == "orphan"
+    st, _, r = api("GET", "resolve?ref=N:N_nope")
+    assert st == 200 and r["status"] == "orphan"
+    st, _, r = api("GET", "resolve?ref=C:some-concept")
+    assert st == 200 and r["status"] == "orphan" and "unsupported_kind" in r["flags"]
+    st, _, body = api("GET", "resolve?ref=garbage")
+    assert st == 400 and "ref" in body["error"]
+    assert api("GET", "resolve")[0] == 400
+
+
+# ---- notes ------------------------------------------------------------------------------------------------
+def test_notes_crud_conflict_and_lookup(api):
+    sid = _sid("P001", "The femoral stem transfers load to the calcar.")
+    st, hd, note = api("POST", "notes", {"title": "Calcar", "body_md": "Load path [[D:P002]]", "tags": ["Mech", "load"],
+                                          "targets": [f"S:{sid}", "D:P001"]})
+    assert st == 201, note
+    nid = note["note_id"]
+    assert nid.startswith("N_") and note["rev"] == 1 and note["tags"] == ["mech", "load"]
+    assert note["links"] == ["D:P002"]
+    tg = {t["ref"]: t for t in note["targets"]}
+    assert tg[f"S:{sid}"]["snapshot_text"] == "The femoral stem transfers load to the calcar."
+    assert tg[f"S:{sid}"]["snapshot_json"]["page"] == 1 and tg[f"S:{sid}"]["status"] == "live"
+    assert tg["D:P001"]["snapshot_text"] == "Stem loading study"
+
+    st, _, got = api("GET", f"notes/{nid}")
+    assert st == 200 and got["body_md"] == "Load path [[D:P002]]"
+
+    # page/doc now report the note
+    st, _, p = api("GET", "docs/P001/pages/1")
+    assert [s["notes"] for s in p["sentences"]] == [1, 0]
+    assert api("GET", "docs/P001")[2]["notes_count"] == 1
+    assert api("GET", "docs")[2]["rows"][0]["notes_count"] == 1
+    st, _, s = api("GET", f"sentences/{sid}")
+    assert [n["note_id"] for n in s["notes"]] == [nid]
+
+    # update with the right rev
+    st, _, upd = api("PUT", f"notes/{nid}", {"rev": 1, "body_md": "Load path v2 [[S:%s]]" % sid, "explicit": True})
+    assert st == 200 and upd["note"]["rev"] == 2 and upd["note"]["links"] == [f"S:{sid}"]
+    assert upd["note"]["title"] == "Calcar"  # unchanged fields kept
+    # stale rev → 409 with the server copy
+    st, _, conflict = api("PUT", f"notes/{nid}", {"rev": 1, "body_md": "stale write"})
+    assert st == 409 and conflict["conflict"] is True and conflict["server"]["rev"] == 2
+    assert conflict["server"]["body_md"].startswith("Load path v2")
+    # rev missing → 400
+    assert api("PUT", f"notes/{nid}", {"body_md": "x"})[0] == 400
+    assert api("PUT", "notes/N_nope", {"rev": 1, "body_md": "x"})[0] == 404
+
+    # lookups
+    st, _, rows = api("GET", f"notes/for?ref=S:{sid}")
+    assert st == 200 and [n["note_id"] for n in rows] == [nid]
+    assert api("GET", "notes/for?ref=D:P001")[2][0]["note_id"] == nid
+    assert api("GET", "notes/for?ref=D:P002")[2] == []  # link removed in rev 2
+    assert api("GET", "notes/for?ref=bad")[0] == 400
+    st, _, lst = api("GET", "notes?q=calcar")
+    assert st == 200 and lst["total"] == 1 and lst["rows"][0]["note_id"] == nid and "excerpt" in lst["rows"][0]
+    assert api("GET", "notes?tag=mech")[2]["total"] == 1
+    assert api("GET", "notes?tag=nothing")[2]["total"] == 0
+    st, _, hist = api("GET", f"notes/{nid}/history")
+    assert st == 200
+    assert {(h["rev"], h["reason"]) for h in hist} >= {(1, "explicit"), (2, "explicit"), (1, "conflict")}
+    assert [h for h in hist if h["reason"] == "conflict"][0]["body_md"] == "stale write"
+    assert api("GET", "notes/N_nope/history")[0] == 404
+
+    # delete
+    st, _, d = api("DELETE", f"notes/{nid}")
+    assert st == 200 and d == {"deleted": nid}
+    assert api("GET", f"notes/{nid}")[0] == 404
+    assert api("DELETE", f"notes/{nid}")[0] == 404
+    assert api("GET", f"notes/for?ref=S:{sid}")[2] == []
+
+
+def test_note_without_targets_and_bad_bodies(api):
+    st, _, note = api("POST", "notes", {"title": "Free", "body_md": "standalone"})
+    assert st == 201 and note["targets"] == [] and note["tags"] == []
+    assert api("POST", "notes", {"targets": ["nonsense"]})[0] == 400
+    api("DELETE", f"notes/{note['note_id']}")
+
+
+# ---- collections ------------------------------------------------------------------------------------------
+def test_collections_items_and_export(api):
+    assert api("POST", "collections", {"name": "   "})[0] == 400
+    st, _, coll = api("POST", "collections", {"name": "Calcar loading", "description": "Evidence on calcar load"})
+    assert st == 201 and coll["coll_id"].startswith("K_") and coll["items"] == []
+    cid = coll["coll_id"]
+    st, _, lst = api("GET", "collections")
+    assert st == 200 and [c["coll_id"] for c in lst] == [cid] and lst[0]["n_items"] == 0
+
+    sid1 = _sid("P001", "The femoral stem transfers load to the calcar.")
+    sid2 = _sid("P002", "Micromotion above the threshold leads to fibrous tissue.")
+    st, _, i1 = api("POST", f"collections/{cid}/items", {"ref": f"S:{sid1}", "comment_md": "Primary load path."})
+    assert st == 201 and i1["item_id"].startswith("KI_") and i1["snapshot"]["doc_id"] == "P001"
+    assert i1["snapshot"]["text"] == "The femoral stem transfers load to the calcar." and i1["seq"] == 1.0
+    st, _, i2 = api("POST", f"collections/{cid}/items", {"ref": f"S:{sid2}"})
+    assert st == 201 and i2["seq"] == 2.0
+    st, _, i3 = api("POST", f"collections/{cid}/items", {"comment_md": "Free-standing remark."})
+    assert st == 201 and i3["ref"] is None and i3["snapshot"] is None
+    st, _, i4 = api("POST", f"collections/{cid}/items", {"ref": "D:P001", "after_item": i1["item_id"]})
+    assert st == 201 and 1.0 < i4["seq"] < 2.0
+    assert api("POST", f"collections/{cid}/items", {"ref": "S:x", "after_item": "KI_nope"})[0] == 404
+    assert api("POST", "collections/K_nope/items", {"comment_md": "x"})[0] == 404
+
+    st, _, got = api("GET", f"collections/{cid}")
+    assert st == 200 and [i["item_id"] for i in got["items"]] == [i1["item_id"], i4["item_id"], i2["item_id"], i3["item_id"]]
+
+    # reorder (move the free comment to the top) and edit a comment
+    st, _, upd = api("PUT", f"collections/items/{i3['item_id']}", {"seq": 0.5, "comment_md": "Edited remark."})
+    assert st == 200 and upd["seq"] == 0.5 and upd["comment_md"] == "Edited remark."
+    got = api("GET", f"collections/{cid}")[2]
+    assert [i["item_id"] for i in got["items"]][0] == i3["item_id"]
+    assert api("PUT", "collections/items/KI_nope", {"seq": 1})[0] == 404
+
+    # export
+    st, hd, md = api("GET", f"collections/{cid}/export.md", raw=True)
+    assert st == 200 and hd["Content-Type"].startswith("text/markdown")
+    assert hd["Content-Disposition"].startswith("inline;")
+    text = md.decode("utf-8")
+    assert text.startswith("# Calcar loading\n\nEvidence on calcar load\n")
+    assert "> The femoral stem transfers load to the calcar." in text
+    assert "[P001 p.1] [1]" in text and "[P002 p.2] [2]" in text
+    assert "   Edited remark." in text and "Primary load path." in text
+    ref_section = text.split("## References", 1)[1]
+    assert "1. Smith J; Li W (2021) Stem loading study. J Biomech. [10.1000/stem.1](https://doi.org/10.1000/stem.1) `P001`" in ref_section
+    assert "2. Wang Q (2019) Porous coatings and micromotion. Bone. `P002`" in ref_section
+    st, hd, _ = api("GET", f"collections/{cid}/export.md?download=1", raw=True)
+    assert st == 200 and hd["Content-Disposition"].startswith("attachment;")
+    assert api("GET", "collections/K_nope/export.md")[0] == 404
+
+    # remove
+    st, _, r = api("DELETE", f"collections/items/{i2['item_id']}")
+    assert st == 200 and r == {"removed": i2["item_id"]}
+    assert len(api("GET", f"collections/{cid}")[2]["items"]) == 3
+    assert api("DELETE", "collections/items/KI_nope")[0] == 404
+    assert api("GET", "collections/K_nope")[0] == 404
+
+
+# ---- static, errors, limits -------------------------------------------------------------------------------
+def test_static_files(api):
+    st, hd, body = api.page("/")
+    assert st == 200 and hd["Content-Type"] == "text/html; charset=utf-8" and b'id="view"' in body
+    assert hd["Cache-Control"] == "no-cache" and hd["X-Atlas-Build"] == "evidence"
+    st, hd, body = api.page("/static/app.js?v=0.1.0")
+    assert st == 200 and hd["Content-Type"] == "text/javascript; charset=utf-8" and b"import" in body
+    st, hd, _ = api.page("/app.js")
+    assert st == 200 and hd["Content-Type"] == "text/javascript; charset=utf-8"
+    st, hd, body = api.page("/static/i18n.json")
+    assert st == 200 and hd["Content-Type"] == "application/json; charset=utf-8"
+    data = json.loads(body.decode("utf-8"))
+    assert all(set(v) == {"zh", "en"} for v in data.values())
+    st, hd, _ = api.page("/static/style.css")
+    assert st == 200 and hd["Content-Type"] == "text/css; charset=utf-8"
+    for mod in ("core.js", "editor.js", "reader.js", "views.js"):
+        assert api.page("/static/" + mod)[0] == 200
+    assert api.page("/nope.css")[0] == 404
+    assert api.page("/static/../server.py")[0] == 404
+    assert api.page("/static/..%2Fserver.py")[0] == 404
+    assert http_server.MIME[".mjs"].startswith("text/javascript")
+    assert http_server.MIME[".wasm"] == "application/wasm"
+    assert http_server.MIME[".woff2"] == "font/woff2"
+
+
+def test_spa_has_no_inline_handlers():
+    static = Path(http_server.STATIC_DIR)
+    html = (static / "index.html").read_text(encoding="utf-8")
+    assert " on" not in html.lower().replace(" one", "")  # no onclick= etc.
+    assert "javascript:" not in html
+    for js in static.glob("*.js"):
+        src = js.read_text(encoding="utf-8")
+        assert "eval(" not in src and "new Function" not in src, js.name
+
+
+def test_errors_methods_and_body_limits(api):
+    st, hd, body = api("GET", "nothing/here")
+    assert st == 404 and body["error"] and hd["Content-Type"].startswith("application/json")
+    st, _, body = api("DELETE", "info")
+    assert st == 405
+    st, _, body = api("POST", "collections", {"name": "x", "description": ["not", "a", "string"]})
+    assert st in (201, 400, 500)  # the store coerces or rejects; the adapter must answer JSON either way
+    assert "error" in body or "coll_id" in body
+    # malformed JSON
+    req = urllib.request.Request(api.base + "/api/v1/collections", data=b"{not json", method="POST",
+                                 headers={"Content-Type": "application/json"})
+    with pytest.raises(urllib.error.HTTPError) as ei:
+        urllib.request.urlopen(req, timeout=10)
+    assert ei.value.code == 400
+    # a JSON array is not an object
+    req = urllib.request.Request(api.base + "/api/v1/collections", data=b"[1,2]", method="POST",
+                                 headers={"Content-Type": "application/json"})
+    with pytest.raises(urllib.error.HTTPError) as ei:
+        urllib.request.urlopen(req, timeout=10)
+    assert ei.value.code == 400
+    # body cap: announce 21 MB, send nothing → 413 before any byte is read
+    host, port = api.base[len("http://"):].split(":")
+    conn = http.client.HTTPConnection(host, int(port), timeout=10)
+    conn.putrequest("POST", "/api/v1/notes")
+    conn.putheader("Content-Type", "application/json")
+    conn.putheader("Content-Length", str(21 * 1024 * 1024))
+    conn.endheaders()
+    resp = conn.getresponse()
+    assert resp.status == 413
+    assert json.loads(resp.read().decode("utf-8"))["error"]
+    conn.close()
+
+
+def test_head_and_unicode_paths(api):
+    req = urllib.request.Request(api.base + "/api/v1/info", method="HEAD")
+    with urllib.request.urlopen(req, timeout=10) as r:
+        assert r.status == 200 and r.read() == b"" and int(r.headers["Content-Length"]) > 0
+    st, _, res = api("GET", "search?phrase=" + urllib.parse.quote("150 μm"))
+    assert st == 200 and res["total"] == 1
+
+
+def test_service_thread_locality(served):
+    import threading
+    svc = served["service"]
+    seen = {}
+
+    def worker(name):
+        ev, us = svc.evidence(), svc.user()
+        assert svc.evidence() is ev and svc.user() is us  # cached within the thread
+        seen[name] = (ev, us)  # keep them alive so the objects (and ids) cannot be recycled
+        svc.close()
+
+    ts = [threading.Thread(target=worker, args=(i,)) for i in range(3)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert len({id(v[0]) for v in seen.values()}) == 3 and len({id(v[1]) for v in seen.values()}) == 3
+    assert all(v[0].conn is not seen[0][0].conn for k, v in seen.items() if k != 0)
+
+
+def test_serve_log_setup(served):
+    path = http_server.setup_logging(served["project"])
+    assert path.name == "serve.log" and path.parent == served["project"].logs_dir
+    assert http_server.setup_logging(served["project"]) == path  # idempotent, one handler
+    import logging
+    handlers = [h for h in logging.getLogger("atlas").handlers
+                if isinstance(h, logging.handlers.RotatingFileHandler) and Path(h.baseFilename) == path]
+    assert len(handlers) == 1 and handlers[0].maxBytes == 5 * 1024 * 1024 and handlers[0].backupCount == 3
+    logging.getLogger("atlas").removeHandler(handlers[0])
+    handlers[0].close()

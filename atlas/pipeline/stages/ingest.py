@@ -24,11 +24,284 @@ Manifest: CSV with columns doc_id,title,year,authors,doi,venue,doc_type,file (fi
 not in the manifest but present in pdf_dir get doc_id 'D' + 4-digit sequence (persisted in the documents table,
 so re-running assigns the same ids) and meta from pdf_metadata(). `atlas docs add` registers; `atlas run ingest`
 extracts. The stage logs one line per document to work/logs/ingest.log and returns a Report.
+
+Refinement of step 5 (PDF text has no blank lines between blocks, so a heading would otherwise merge into the
+first sentence of its section): every SectionMark except the implicit (1, 0, 'front') is a hard sentence
+boundary at the mark's offset and at the end of that line; the heading line therefore becomes its own (short,
+flagged) sentence. A masked line leaves its newline behind, so the lines around a mask stay separate.
 """
 from __future__ import annotations
 
+import csv
+import logging
+import re
+from bisect import bisect_right
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import yaml
+
 from atlas.config import Project
+from atlas.core.ids import canonical_json, extraction_id, norm, sentence_id, text_sha256
+from atlas.core.schemas import BODY_SECTIONS, DocMeta, LineMask, PageText, SectionMark, SentenceRow, Unit
+from atlas.core.segment import SEGMENT_VERSION, garbage_flags, split_sentences, tag_sentence
+from atlas.doctypes import get_doctype
+from atlas.ingest.pdf import extract_pages, extractor_tag, pdf_metadata, sha256_file, text_ratio
 from atlas.pipeline.runner import Report
+from atlas.store.db import transaction
+from atlas.store.evidence import EvidenceStore
+
+log = logging.getLogger(__name__)
+
+MANIFEST_COLUMNS = ("doc_id", "title", "year", "authors", "doi", "venue", "doc_type", "file")
+SCAN_ID_PREFIX = "D"
+SCAN_ID_WIDTH = 4
+ALIAS_MIN_OVERLAP = 0.5
+UNITS_OVERRIDE_FILE = "units_override.yaml"
+INGEST_LOG = "ingest.log"
+_FILE_LOGGER = "atlas.ingest.file"
+
+
+# ---- pure helpers (page → sentences) --------------------------------------------------------------------------
+
+def clean_page_text(text: str, masks: Sequence[LineMask]) -> tuple[str, list[int], list[int]]:
+    """Remove the masked spans of one page. Returns (cleaned, to_orig, to_clean): to_orig[i] is the original
+    offset of cleaned[i]; to_clean[j] (len(text)+1 entries) is the cleaned offset at which original offset j
+    lands (a masked char maps to the position of the next kept char)."""
+    n = len(text)
+    kept: list[str] = []
+    to_orig: list[int] = []
+    to_clean: list[int] = [0] * (n + 1)
+    pos = 0
+    for m in sorted(masks, key=lambda m: (m.cstart, m.cend)):
+        a, b = max(pos, min(m.cstart, n)), max(pos, min(m.cend, n))
+        if a > pos:
+            seg = text[pos:a]
+            base = len(to_orig)
+            kept.append(seg)
+            to_orig.extend(range(pos, a))
+            for j in range(pos, a):
+                to_clean[j] = base + (j - pos)
+            pos = a
+        if b > pos:
+            c = len(to_orig)
+            for j in range(pos, b):
+                to_clean[j] = c
+            pos = b
+    if pos < n:
+        seg = text[pos:n]
+        base = len(to_orig)
+        kept.append(seg)
+        to_orig.extend(range(pos, n))
+        for j in range(pos, n):
+            to_clean[j] = base + (j - pos)
+    to_clean[n] = len(to_orig)
+    return "".join(kept), to_orig, to_clean
+
+
+def _line_end(text: str, pos: int) -> int:
+    nl = text.find("\n", pos)
+    return len(text) if nl < 0 else nl
+
+
+def page_sentence_spans(page: PageText, masks: Sequence[LineMask], marks: Sequence[SectionMark],
+                        min_chars: int = 3) -> list[tuple[int, int, str]]:
+    """(cstart, cend, text) of the sentences of one page in reading order; offsets index into page.text, text is
+    the cleaned (mask-free) slice. Section marks on the page are hard boundaries (see the module docstring)."""
+    text = page.text
+    page_masks = [m for m in masks if m.page_no == page.page_no]
+    cleaned, to_orig, to_clean = clean_page_text(text, page_masks)
+    if not cleaned.strip():
+        return []
+    bounds: set[int] = {0, len(cleaned)}
+    heading_segs: set[tuple[int, int]] = set()
+    for m in marks:
+        if m.page_no != page.page_no or (m.page_no == 1 and m.cstart == 0):
+            continue
+        if 0 < m.cstart < len(text):
+            s, e = to_clean[m.cstart], to_clean[_line_end(text, m.cstart)]
+            bounds.update((s, e))
+            heading_segs.add((s, e))
+    cuts = sorted(bounds)
+    out: list[tuple[int, int, str]] = []
+    for s, e in zip(cuts, cuts[1:]):
+        if e <= s:
+            continue
+        if (s, e) in heading_segs:
+            # the heading (or 'Keywords:') line itself: one sentence, never split at its numbering ('1.')
+            a, b = s, e
+            while a < b and cleaned[a].isspace():
+                a += 1
+            while b > a and cleaned[b - 1].isspace():
+                b -= 1
+            spans = [(a - s, b - s)] if b - a >= min_chars else []
+        else:
+            spans = split_sentences(cleaned[s:e], min_chars)
+        for a, b in spans:
+            a, b = s + a, s + b
+            out.append((to_orig[a], to_orig[b - 1] + 1, cleaned[a:b]))
+    return out
+
+
+class _MarkIndex:
+    def __init__(self, marks: Sequence[SectionMark]):
+        ms = sorted(marks, key=lambda m: (m.page_no, m.cstart))
+        self.keys = [(m.page_no, m.cstart) for m in ms]
+        self.sections = [m.section for m in ms]
+
+    def section_at(self, page_no: int, cstart: int) -> str:
+        i = bisect_right(self.keys, (page_no, cstart)) - 1
+        return self.sections[i] if i >= 0 else "front"
+
+
+def _unit_for(units: Sequence[Unit], page_no: int, doc_id: str) -> str:
+    for u in units:
+        if u.kind == "chapter" and u.page_from <= page_no <= u.page_to:
+            return u.unit_id
+    for u in units:
+        if u.kind == "document":
+            return u.unit_id
+    return doc_id
+
+
+def build_sentences(doc_id: str, ext_id: str, pages: Sequence[PageText], masks: Sequence[LineMask],
+                    units: Sequence[Unit], marks: Sequence[SectionMark], min_chars: int = 3) -> list[SentenceRow]:
+    """Steps 5–6 of the module docstring for a whole document (pure)."""
+    index = _MarkIndex(marks)
+    rows: list[SentenceRow] = []
+    seen: dict[str, int] = {}
+    seq = 0
+    for page in sorted(pages, key=lambda p: p.page_no):
+        unit = _unit_for(units, page.page_no, doc_id)
+        for cstart, cend, text in page_sentence_spans(page, masks, marks, min_chars):
+            key = norm(text)
+            k = seen.get(key, 0)
+            seen[key] = k + 1
+            section = index.section_at(page.page_no, cstart)
+            rows.append(SentenceRow(
+                sid=sentence_id(doc_id, text, k), doc_id=doc_id, text=text, ext_id=ext_id, seq=seq, unit_id=unit,
+                page_no=page.page_no, cstart=cstart, cend=cend, section=section,
+                is_body=section in BODY_SECTIONS, tags=tuple(tag_sentence(text)),
+                flags=tuple(garbage_flags(text))))
+            seq += 1
+    return rows
+
+
+def compute_aliases(old: Sequence[SentenceRow], new: Sequence[SentenceRow], from_ext: str, to_ext: str,
+                    min_overlap: float = ALIAS_MIN_OVERLAP) -> list[tuple[str, str, str, str, float]]:
+    """Step 7 (pure): (old_sid, new_sid, from_ext, to_ext, overlap) for every new sentence on the same page whose
+    span covers ≥ min_overlap of the old span."""
+    by_page: dict[int, list[SentenceRow]] = {}
+    for s in new:
+        by_page.setdefault(s.page_no, []).append(s)
+    out: list[tuple[str, str, str, str, float]] = []
+    for o in old:
+        length = max(1, o.cend - o.cstart)
+        for s in by_page.get(o.page_no, []):
+            inter = min(o.cend, s.cend) - max(o.cstart, s.cstart)
+            if inter <= 0:
+                continue
+            ratio = inter / length
+            if ratio >= min_overlap:
+                out.append((o.sid, s.sid, from_ext, to_ext, round(min(1.0, ratio), 4)))
+    return out
+
+
+def drop_ratio_of(pages: Sequence[PageText], masks: Sequence[LineMask]) -> float:
+    total = sum(len(p.text) for p in pages)
+    if total == 0:
+        return 0.0
+    dropped = sum(max(0, m.cend - m.cstart) for m in masks)
+    return min(1.0, dropped / total)
+
+
+def _override_sha(project: Project, doc_id: str) -> str:
+    f = project.curated_dir / UNITS_OVERRIDE_FILE
+    if not f.exists():
+        return "-"
+    try:
+        data = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        log.warning("cannot read %s: %s", f, e)
+        return "-"
+    entry = data.get(doc_id) if isinstance(data, dict) else None
+    if entry is None:
+        return "-"
+    return text_sha256(canonical_json(entry))[:12]
+
+
+def _doc_path(project: Project, rel_path: str | None) -> Path | None:
+    if not rel_path:
+        return None
+    p = Path(rel_path)
+    return p if p.is_absolute() else project.pdf_dir / p
+
+
+def _file_logger(project: Project) -> tuple[logging.Logger, logging.Handler]:
+    project.logs_dir.mkdir(parents=True, exist_ok=True)
+    lg = logging.getLogger(_FILE_LOGGER)
+    lg.setLevel(logging.INFO)
+    lg.propagate = False
+    h = logging.FileHandler(project.logs_dir / INGEST_LOG, encoding="utf-8")
+    h.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    lg.addHandler(h)
+    return lg, h
+
+
+@dataclass
+class _Job:
+    doc_id: str
+    doc_type: str
+    path: Path
+    pdf_sha256: str
+    extractor_version: str
+    ext_id: str
+    doctype: object
+    min_chars: int
+    # filled by _compute
+    pages: list[PageText] = field(default_factory=list)
+    masks: list[LineMask] = field(default_factory=list)
+    units: list[Unit] = field(default_factory=list)
+    marks: list[SectionMark] = field(default_factory=list)
+    sentences: list[SentenceRow] = field(default_factory=list)
+    text_ratio: float = 0.0
+    drop_ratio: float = 0.0
+    error: str | None = None
+
+
+def _compute(job: _Job) -> _Job:
+    """Steps 3–6 (no database access; safe in a worker thread)."""
+    try:
+        dt = job.doctype
+        job.pages = extract_pages(job.path)
+        job.text_ratio = text_ratio(job.pages)
+        job.masks = list(dt.drop_non_body(job.pages))
+        job.units = list(dt.segment(job.doc_id, job.pages, job.masks))
+        job.marks = list(dt.label_sections(job.doc_id, job.pages, job.masks, job.units))
+        job.sentences = build_sentences(job.doc_id, job.ext_id, job.pages, job.masks, job.units, job.marks,
+                                        job.min_chars)
+        job.drop_ratio = drop_ratio_of(job.pages, job.masks)
+    except Exception as e:
+        log.exception("ingest failed for %s", job.doc_id)
+        job.error = f"{type(e).__name__}: {e}"
+    return job
+
+
+def _stats(job: _Job) -> dict:
+    sections: dict[str, int] = {}
+    flags: dict[str, int] = {}
+    reasons: dict[str, int] = {}
+    for s in job.sentences:
+        sections[s.section] = sections.get(s.section, 0) + 1
+        for f in s.flags:
+            flags[f] = flags.get(f, 0) + 1
+    for m in job.masks:
+        reasons[m.reason] = reasons.get(m.reason, 0) + 1
+    return {"sections": sections, "flags": flags, "masks": reasons, "n_masks": len(job.masks),
+            "n_units": len(job.units), "n_marks": len(job.marks),
+            "body_sentences": sum(1 for s in job.sentences if s.is_body)}
 
 
 class IngestStage:
@@ -39,10 +312,292 @@ class IngestStage:
 
     def run(self, project: Project, *, reextract: bool = False, limit: int | None = None,
             doc_ids: list[str] | None = None, workers: int = 1) -> Report:
-        raise NotImplementedError("increment 1 / ingest")
+        report = Report(stage=self.name)
+        details: dict[str, dict] = {}
+        report.details["documents"] = details
+        min_chars = int(project.get("ingest.sentence_min_chars", 3) or 3)
+        default_type = str(project.get("doc_type", "paper") or "paper")
+        flog, handler = _file_logger(project)
+        store = EvidenceStore.open(project.evidence_db, "rw")
+        try:
+            docs = sorted(store.list_documents(limit=10 ** 9)["rows"], key=lambda d: d["doc_id"])
+            if doc_ids:
+                wanted = {d.strip() for d in doc_ids if d and d.strip()}
+                docs = [d for d in docs if d["doc_id"] in wanted]
+            if limit is not None and limit >= 0:
+                docs = docs[:limit]
+            report.items_total = len(docs)
+
+            # ---- steps 1–2: plan (needs the store for the skip check)
+            jobs: list[_Job] = []
+            for d in docs:
+                doc_id = d["doc_id"]
+                path = _doc_path(project, d.get("rel_path"))
+                if path is None or not path.is_file():
+                    report.items_failed += 1
+                    msg = f"{doc_id}: PDF not found: {path}"
+                    report.warnings.append(msg)
+                    details[doc_id] = {"status": "failed", "error": "PDF not found"}
+                    flog.info("%s failed pdf-not-found %s", doc_id, path)
+                    continue
+                try:
+                    sha = sha256_file(path)
+                    doc_type = d.get("doc_type") or default_type
+                    doctype = get_doctype(doc_type)
+                    if sha != d.get("pdf_sha256"):
+                        log.info("%s: file changed on disk; registering new sha", doc_id)
+                        store.add_document(doc_id, doc_type, d.get("source") or "scan", path,
+                                           d.get("rel_path") or str(path), sha)
+                    version = (f"{SEGMENT_VERSION}+{doctype.name}:{doctype.version}+{extractor_tag()}"
+                               f"+ovr:{_override_sha(project, doc_id)}")
+                    ext_id = extraction_id(doc_id, sha, version)
+                except Exception as e:
+                    log.exception("ingest planning failed for %s", doc_id)
+                    report.items_failed += 1
+                    report.warnings.append(f"{doc_id}: {type(e).__name__}: {e}")
+                    details[doc_id] = {"status": "failed", "error": str(e)}
+                    flog.info("%s failed %s", doc_id, e)
+                    continue
+                if store.extraction_exists(ext_id) and not reextract:
+                    report.items_skipped += 1
+                    details[doc_id] = {"status": "skipped", "ext_id": ext_id}
+                    flog.info("%s skipped ext=%s (exists)", doc_id, ext_id)
+                    continue
+                jobs.append(_Job(doc_id=doc_id, doc_type=doc_type, path=path, pdf_sha256=sha,
+                                 extractor_version=version, ext_id=ext_id, doctype=doctype, min_chars=min_chars))
+
+            # ---- steps 3–6: compute (optionally in threads), steps 7–8: write in doc_id order
+            if workers and workers > 1 and len(jobs) > 1:
+                pool = ThreadPoolExecutor(max_workers=int(workers))
+                results = pool.map(_compute, jobs)
+            else:
+                pool = None
+                results = map(_compute, jobs)
+            try:
+                for job in results:
+                    self._finish(job, store, report, details, flog)
+            finally:
+                if pool is not None:
+                    pool.shutdown(wait=True)
+        finally:
+            store.close()
+            flog.removeHandler(handler)
+            handler.close()
+        log.info(report.summary())
+        return report
+
+    @staticmethod
+    def _finish(job: _Job, store: EvidenceStore, report: Report, details: dict, flog: logging.Logger) -> None:
+        doc_id = job.doc_id
+        if job.error:
+            report.items_failed += 1
+            report.warnings.append(f"{doc_id}: {job.error}")
+            details[doc_id] = {"status": "failed", "error": job.error, "ext_id": job.ext_id}
+            flog.info("%s failed ext=%s %s", doc_id, job.ext_id, job.error)
+            return
+        warns: list[str] = []
+        th = job.doctype.thresholds
+        if job.text_ratio < th.min_text_ratio:
+            warns.append(f"low text ratio {job.text_ratio:.2f} < {th.min_text_ratio:.2f}")
+        if job.drop_ratio > th.max_drop_ratio:
+            warns.append(f"drop ratio {job.drop_ratio:.2f} > {th.max_drop_ratio:.2f}")
+        if not job.sentences:
+            warns.append("no sentences")
+        try:
+            prev = store.current_extraction(doc_id)
+            aliases: list[tuple[str, str, str, str, float]] = []
+            if prev is not None and prev["ext_id"] != job.ext_id:
+                old = store.sentences_of_extraction(prev["ext_id"])
+                aliases = compute_aliases(old, job.sentences, prev["ext_id"], job.ext_id)
+            stats = _stats(job)
+            stats["warnings"] = warns
+            with transaction(store.conn):
+                store.add_extraction(ext_id=job.ext_id, doc_id=doc_id, pdf_sha256=job.pdf_sha256,
+                                     extractor_version=job.extractor_version, doc_type=job.doc_type,
+                                     pages=job.pages, masks=job.masks, units=job.units, sentences=job.sentences,
+                                     text_ratio=job.text_ratio, drop_ratio=job.drop_ratio, stats=stats)
+                if aliases:
+                    store.add_aliases(aliases)
+        except Exception as e:
+            log.exception("storing extraction failed for %s", doc_id)
+            report.items_failed += 1
+            report.warnings.append(f"{doc_id}: {type(e).__name__}: {e}")
+            details[doc_id] = {"status": "failed", "error": str(e), "ext_id": job.ext_id}
+            flog.info("%s failed ext=%s %s", doc_id, job.ext_id, e)
+            return
+        report.items_done += 1
+        for w in warns:
+            report.warnings.append(f"{doc_id}: {w}")
+        details[doc_id] = {"status": "done", "ext_id": job.ext_id, "n_pages": len(job.pages),
+                           "n_sentences": len(job.sentences), "n_aliases": len(aliases),
+                           "text_ratio": round(job.text_ratio, 4), "drop_ratio": round(job.drop_ratio, 4),
+                           "warnings": warns}
+        flog.info("%s done ext=%s pages=%d sentences=%d masks=%d aliases=%d text_ratio=%.3f drop_ratio=%.3f%s",
+                  doc_id, job.ext_id, len(job.pages), len(job.sentences), len(job.masks), len(aliases),
+                  job.text_ratio, job.drop_ratio, (" warnings=" + "; ".join(warns)) if warns else "")
+        log.info("%s: %d pages, %d sentences (ext %s)", doc_id, len(job.pages), len(job.sentences), job.ext_id)
+
+
+# ---- registration (`atlas docs add`) ---------------------------------------------------------------------------
+
+def _rel_path(project: Project, path: Path) -> str:
+    try:
+        return path.resolve().relative_to(project.pdf_dir.resolve()).as_posix()
+    except ValueError:
+        return str(path.resolve())
+
+
+def _int_or_none(v: str | None) -> int | None:
+    s = (v or "").strip()
+    m = re.search(r"\d{4}", s)
+    if m:
+        return int(m.group(0))
+    return int(s) if s.isdigit() else None
+
+
+def _meta_from_row(row: dict) -> DocMeta:
+    g = lambda k: (" ".join((row.get(k) or "").split()) or None)  # noqa: E731
+    return DocMeta(title=g("title"), year=_int_or_none(row.get("year")), authors=g("authors"), doi=g("doi"),
+                   venue=g("venue"))
+
+
+def _fill_from_pdf(meta: DocMeta, path: Path) -> DocMeta:
+    """Fill title/authors/keywords/doi that the manifest did not provide from the PDF (info dict, then guesses)."""
+    pm = pdf_metadata(path)
+    if meta.title is None:
+        meta.title = pm.title or pm.extra.get("title_guess")
+    if meta.authors is None:
+        meta.authors = pm.authors
+    if meta.keywords is None:
+        meta.keywords = pm.keywords
+    if meta.doi is None:
+        meta.doi = pm.doi or pm.extra.get("doi_guess")
+    meta.extra.update({k: v for k, v in pm.extra.items() if v is not None})
+    return meta
+
+
+def _meta_changed(existing: dict, meta: DocMeta) -> bool:
+    for f in ("title", "year", "authors", "doi", "venue"):
+        v = getattr(meta, f)
+        if v is not None and existing.get(f) != v:
+            return True
+    return False
+
+
+def read_manifest(path: Path) -> list[dict]:
+    """Rows of manifest.csv (UTF-8 with optional BOM), header names lower-cased and stripped."""
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        rows: list[dict] = []
+        for raw in reader:
+            row = {(k or "").strip().lower(): (v or "").strip() for k, v in raw.items() if k is not None}
+            if any(row.values()):
+                rows.append(row)
+    return rows
 
 
 def register_documents(project: Project, manifest: str | None = None, pattern: str = "**/*.pdf") -> Report:
     """`atlas docs add`: read manifest.csv (if present or given) and/or scan pdf_dir; add documents and files to
     the evidence store; never extracts. Report.details = {added, updated, unchanged, missing_files}."""
-    raise NotImplementedError("increment 1 / ingest")
+    report = Report(stage="docs add")
+    added: list[str] = []
+    updated: list[str] = []
+    unchanged: list[str] = []
+    missing: list[str] = []
+    report.details.update({"added": added, "updated": updated, "unchanged": unchanged, "missing_files": missing})
+    default_type = str(project.get("doc_type", "paper") or "paper")
+    pdf_dir = project.pdf_dir
+
+    mpath: Path | None = None
+    if manifest:
+        mpath = Path(manifest)
+        if not mpath.is_absolute():
+            mpath = project.root / mpath
+        if not mpath.is_file():
+            raise FileNotFoundError(f"manifest not found: {mpath}")
+    elif project.manifest_path.is_file():
+        mpath = project.manifest_path
+
+    store = EvidenceStore.open(project.evidence_db, "rw")
+    try:
+        known = store.known_files()
+        seq = store.max_doc_seq(SCAN_ID_PREFIX)
+
+        def next_id() -> str:
+            nonlocal seq
+            seq += 1
+            return f"{SCAN_ID_PREFIX}{seq:0{SCAN_ID_WIDTH}d}"
+
+        def register(doc_id: str, doc_type: str, source: str, path: Path, meta: DocMeta) -> None:
+            rel = _rel_path(project, path)
+            sha = sha256_file(path)
+            existing = store.get_document(doc_id)
+            store.add_document(doc_id, doc_type, source, path, rel, sha, meta)
+            known[rel] = doc_id
+            if existing is None:
+                added.append(doc_id)
+            elif existing.get("pdf_sha256") != sha or _meta_changed(existing, meta):
+                updated.append(doc_id)
+            else:
+                unchanged.append(doc_id)
+
+        manifest_files: set[str] = set()
+        if mpath is not None:
+            rows = read_manifest(mpath)
+            report.items_total += len(rows)
+            for i, row in enumerate(rows, 1):
+                file = row.get("file", "")
+                if not file:
+                    report.items_failed += 1
+                    report.warnings.append(f"manifest row {i}: no file")
+                    continue
+                p = Path(file)
+                path = p if p.is_absolute() else pdf_dir / p
+                if not path.is_file():
+                    report.items_failed += 1
+                    missing.append(file)
+                    report.warnings.append(f"manifest row {i}: file not found: {path}")
+                    continue
+                manifest_files.add(_rel_path(project, path))
+                doc_id = row.get("doc_id") or ""
+                if not doc_id:
+                    rel = _rel_path(project, path)
+                    doc_id = known.get(rel) or next_id()
+                doc_type = row.get("doc_type") or default_type
+                meta = _meta_from_row(row)
+                if meta.title is None:
+                    meta = _fill_from_pdf(meta, path)
+                try:
+                    register(doc_id, doc_type, "manifest", path, meta)
+                    report.items_done += 1
+                except Exception as e:
+                    log.exception("registering %s failed", doc_id)
+                    report.items_failed += 1
+                    report.warnings.append(f"{doc_id}: {type(e).__name__}: {e}")
+
+        if pdf_dir.is_dir():
+            for path in sorted(p for p in pdf_dir.glob(pattern) if p.is_file()):
+                rel = _rel_path(project, path)
+                if rel in manifest_files:
+                    continue
+                report.items_total += 1
+                if rel in known:
+                    unchanged.append(known[rel])
+                    report.items_skipped += 1
+                    continue
+                doc_id = next_id()
+                meta = _fill_from_pdf(DocMeta(), path)
+                try:
+                    register(doc_id, default_type, "scan", path, meta)
+                    report.items_done += 1
+                except Exception as e:
+                    log.exception("registering %s failed", doc_id)
+                    report.items_failed += 1
+                    report.warnings.append(f"{doc_id}: {type(e).__name__}: {e}")
+        elif mpath is None:
+            report.warnings.append(f"pdf_dir does not exist: {pdf_dir}")
+    finally:
+        store.close()
+    log.info("%s: added %d, updated %d, unchanged %d, missing %d", report.stage, len(added), len(updated),
+             len(unchanged), len(missing))
+    return report
