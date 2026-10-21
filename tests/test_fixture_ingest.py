@@ -337,7 +337,10 @@ def test_unmanifested_pdf_gets_persistent_d_id(corpus: Corpus):
     extra = project.pdf_dir / "extra" / "unlisted.pdf"
     extra.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(src, extra)
+    # with a manifest, pdf_dir is NOT scanned unless asked (a library folder may hold far more than the corpus)
     rep = register_documents(project, manifest=info["manifest"])
+    assert rep.details["added"] == [], rep.details
+    rep = register_documents(project, manifest=info["manifest"], scan=True)
     assert rep.details["added"] == ["D0001"], rep.details
     assert sorted(rep.details["unchanged"]) == sorted(corpus.docs)
     assert rep.details["missing_files"] == [] and rep.items_failed == 0
@@ -352,12 +355,12 @@ def test_unmanifested_pdf_gets_persistent_d_id(corpus: Corpus):
     finally:
         store.close()
     # re-running assigns the same id and reports it unchanged
-    rep = register_documents(project, manifest=info["manifest"])
+    rep = register_documents(project, manifest=info["manifest"], scan=True)
     assert rep.details["added"] == [] and "D0001" in rep.details["unchanged"]
     # a second unmanifested file continues the sequence
     extra2 = project.pdf_dir / "extra" / "another.pdf"
     shutil.copyfile(Path(corpus.docs["P002"]["path"]), extra2)
-    rep = register_documents(project, manifest=info["manifest"])
+    rep = register_documents(project, manifest=info["manifest"], scan=True)
     assert rep.details["added"] == ["D0002"]
     # ingest only touches the new documents
     rep = run_stage(project, "ingest")
