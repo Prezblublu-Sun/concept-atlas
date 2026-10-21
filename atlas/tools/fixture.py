@@ -42,6 +42,8 @@ from pathlib import Path
 
 import fitz
 
+from atlas.core.text import sentence_text
+
 log = logging.getLogger(__name__)
 
 PAGE_W, PAGE_H = 595.0, 842.0
@@ -415,7 +417,7 @@ def make_fixture(out_dir: str | Path, seed: int = 1) -> dict:
                              {"title": paper.title, "authors": paper.authors, "keywords": ", ".join(paper.keywords)},
                              id_key=f"concept-atlas fixture {seed} {paper.doc_id}")
         sentences = paper.sentences()
-        n_mm = sum(1 for s in sentences if "micromotion" in s)
+        n_mm = sum(1 for s in sentences if "micromotion" in sentence_text(s))   # the hyphen special counts
         counts[paper.doc_id] = n_mm
         documents.append({
             "doc_id": paper.doc_id, "file": file, "path": str(path), "title": paper.title, "year": paper.year,

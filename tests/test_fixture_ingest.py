@@ -16,6 +16,7 @@ from atlas import cli
 from atlas.config import Project, init_project
 from atlas.core.ids import norm, sentence_id
 from atlas.core.schemas import BODY_SECTIONS
+from atlas.core.text import sentence_text
 from atlas.doctypes.paper import PaperDocType
 from atlas.pipeline.runner import run_stage
 from atlas.pipeline.stages.ingest import IngestStage, register_documents
@@ -124,8 +125,8 @@ def test_every_planted_sentence_is_one_stored_sentence(corpus: Corpus):
         stored = {}
         for r in corpus.rows[doc_id]:
             stored[collapse(r.text)] = stored.get(collapse(r.text), 0) + 1
-        for s in d["sentences"]:
-            assert stored.get(collapse(s), 0) >= 1, (doc_id, s)
+        for s in d["sentences"]:          # planted text in its stored (dehyphenated) form
+            assert stored.get(collapse(sentence_text(s)), 0) >= 1, (doc_id, s)
 
 
 def test_sequence_and_offsets(corpus: Corpus):
@@ -179,11 +180,11 @@ def test_unit_traps_and_hyphen(corpus: Corpus):
         assert rows[0].is_body and rows[0].section in BODY
     assert "quant" in rows[0].tags or True  # tags are the core agent's rules; presence is not asserted here
     hy = sp["hyphen"]
-    rows = [r for r in corpus.rows[hy["doc_id"]] if "micro-" in r.text and "motion under physiological" in collapse(r.text)]
+    rows = [r for r in corpus.rows[hy["doc_id"]] if "micromotion under physiological" in r.text]
     assert len(rows) == 1
-    assert collapse(rows[0].text) == collapse(hy["text"])
-    assert "micromotion" not in rows[0].text
-    assert "micro-\nmotion" in rows[0].text         # stored verbatim: the line break is kept
+    # stored dehyphenated: 'micro-\nmotion' joins because the document never writes 'micro-motion' inside a line
+    assert rows[0].text == sentence_text(hy["text"]) and "\n" not in rows[0].text
+    assert "micro-" not in rows[0].text
 
 
 def test_non_body_lines_produce_no_sentences(corpus: Corpus):

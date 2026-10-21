@@ -38,6 +38,50 @@ def collapse_ws(s: str | None) -> str:
     return " ".join((s or "").split())
 
 
+# ---- sentence text ------------------------------------------------------------------------------------------------
+
+#: Ligature glyphs that PDF fonts emit for letter pairs ('ﬁnding' → 'finding'); NFKC would expand them too, but
+#: NFKC also rewrites superscripts and the micro sign, which evidence text must keep.
+LIGATURES = {"ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl", "ﬅ": "ft",
+             "ﬆ": "st"}
+_LIG_RE = re.compile("|".join(map(re.escape, LIGATURES)))
+_HYPHEN_WORD_RE = re.compile(r"[^\W\d_]+(?:-[^\W\d_]+)+")           # 'long-term', 'state-of-the-art' inside one line
+_SOFT_BREAK_RE = re.compile(r"­[ \t]*\n[ \t]*")
+_HARD_BREAK_RE = re.compile(r"([^\W\d_]+)-[ \t]*\n[ \t]*([^\W\d_]+)")
+
+
+def hyphen_vocab(text: str | None) -> frozenset[str]:
+    """Lower-cased hyphenated words that occur inside a line ('long-term', 'state-of-the-art'): the evidence that
+    a hyphen at a line end belongs to the word rather than to the line break."""
+    return frozenset(w.lower() for line in (text or "").split("\n") for w in _HYPHEN_WORD_RE.findall(line))
+
+
+def dehyphenate(text: str | None, vocab: frozenset[str] | None = None) -> str:
+    """Join words broken across lines. A soft hyphen (U+00AD) before the line break always joins
+    ('Peripros­\\nthetic' → 'Periprosthetic'). A hard hyphen joins unless the hyphenated word is written
+    inside a line elsewhere in the document ('long-\\nterm' → 'long-term' when `vocab` holds 'long-term', else
+    'longterm'; 'state-of-\\nthe-art' keeps its hyphen when 'state-of-the-art' is in `vocab`)."""
+    s = _SOFT_BREAK_RE.sub("", text or "")
+
+    def join(m: re.Match[str]) -> str:
+        a, b = m.group(1), m.group(2)
+        word = f"{a}-{b}".lower()
+        if vocab and any(word in v for v in vocab):
+            return f"{a}-{b}"
+        return a + b
+
+    return _HARD_BREAK_RE.sub(join, s)
+
+
+def sentence_text(raw: str | None, vocab: frozenset[str] | None = None) -> str:
+    """Stored form of a sentence cut from page text: dehyphenated (see dehyphenate), stray soft hyphens removed,
+    ligature glyphs expanded, line breaks and runs of whitespace collapsed to one space, stripped. Offsets into
+    the page text are unaffected (they are kept separately)."""
+    s = dehyphenate(raw, vocab).replace("­", "")
+    s = _LIG_RE.sub(lambda m: LIGATURES[m.group(0)], s)
+    return " ".join(s.split())
+
+
 #: Inline evidence ids that LLM text sometimes contains and that must never count as numbers:
 #: E12, R3, F7, ST_ab12cd, S1 + 16 hex, optionally wrapped in [] or () and separated by , ， 、 or spaces.
 INLINE_ID_RE = re.compile(r"(?<![A-Za-z0-9])(?:\[|\()?\s*(?:(?:E|R|F)\d{1,4}|ST_[0-9a-f]{6,}|S1[0-9a-f]{16})"

@@ -16,7 +16,8 @@ import unicodedata
 
 from atlas.core.schemas import TAGS
 
-SEGMENT_VERSION = "seg3"   # seg3: descriptive (loose) headings, numbered-sequence and run-in headings
+SEGMENT_VERSION = "seg4"   # seg3: descriptive (loose) headings, numbered-sequence and run-in headings;
+                           # seg4: sentence text dehyphenated / ligatures expanded (atlas.core.text.sentence_text)
 
 #: Canonical headings → section (strict forms). Matching is case-insensitive on the whole line after stripping
 #: numbering ('2.', '2', 'II.', 'Chapter 3', '3.1') and trailing punctuation; the line must be ≤ 8 words.

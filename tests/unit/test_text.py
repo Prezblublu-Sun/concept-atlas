@@ -201,3 +201,37 @@ def test_numbers_missing_sorted_and_handles_none():
     assert numbers_missing("50 then 7 then 1000", []) == sorted(["50", "7", "1000"])
     assert numbers_missing(None, ["anything"]) == []
     assert numbers_missing("5 items", []) == ["5"]
+
+
+# ---- sentence text --------------------------------------------------------------------------------------------
+
+from atlas.core.text import dehyphenate, hyphen_vocab, sentence_text  # noqa: E402
+
+
+def test_hyphen_vocab_collects_intra_line_hyphenated_words():
+    text = "A long-term study of state-of-the-art stems.\nThe long-\nterm result was good.\nX-ray 3-D"
+    assert hyphen_vocab(text) == {"long-term", "state-of-the-art", "x-ray"}
+
+
+def test_dehyphenate_soft_hyphen_always_joins():
+    assert dehyphenate("Peripros­\nthetic fractures") == "Periprosthetic fractures"
+    assert dehyphenate("Peripros­ \n  thetic") == "Periprosthetic"
+
+
+def test_dehyphenate_hard_hyphen_uses_the_document_vocabulary():
+    assert dehyphenate("peripros-\nthetic") == "periprosthetic"
+    assert dehyphenate("long-\nterm", frozenset({"long-term"})) == "long-term"
+    assert dehyphenate("long-\nterm", frozenset()) == "longterm"
+    assert dehyphenate("state-of-\nthe-art", frozenset({"state-of-the-art"})) == "state-of-the-art"
+    assert dehyphenate("Long-\nterm", frozenset({"long-term"})) == "Long-term"      # case-insensitive lookup
+
+
+def test_dehyphenate_leaves_hyphens_inside_a_line_and_before_digits():
+    assert dehyphenate("long-term 3-\n4 mm") == "long-term 3-\n4 mm"
+
+
+def test_sentence_text_collapses_breaks_and_expands_ligatures():
+    raw = "The ﬁnal\nresult of the long-\nterm study was\xa0clear.  "
+    assert sentence_text(raw, frozenset({"long-term"})) == "The final result of the long-term study was clear."
+    assert sentence_text("a­b") == "ab"
+    assert sentence_text(None) == ""

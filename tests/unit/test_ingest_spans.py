@@ -30,7 +30,7 @@ def test_keywords_block_ending_at_page_start_then_introduction_heading():
     # line is split like ordinary text
     marks = [SectionMark(1, 0, "front"), SectionMark(1, 20, "keywords"), SectionMark(2, 0, "front")]
     p2b = PageText(2, "More front matter\nthat wraps. Then a sentence.\n")
-    assert texts(page_sentence_spans(p2b, [], marks)) == ["More front matter\nthat wraps.", "Then a sentence."]
+    assert texts(page_sentence_spans(p2b, [], marks)) == ["More front matter that wraps.", "Then a sentence."]
 
 
 def test_heading_mid_page_and_masked_lines():

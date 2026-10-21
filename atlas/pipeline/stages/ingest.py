@@ -52,6 +52,7 @@ from atlas.config import Project
 from atlas.core.ids import canonical_json, extraction_id, norm, sentence_id, text_sha256
 from atlas.core.schemas import BODY_SECTIONS, DocMeta, LineMask, PageText, SectionMark, SentenceRow, Unit
 from atlas.core.segment import SEGMENT_VERSION, garbage_flags, split_sentences, tag_sentence
+from atlas.core.text import hyphen_vocab, sentence_text
 from atlas.doctypes import get_doctype
 from atlas.ingest.pdf import extract_pages, extractor_tag, pdf_metadata, sha256_file, text_ratio
 from atlas.pipeline.runner import Report
@@ -112,9 +113,11 @@ def _line_end(text: str, pos: int) -> int:
 
 
 def page_sentence_spans(page: PageText, masks: Sequence[LineMask], marks: Sequence[SectionMark],
-                        min_chars: int = 3) -> list[tuple[int, int, str]]:
+                        min_chars: int = 3, vocab: frozenset[str] | None = None) -> list[tuple[int, int, str]]:
     """(cstart, cend, text) of the sentences of one page in reading order; offsets index into page.text, text is
-    the cleaned (mask-free) slice. Section marks on the page are hard boundaries (see the module docstring)."""
+    the cleaned (mask-free) slice normalised by atlas.core.text.sentence_text (dehyphenated with the document's
+    `vocab` of hyphenated words, ligatures expanded, whitespace collapsed). Section marks on the page are hard
+    boundaries (see the module docstring)."""
     text = page.text
     page_masks = [m for m in masks if m.page_no == page.page_no]
     cleaned, to_orig, to_clean = clean_page_text(text, page_masks)
@@ -146,7 +149,7 @@ def page_sentence_spans(page: PageText, masks: Sequence[LineMask], marks: Sequen
             spans = split_sentences(cleaned[s:e], min_chars)
         for a, b in spans:
             a, b = s + a, s + b
-            out.append((to_orig[a], to_orig[b - 1] + 1, cleaned[a:b]))
+            out.append((to_orig[a], to_orig[b - 1] + 1, sentence_text(cleaned[a:b], vocab)))
     return out
 
 
@@ -175,12 +178,13 @@ def build_sentences(doc_id: str, ext_id: str, pages: Sequence[PageText], masks: 
                     units: Sequence[Unit], marks: Sequence[SectionMark], min_chars: int = 3) -> list[SentenceRow]:
     """Steps 5–6 of the module docstring for a whole document (pure)."""
     index = _MarkIndex(marks)
+    vocab = hyphen_vocab("\n".join(p.text for p in pages))
     rows: list[SentenceRow] = []
     seen: dict[str, int] = {}
     seq = 0
     for page in sorted(pages, key=lambda p: p.page_no):
         unit = _unit_for(units, page.page_no, doc_id)
-        for cstart, cend, text in page_sentence_spans(page, masks, marks, min_chars):
+        for cstart, cend, text in page_sentence_spans(page, masks, marks, min_chars, vocab):
             key = norm(text)
             k = seen.get(key, 0)
             seen[key] = k + 1
