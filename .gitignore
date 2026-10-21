@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+atlas/http/static/vendor/
+# project folders never live inside the repo, but just in case
+projects/
+*.pdf
+.DS_Store
+Thumbs.db

@@ -1,0 +1,41 @@
+# Every tunable with its default. A project's project.yaml overrides keys here (deep merge).
+doc_type: paper                       # paper | thesis; a manifest column may override per document
+paths:
+  pdf_dir: pdf                        # relative to the project root unless absolute
+ingest:
+  sentence_min_chars: 3
+  page_render_zoom: 1.6
+llm:
+  provider: deepseek
+  base_url: https://api.deepseek.com
+  model: deepseek-flash
+  api_key_env: ATLAS_LLM_API_KEY
+  concurrency: 8
+  prefer_idle: true
+  balance_floor_rmb: 5
+  balance_endpoint: /user/balance
+  pricing:
+    currency: RMB
+    per_million: { input_miss: 1.0, input_hit: 0.02, output: 4.0 }
+    peak_multiplier: 2
+    peak: { tz_offset_hours: 8, weekdays: [0, 1, 2, 3, 4], hours: [[9, 12], [14, 18]] }
+budgets:
+  run: 80
+  stage: { overview: 60 }
+  daily: { ask: 2 }
+overview:
+  mode_by_tier: { A: deep, B: deep, C: lite, D: lite, E: skip }
+  stale_ratio: 0.10
+  stale_min_added: 30
+  per_unit_cap: 40
+stats:
+  trend_recent: [2024, 2026]
+  trend_base_until: 2020
+qa:
+  accept_threshold: 0.85
+embedding:
+  model: bge-m3
+  url: ""                             # e.g. http://my-gpu-box:8790 (atlas embed serve)
+serve:
+  host: 127.0.0.1
+  port: 8767
