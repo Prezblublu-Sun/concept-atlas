@@ -214,8 +214,8 @@ def test_hyphen_vocab_collects_intra_line_hyphenated_words():
 
 
 def test_dehyphenate_soft_hyphen_always_joins():
-    assert dehyphenate("Peripros­\nthetic fractures") == "Periprosthetic fractures"
-    assert dehyphenate("Peripros­ \n  thetic") == "Periprosthetic"
+    assert dehyphenate("Peripros\u00ad\nthetic fractures") == "Periprosthetic fractures"
+    assert dehyphenate("Peripros\u00ad \n  thetic") == "Periprosthetic"
 
 
 def test_dehyphenate_hard_hyphen_uses_the_document_vocabulary():
@@ -233,5 +233,6 @@ def test_dehyphenate_leaves_hyphens_inside_a_line_and_before_digits():
 def test_sentence_text_collapses_breaks_and_expands_ligatures():
     raw = "The ﬁnal\nresult of the long-\nterm study was\xa0clear.  "
     assert sentence_text(raw, frozenset({"long-term"})) == "The final result of the long-term study was clear."
-    assert sentence_text("a­b") == "ab"
+    assert sentence_text("a\u00adb") == "ab"
+    assert sentence_text("2\u2002 \x07Material and\xa0Methods") == "2 Material and Methods"
     assert sentence_text(None) == ""

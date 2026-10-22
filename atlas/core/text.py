@@ -46,7 +46,8 @@ LIGATURES = {"ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl", 
              "ﬆ": "st"}
 _LIG_RE = re.compile("|".join(map(re.escape, LIGATURES)))
 _HYPHEN_WORD_RE = re.compile(r"[^\W\d_]+(?:-[^\W\d_]+)+")           # 'long-term', 'state-of-the-art' inside one line
-_SOFT_BREAK_RE = re.compile(r"­[ \t]*\n[ \t]*")
+_SOFT_BREAK_RE = re.compile("\u00ad[ \t]*\n[ \t]*")
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")                 # C0 / DEL glyph placeholders ('\x07')
 _HARD_BREAK_RE = re.compile(r"([^\W\d_]+)-[ \t]*\n[ \t]*([^\W\d_]+)")
 
 
@@ -58,7 +59,7 @@ def hyphen_vocab(text: str | None) -> frozenset[str]:
 
 def dehyphenate(text: str | None, vocab: frozenset[str] | None = None) -> str:
     """Join words broken across lines. A soft hyphen (U+00AD) before the line break always joins
-    ('Peripros­\\nthetic' → 'Periprosthetic'). A hard hyphen joins unless the hyphenated word is written
+    ('Peripros<U+00AD>\\nthetic' → 'Periprosthetic'). A hard hyphen joins unless the hyphenated word is written
     inside a line elsewhere in the document ('long-\\nterm' → 'long-term' when `vocab` holds 'long-term', else
     'longterm'; 'state-of-\\nthe-art' keeps its hyphen when 'state-of-the-art' is in `vocab`)."""
     s = _SOFT_BREAK_RE.sub("", text or "")
@@ -74,10 +75,10 @@ def dehyphenate(text: str | None, vocab: frozenset[str] | None = None) -> str:
 
 
 def sentence_text(raw: str | None, vocab: frozenset[str] | None = None) -> str:
-    """Stored form of a sentence cut from page text: dehyphenated (see dehyphenate), stray soft hyphens removed,
-    ligature glyphs expanded, line breaks and runs of whitespace collapsed to one space, stripped. Offsets into
-    the page text are unaffected (they are kept separately)."""
-    s = dehyphenate(raw, vocab).replace("­", "")
+    """Stored form of a sentence cut from page text: dehyphenated (see dehyphenate), stray soft hyphens and
+    control characters removed, ligature glyphs expanded, line breaks and runs of whitespace collapsed to one
+    space, stripped. Offsets into the page text are unaffected (they are kept separately)."""
+    s = _CTRL_RE.sub("", dehyphenate(raw, vocab).replace("\u00ad", ""))
     s = _LIG_RE.sub(lambda m: LIGATURES[m.group(0)], s)
     return " ".join(s.split())
 

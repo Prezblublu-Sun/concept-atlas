@@ -31,6 +31,8 @@ from atlas.doctypes.paper import PaperDocType
     ("Discussion/Conclusion", ("discussion", "strict")),
     ("Notes and references", ("references", "strict")),
     ("1. Introductions", ("introduction", "strict")),
+    ("2\u2002 \x07Material and\xa0Methods", ("methods", "strict")),     # Springer: en space + BEL glyph
+    ("3\u2002 \x07Results", ("results", "strict")),
 ])
 def test_detect_heading_ex_positive(line, expected):
     assert detect_heading_ex(line) == expected
@@ -62,6 +64,7 @@ def test_detect_heading_ex_negative(line):
     ("II. BAYESIAN OPTIMIZATION WITH", (2, "BAYESIAN OPTIMIZATION WITH")),    # heading wrapped onto two lines
     ("1. Introduction. Operator learning has emerged as a methodology", (1, "Introduction")),   # run-in (SIAM)
     ("6. Conclusion. This paper proposes the Fourier Neural Mappings", (6, "Conclusion")),
+    ("4\u2002 \x07Geometric multigrid method", (4, "Geometric multigrid method")),
 ])
 def test_split_numbered_heading_positive(line, expected):
     assert split_numbered_heading(line) == expected

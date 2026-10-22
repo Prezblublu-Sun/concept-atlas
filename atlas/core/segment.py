@@ -16,8 +16,9 @@ import unicodedata
 
 from atlas.core.schemas import TAGS
 
-SEGMENT_VERSION = "seg4"   # seg3: descriptive (loose) headings, numbered-sequence and run-in headings;
-                           # seg4: sentence text dehyphenated / ligatures expanded (atlas.core.text.sentence_text)
+SEGMENT_VERSION = "seg5"   # seg3: descriptive (loose) headings, numbered-sequence and run-in headings;
+                           # seg4: sentence text dehyphenated / ligatures expanded (atlas.core.text.sentence_text);
+                           # seg5: control characters ignored in headings and sentence text
 
 #: Canonical headings → section (strict forms). Matching is case-insensitive on the whole line after stripping
 #: numbering ('2.', '2', 'II.', 'Chapter 3', '3.1') and trailing punctuation; the line must be ≤ 8 words.
@@ -115,7 +116,7 @@ def classify_heading_text(text: str) -> str | None:
     """Section for the text of a known heading by keyword anywhere in it (used for numbered structural
     headings whose shape is already established); None when no keyword matches ('Nomenclature',
     'Extrapolating from a pretrained PRNN')."""
-    s = " ".join(unicodedata.normalize("NFKC", text or "").split())
+    s = heading_line(text)
     for rx, section in _CLASSIFY:
         if rx.search(s):
             return section
@@ -232,13 +233,23 @@ def detect_heading(line: str) -> str | None:
     return hit[0] if hit else None
 
 
+#: C0 / DEL control characters (not \t \n): PDF fonts emit them as glyph placeholders ('2 \x07Methods').
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def heading_line(line: str | None) -> str:
+    """NFKC-normalised, control-character-free, whitespace-collapsed form of a line for heading detection."""
+    return " ".join(_CTRL_RE.sub("", unicodedata.normalize("NFKC", line or "")).split())
+
+
 def detect_heading_ex(line: str) -> tuple[str, str] | None:
     """(section, strength) for a heading line, else None. A heading is a short line (≤ 8 words, ≤ 60 chars)
     without a terminal period that matches HEADINGS (strength 'strict') or HEADINGS_LOOSE (strength 'loose')
     after numbering and a short trailing parenthesis are stripped; 'Results and discussion' → 'results';
     ALL-CAPS variants count. Lines that are clearly sentences (contain ' the ' …, end with '.' or start in lower
-    case) are not headings; loose forms also need a non-fragment first word ('these results')."""
-    s = " ".join(unicodedata.normalize("NFKC", line or "").split())
+    case) are not headings; loose forms also need a non-fragment first word ('these results'). Control
+    characters are ignored ('2\u2002 \x07Methods' in Springer PDFs)."""
+    s = heading_line(line)
     if not s or len(s) > 60 or len(s.split()) > 8:
         return None
     core = _NUMBERING_RE.sub("", s, count=1).strip()
@@ -280,7 +291,7 @@ def split_numbered_heading(line: str) -> tuple[int, str] | None:
     (heading = text before the first '. ' that is followed by a capital). None for sub-numbers ('2.1 …'), units
     ('4 MB', '2 mm thick plates'), formulas, captions and ordinary sentences. The caller decides whether the
     number fits the sequence of the document."""
-    s = " ".join(unicodedata.normalize("NFKC", line or "").split())
+    s = heading_line(line)
     m = _NUM_HEAD_RE.match(s)
     if not m:
         return None

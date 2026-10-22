@@ -237,7 +237,7 @@ def _ack_reason(s: str) -> str:
 @register
 class PaperDocType:
     name = "paper"
-    version = "paper2"
+    version = "paper3"
     thresholds = Thresholds()
 
     # ---- masks ---------------------------------------------------------------------------------------------
