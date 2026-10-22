@@ -347,7 +347,7 @@ class PaperDocType:
                 higher = [a for a in accepted if a.rank > rank]
                 if all(a.strength == "loose" for a in higher):
                     accepted = [a for a in accepted if not (a.rank > rank and a.strength == "loose")]
-                elif _structured_abstract(accepted, ev, sec, lines):
+                elif _structured_abstract(accepted, ev.idx, rank, sec, lines):
                     dropped = [a for a in accepted if a.rank >= rank]
                     accepted = [a for a in accepted if a.rank < rank]
                     if not any(a.section == "abstract" for a in accepted):
@@ -484,20 +484,22 @@ def _numbered_headings(lines: Sequence[_Line], hf_masked: set[tuple[int, int]]) 
     return out
 
 
-def _structured_abstract(accepted: Sequence[_Event], ev: _Event, sec: str, lines: Sequence[_Line]) -> bool:
-    """True when the accepted body headings of rank ≥ the incoming 'introduction'/'methods' heading look like a
+def _structured_abstract(accepted: Sequence[_Event], idx: int, rank: int, sec: str,
+                         lines: Sequence[_Line]) -> bool:
+    """True when the accepted body headings of rank ≥ `rank` (the incoming 'introduction'/'methods' heading at
+    line `idx`) look like a
     structured abstract (Background / Methods / Results / Conclusions): all on the first STRUCTURED_MAX_PAGE pages,
     none a literal 'Introduction', at most STRUCTURED_MAX_GAP lines apart and at most STRUCTURED_MAX_TAIL lines
     before the incoming heading."""
     if sec not in ("introduction", "methods"):
         return False
-    idxs = [a.idx for a in accepted if a.rank >= ev.rank and a.section != "keywords"]
+    idxs = [a.idx for a in accepted if a.rank >= rank and a.section != "keywords"]
     if not idxs or any(lines[i].page_no > STRUCTURED_MAX_PAGE for i in idxs):
         return False
     if any(INTRO_LITERAL.match(lines[i].text) for i in idxs):  # a literal 'Introduction' is never part of an abstract
         return False
     return (all(b - a <= STRUCTURED_MAX_GAP for a, b in zip(idxs, idxs[1:]))
-            and ev.idx - idxs[-1] <= STRUCTURED_MAX_TAIL)
+            and idx - idxs[-1] <= STRUCTURED_MAX_TAIL)
 
 
 _FRONT_MARKERS = re.compile(r"[*†‡§¶]|[¹²³⁰-⁹]")    # author affiliation markers
