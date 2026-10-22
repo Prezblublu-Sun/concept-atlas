@@ -3,9 +3,15 @@ the ranked concepts of every sub-domain (v2 `subdomain_framework.py`) and `frame
 content-framework categories. No LLM. Implemented by: increment 2 (derived layer).
 
 Membership: a unit (document, and chapters for theses) belongs to a within-sub-domain of one of its document's
-domains when any anchor has a standalone hit in its title / keywords / abstract (topic_hits); `core` when an
-anchor is in the title or keywords or anchors are mentioned >= 2 times in the abstract, else `related`; a cross
-sub-domain needs every anchor group to hit, `core` needs every group strong.
+domains when any anchor has a hit in its title / keywords / abstract (topic_hits, **every** occurrence counted,
+nested ones included: the previous system's assignment read the first version's `term_paper` topic columns,
+which had no nested distinction — `neural network` inside `convolutional neural network` is a hit of the
+anchor `neural network`); `core` when an anchor is in the title or keywords or anchors are mentioned >= 2 times
+in the abstract (`stats.strong_abstract_hits`), else `related`; a cross sub-domain needs every anchor group to
+hit, `core` needs every group strong. The ranked concepts of a sub-domain use the standalone body users of
+`counts` (as the v2 sub-domain framework).
+
+Version history: assign1 used standalone topic hits for the anchors; assign2 counts every hit (v1/v2 semantics).
 """
 from __future__ import annotations
 
@@ -26,7 +32,7 @@ TOP_OVERLAPS = 8
 
 
 def assign_units(store: BuildStore, params: dict | None) -> list[tuple[str, str, str, dict, int]]:
-    th = store.topic_hits_by_unit()
+    th = store.topic_hits_by_unit(standalone=False)
     meta = store.doc_meta_all()
     anchors = store.anchors_all()
     subs = store.subdomains_all()
@@ -134,7 +140,7 @@ def category_stats(store: BuildStore) -> list[dict]:
 
 class AssignStage:
     name = "assign"
-    version = "assign1"
+    version = "assign2"
     llm = False
     requires: tuple[str, ...] = ("match",)
     gate: tuple[str, ...] = ("subdomains", "domains", "doc_domains")
@@ -162,7 +168,8 @@ class AssignStage:
         build.set_item(self.name, "*", "done", self.version, detail)
         m = build.manifest()
         stages = m.get("stages") or {}
-        stages[self.name] = {"status": "done", "seconds": round(time.perf_counter() - t0, 2), **detail}
+        stages[self.name] = {"status": "done", "version": self.version, "seconds": round(time.perf_counter() - t0, 2),
+                             **detail}
         build.update_manifest(stages=stages)
         report.details.update(detail)
         log.info(report.summary())

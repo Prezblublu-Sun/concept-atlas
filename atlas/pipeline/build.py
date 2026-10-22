@@ -80,11 +80,9 @@ def new_build(project: Project, note: str | None = None) -> dict:
     try:
         pinned = store.pin_evidence(project.evidence_db, _doc_domains(project))
         scheme = store.load_scheme()
-        ev_sha = None
-        try:
-            ev_sha = sha256_file(project.evidence_db) if project.evidence_db.stat().st_size < 512 * 1024 * 1024 else None
-        except OSError:
-            ev_sha = None
+        t1 = time.perf_counter()
+        ev_sha = sha256_file(project.evidence_db)       # the main file only; the pin itself is by sentence ids
+        log.info("evidence sha256 %s… in %.1f s", ev_sha[:12], time.perf_counter() - t1)
         m = store.update_manifest(docs=pinned["docs"], sentences=pinned["sentences"], units=pinned["units"],
                                   scheme=scheme, evidence_sha_at_pin=ev_sha,
                                   stages={"new": {"seconds": round(time.perf_counter() - t0, 2)}})

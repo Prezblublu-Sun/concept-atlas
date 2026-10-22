@@ -15,6 +15,13 @@ Vocabulary (all counts, no judgement):
 
 Per-document input: {section: (n, n_nested)} where section ∈ SECTIONS ∪ {'body'}; standalone = n - n_nested
 (literal: n).
+
+Sub-domain membership (v2 `assign_subdomains.py`) works on per-unit topic counts {concept_id: (title, keywords,
+abstract)}; the caller decides whether those are every occurrence (the previous system: nested hits included) or
+standalone counts — the functions here only add them up.
+
+The defaults below are repeated in `atlas/defaults.yaml` (`stats:`), which a project may override; this module is
+pure (no YAML), so a test keeps the two in sync.
 """
 from __future__ import annotations
 
@@ -22,7 +29,7 @@ import math
 import statistics
 from collections.abc import Iterable, Mapping, Sequence
 
-STATS_VERSION = "s1"
+STATS_VERSION = "s1"       # bump when any metric definition in this module changes
 
 DEFAULT_PARAMS: dict = {
     "cov_hi": 0.10,

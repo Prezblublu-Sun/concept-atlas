@@ -153,6 +153,11 @@ def test_outputs_counts_and_queries(proj):
     assert st.topic_users()["C_stem"] == {"P1", "P2", "P3"}
     th = st.topic_hits_by_unit()
     assert th["P1"]["C_stem"] == (1, 1, 0) and th["P2"]["C_micromotion"] == (0, 0, 1)
+    st.add_topic_hits([("P3", "C_micromotion", "abstract", 2, 2), ("P3", "C_lit", "abstract", 1, 1)])
+    assert st.topic_hits_by_unit()["P3"] == {"C_stem": (1, 0, 0), "C_micromotion": (0, 0, 2), "C_lit": (0, 0, 1)}   # every hit
+    assert st.topic_hits_by_unit(standalone=True)["P3"] == {"C_stem": (1, 0, 0), "C_lit": (0, 0, 1)}            # literal: n
+    st.add_topic_hits([("P3", "C_micromotion", "abstract", 2, 2), ("P3", "C_lit", "abstract", 1, 1)])     # idempotent
+    st.rebuild_counts()
     per = dict(st.iter_counts())
     assert per["C_micromotion"]["P2"]["body"] == (2, 1) and per["C_lit"]["P1"]["body"] == (1, 0)
     assert per["C_stem"]["P3"] == {"title": (1, 0), "body": (1, 0)}   # a title hit counts as body use (v2 full text)
