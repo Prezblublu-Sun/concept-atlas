@@ -72,6 +72,9 @@ export const i18n = {
   sections: {},
   tags: {},
   kinds: {},
+  tiers: {},
+  dataMap: {},      // build i18n table: zh → en (domain / category / sub-domain names, descriptions, notes)
+  domains: [],
   async load() {
     try { this.lang = localStorage.getItem(LANG_KEY) || this.detect(); } catch { this.lang = this.detect(); }
     const data = await api.get("i18n");
@@ -79,6 +82,9 @@ export const i18n = {
     this.sections = data.sections || {};
     this.tags = data.tags || {};
     this.kinds = data.kinds || {};
+    this.tiers = data.tiers || {};
+    this.dataMap = data.data || {};
+    this.domains = data.domains || [];
     document.documentElement.lang = this.lang === "zh" ? "zh-CN" : "en";
   },
   detect() {
@@ -104,6 +110,8 @@ export const i18n = {
     return s;
   },
   section(key) { return this.pick(this.sections[key], key); },
+  /** A data label from the build's i18n table: the English translation when lang = en and one exists, else the Chinese. */
+  data(zh) { if (!zh) return ""; return this.lang === "en" ? (this.dataMap[zh] || zh) : zh; },
   tag(key) { return this.pick(this.tags[key], key); },
   kind(letter) { return this.pick(this.kinds[letter], letter); },
 };
@@ -278,7 +286,9 @@ export function refHref(obj) {
   if (kind === "S" && obj.doc_id) {
     return `#/docs/${encodeURIComponent(obj.doc_id)}` + qs({ page: obj.page || 1, sid: obj.sid });
   }
-  if ((kind === "D" || kind === "U") && obj.doc_id) return `#/docs/${encodeURIComponent(obj.doc_id)}`;
+  if ((kind === "D" || kind === "U") && obj.doc_id) return `#/docs/${encodeURIComponent(obj.doc_id)}` + (obj.page ? qs({ page: obj.page }) : "");
+  if (kind === "C") return `#/concepts/${encodeURIComponent(obj.ref.slice(2))}`;
+  if (kind === "SD") return `#/subdomains/${encodeURIComponent(obj.ref.slice(3))}`;
   if (kind === "N") return `#/notes/${encodeURIComponent(obj.ref.slice(2))}`;
   if (kind === "K") return `#/collections/${encodeURIComponent(obj.ref.slice(2))}`;
   return null;

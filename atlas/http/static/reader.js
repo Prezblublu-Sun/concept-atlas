@@ -27,6 +27,7 @@ export async function readerView(docId, params) {
     zoom: Number(store(ZOOM_KEY)) || 1.6,
     hl: params.hl || "",
     sid: params.sid || null,
+    c: (params.c || "").split(",").map((x) => x.trim()).filter(Boolean),   // concept ids to mark (increment 2)
     pageCache: new Map(),
     objectUrl: null,
   };
@@ -44,11 +45,29 @@ export async function readerView(docId, params) {
 
   // ---- center: header + toolbar + viewer
   const metaBits = [doc.year, doc.authors, doc.venue].filter(Boolean).join(" · ");
+  const chips = h("div.chips", { style: "margin-top:4px" });
+  function renderChips() {
+    clear(chips);
+    for (const d of doc.domains || []) chips.appendChild(h("span.badge", (i18n.domains.find((x) => x.id === d) || { zh: d }).zh));
+    for (const s of doc.subdomains || []) chips.appendChild(h("a.chip" + (s.tier === "core" ? ".on" : ""), { href: `#/subdomains/${encodeURIComponent(s.sub_id)}`, title: s.sub_id }, i18n.lang === "en" ? (s.en || s.zh) : s.zh));
+    for (const c of doc.top_concepts || []) {
+      const on = state.c.includes(c.id);
+      chips.appendChild(h("a.chip" + (on ? ".on" : ""), { href: "#", title: (c.zh || "") + " · " + t("doc.markHint"), on: { click: (ev) => { ev.preventDefault(); toggleConcept(c.id); } } }, c.label, h("span.n", String(c.n))));
+    }
+    if (state.c.length) chips.appendChild(h("button.btn.small", { type: "button", on: { click: () => { state.c = []; syncHash(); renderChips(); state.pageCache.clear(); render(); } } }, t("doc.clearMarks")));
+  }
+  function toggleConcept(cid) {
+    state.c = state.c.includes(cid) ? state.c.filter((x) => x !== cid) : [...state.c, cid];
+    syncHash(); renderChips(); state.pageCache.clear(); render();
+  }
   const head = h("div.reader-head",
-    h("div.crumb", h("a", { href: "#/docs" }, t("nav.docs")), " / ", h("span.mono", doc.doc_id)),
+    h("div.crumb", h("a", { href: "#/docs" }, t("nav.docs")), " / ", h("span.mono", doc.doc_id),
+      (doc.units || []).length > 1 ? [" · ", h("span.muted", `${doc.units.length - 1} ${t("doc.units")}`)] : null),
     h("div.reader-title", doc.title || t("common.untitled")),
     h("div.reader-meta", metaBits, doc.doi ? [" · ", h("a", { href: "https://doi.org/" + doc.doi, target: "_blank", rel: "noopener" }, doc.doi)] : null),
+    chips,
   );
+  renderChips();
   const pageInput = h("input.pageno", { type: "number", min: 1, max: Math.max(1, nPages), value: state.page,
     on: { change: () => setPage(Number(pageInput.value)) } });
   const pageOf = h("span.muted");
@@ -84,7 +103,7 @@ export async function readerView(docId, params) {
 
   function clampPage(p, n) { return Math.max(1, Math.min(p || 1, Math.max(1, n))); }
   function syncHash() {
-    replaceHash(["docs", doc.doc_id], { page: state.page, hl: state.hl || undefined, sid: state.sid || undefined });
+    replaceHash(["docs", doc.doc_id], { page: state.page, hl: state.hl || undefined, sid: state.sid || undefined, c: state.c.length ? state.c.join(",") : undefined });
   }
   function setPage(p) {
     p = clampPage(p, nPages);
@@ -104,9 +123,28 @@ export async function readerView(docId, params) {
 
   async function pageData(n) {
     if (!state.pageCache.has(n)) {
-      state.pageCache.set(n, api.get(`docs/${encodeURIComponent(doc.doc_id)}/pages/${n}`));
+      state.pageCache.set(n, api.get(`docs/${encodeURIComponent(doc.doc_id)}/pages/${n}`, { c: state.c.length ? state.c.join(",") : undefined }));
     }
     return state.pageCache.get(n);
+  }
+
+  /** Stored sentence text with the concept occurrences (and the phrase highlight) marked. */
+  function sentenceText(s) {
+    const occ = (s.concepts || []).filter((o) => o.cend > o.cstart).sort((a, b) => a.cstart - b.cstart);
+    if (!occ.length) return markPhrase(s.text, state.hl);
+    const frag = document.createDocumentFragment();
+    const text = String(s.text ?? "");
+    let i = 0;
+    for (const o of occ) {
+      if (o.cstart < i) continue;
+      if (o.cstart > i) frag.appendChild(markPhrase(text.slice(i, o.cstart), state.hl));
+      const m = h("mark.occ" + (o.nested_in ? ".nested" : ""), text.slice(o.cstart, o.cend));
+      m.title = o.id + (o.nested_in ? ` (${t("concept.nested")} ${o.nested_in})` : "");
+      frag.appendChild(m);
+      i = o.cend;
+    }
+    if (i < text.length) frag.appendChild(markPhrase(text.slice(i), state.hl));
+    return frag;
   }
 
   let renderSeq = 0;
@@ -133,10 +171,13 @@ export async function readerView(docId, params) {
   async function renderImage(seq) {
     if (!doc.has_pdf) { clear(viewer).appendChild(h("div.empty", t("reader.noPdf"))); return; }
     let spans;
-    if (state.sid) {
+    if (state.sid || state.c.length) {
       const pd = await pageData(state.page);
+      const parts = [];
       const s = pd.sentences.find((x) => x.sid === state.sid);
-      if (s) spans = `${s.cstart}-${s.cend}`;
+      if (s) parts.push(`${s.cstart}-${s.cend}`);
+      if (state.c.length) for (const x of pd.sentences) if ((x.concepts || []).length && x.sid !== state.sid) parts.push(`${x.cstart}-${x.cend}`);
+      if (parts.length) spans = parts.slice(0, 200).join(",");
     }
     const res = await api.png(`docs/${encodeURIComponent(doc.doc_id)}/pages/${state.page}.png`,
       { hl: state.hl || undefined, spans, zoom: state.zoom });
@@ -159,19 +200,22 @@ export async function readerView(docId, params) {
     const box = h("div.sents");
     if (!pd.sentences.length) box.appendChild(h("div.empty", t("reader.noText")));
     let selectedEl = null;
+    let nMarked = 0;
     for (const s of pd.sentences) {
+      nMarked += (s.concepts || []).length;
       const row = h("div.sent" + (s.is_body ? "" : ".dim"), { data: { sid: s.sid } },
         h("div.meta", h("span.seq", "#" + s.seq), sectionBadge(s.section, s.is_body), tagBadges(s.tags),
           s.notes ? h("span.badge.accent", t("sent.notes", { n: s.notes })) : null,
           s.is_body ? null : h("span.badge.warn", t("sent.reference"))),
-        h("div.txt", markPhrase(s.text, state.hl)),
+        h("div.txt", sentenceText(s)),
       );
       row.addEventListener("click", () => select(s, row));
       if (s.sid === state.sid) { row.classList.add("sel"); selectedEl = row; }
       box.appendChild(row);
     }
     clear(viewer).appendChild(box);
-    viewer.insertBefore(h("div.muted", { style: "font-size:12px;margin:0 0 6px 4px" }, t("reader.selectHint"), " · ", t("reader.sentences", { n: pd.sentences.length })), box);
+    viewer.insertBefore(h("div.muted", { style: "font-size:12px;margin:0 0 6px 4px" }, t("reader.selectHint"), " · ", t("reader.sentences", { n: pd.sentences.length }),
+      state.c.length ? [" · ", t("reader.marked", { n: nMarked })] : null), box);
     if (selectedEl) selectedEl.scrollIntoView({ block: "center" });
   }
 
@@ -204,10 +248,13 @@ export async function readerView(docId, params) {
     update(p) {
       const page = clampPage(Number(p.page) || 1, nPages);
       const sid = p.sid || null;
-      const changed = page !== state.page || (p.hl || "") !== state.hl || sid !== state.sid;
+      const cs = (p.c || "").split(",").map((x) => x.trim()).filter(Boolean);
+      const cChanged = cs.join(",") !== state.c.join(",");
+      const changed = page !== state.page || (p.hl || "") !== state.hl || sid !== state.sid || cChanged;
       const sidChanged = sid !== state.sid;
-      state.page = page; state.hl = p.hl || ""; state.sid = sid;
+      state.page = page; state.hl = p.hl || ""; state.sid = sid; state.c = cs;
       hlInput.value = state.hl;
+      if (cChanged) { state.pageCache.clear(); renderChips(); }
       if (changed) { render(); if (sidChanged) syncSelection(); }
     },
     destroy() { if (state.objectUrl) URL.revokeObjectURL(state.objectUrl); panel.flush(); },

@@ -340,6 +340,24 @@ class EvidenceStore:
                             section=r["section"], is_body=bool(r["is_body"]), tags=tuple(_unwrap(r["tags"])),
                             flags=tuple(_unwrap(r["flags"]))) for r in rows]
 
+    def sentence_texts_of_doc(self, doc_id: str) -> list[tuple[str, str]]:
+        """(sid, text) of every stored sentence of a document (any extraction)."""
+        return [(r[0], r[1]) for r in self.conn.execute("SELECT sid, text FROM sentences WHERE doc_id=?", (doc_id,))]
+
+    def units_of(self, doc_id: str) -> list[dict]:
+        """Units of the current extraction (document unit first)."""
+        ext_id = self._current_ext_id(doc_id)
+        if ext_id is None:
+            return []
+        rows = self.conn.execute("SELECT unit_id, doc_id, kind, ordinal, heading, page_from, page_to, confidence, "
+                                 "reasons, parent_unit, unit_kind FROM units WHERE ext_id=? ORDER BY ordinal", (ext_id,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["reasons"] = [x for x in (d.get("reasons") or "").split(",") if x]
+            out.append(d)
+        return out
+
     # ---- reading ------------------------------------------------------------------------------------------
     def _current_ext_id(self, doc_id: str) -> str | None:
         r = self.conn.execute("SELECT ext_id FROM extractions WHERE doc_id=? AND is_current=1 "

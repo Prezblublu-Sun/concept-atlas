@@ -34,6 +34,7 @@ SQL_DIR = Path(__file__).with_name("sql")
 MIGRATIONS_DIR = SQL_DIR / "migrations"
 EVIDENCE_SCHEMA_VERSION = 1
 USER_SCHEMA_VERSION = 2     # 2: index on note_targets.resolved_ref (migrations/2.sql)
+BUILD_SCHEMA_VERSION = 1    # build.sqlite (increment 2)
 
 _MODES = ("rw", "ro", "immutable")
 
@@ -147,4 +148,12 @@ def open_user(path: str | Path, mode: str = "rw") -> sqlite3.Connection:
     conn = connect(path, mode)
     if mode == "rw":
         migrate(conn, "user.sql", USER_SCHEMA_VERSION)
+    return conn
+
+
+def open_build(path: str | Path, mode: str = "rw") -> sqlite3.Connection:
+    """connect + migrate('build.sql') when mode == 'rw'. Finished builds are opened with mode='immutable'."""
+    conn = connect(path, mode)
+    if mode == "rw":
+        migrate(conn, "build.sql", BUILD_SCHEMA_VERSION)
     return conn

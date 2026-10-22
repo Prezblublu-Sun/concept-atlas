@@ -4,8 +4,8 @@ All routes under /api/v1/. Path parameters in {braces}. JSON in/out (UTF-8), err
 4xx/5xx (also for unsupported methods such as OPTIONS/PATCH → 405). Query parameters are strings; the adapter
 converts ints/bools and type-checks JSON body values (wrong type → 400); `limit` is clamped to 1..1000 and
 `offset` to >= 0. POST/PUT take their parameters from the JSON body only (query parameters are ignored), with
-`Content-Type: application/json` (else 415). Every response carries `X-Atlas-Build: evidence` (increment 1)
-and `Cache-Control: no-cache` except PNG/PDF (max-age=600).
+`Content-Type: application/json` (else 415). Every response carries `X-Atlas-Build: <promoted build id>`
+('evidence' when no build is promoted) and `Cache-Control: no-cache` except PNG/PDF (max-age=600).
 
 GET  info                                    -> service.info()
 GET  i18n                                    -> service.i18n()
@@ -17,7 +17,14 @@ GET  docs/{doc_id}/search?phrase=&limit=&offset=           -> service.search(doc
 GET  pdf/{doc_id}                            -> the current PDF file (inline; ?download=1 → attachment)
 GET  search?phrase=&limit=&offset=           -> service.search
 GET  sentences/{sid}?context=                -> service.sentence
-GET  resolve?ref=                            -> service.resolve
+GET  resolve?ref=                            -> service.resolve (D: U: S: N: K: and, with a build, C: SD:)
+GET  concepts?q=&domain=&tier=&type=&sub=&cat=&scope=&sort=&dir=&limit=&offset=  -> service.list_concepts (409 without a build)
+GET  concepts/{concept_id}?scope=            -> service.get_concept
+GET  concepts/{concept_id}/sentences?section=&domain=&sub=&doc=&tag=&standalone=&sort=&limit=&offset=
+GET  concepts/{concept_id}/docs?scope=&use=&sort=&limit=&offset=
+GET  framework/terms | framework/categories?domain= | framework/subdomains
+GET  subdomains/{sub_id} | subdomains/{sub_id}/docs?tier=&q=&sort=&limit=&offset=
+GET  docs/{doc_id}/pages/{n}?c=C_a,C_b          -> sentences carry concepts: [{id, cstart, cend}]
 GET  notes?q=&tag=&limit=&offset=            -> service.list_notes
 POST notes            {title, body_md, tags[], targets[]}     -> service.create_note (201)
 GET  notes/{id}                              -> service.get_note
@@ -58,6 +65,15 @@ ROUTES: list[tuple[str, str, str]] = [
     ("GET", "search", "search"),
     ("GET", "sentences/{sid}", "sentence"),
     ("GET", "resolve", "resolve"),
+    ("GET", "concepts", "list_concepts"),
+    ("GET", "concepts/{concept_id}/sentences", "concept_sentences"),
+    ("GET", "concepts/{concept_id}/docs", "concept_docs"),
+    ("GET", "concepts/{concept_id}", "get_concept"),
+    ("GET", "framework/terms", "framework_terms"),
+    ("GET", "framework/categories", "framework_categories"),
+    ("GET", "framework/subdomains", "framework_subdomains"),
+    ("GET", "subdomains/{sub_id}/docs", "subdomain_docs"),
+    ("GET", "subdomains/{sub_id}", "get_subdomain"),
     ("GET", "notes/for", "notes_for"),
     ("GET", "notes", "list_notes"),
     ("POST", "notes", "create_note"),

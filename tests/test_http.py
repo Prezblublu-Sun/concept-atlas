@@ -317,7 +317,9 @@ def test_resolve(api):
     assert st == 200 and r["status"] == "orphan"
     st, _, r = api("GET", "resolve?ref=N:N_nope")
     assert st == 200 and r["status"] == "orphan"
-    st, _, r = api("GET", "resolve?ref=C:some-concept")
+    st, _, r = api("GET", "resolve?ref=C:some-concept")      # increment 2: C: resolves through a build; none here
+    assert st == 200 and r["status"] == "orphan" and "no_build" in r["flags"]
+    st, _, r = api("GET", "resolve?ref=A:some-answer")
     assert st == 200 and r["status"] == "orphan" and "unsupported_kind" in r["flags"]
     st, _, body = api("GET", "resolve?ref=garbage")
     assert st == 400 and "ref" in body["error"]
@@ -722,10 +724,10 @@ def test_request_threads_reuse_pooled_stores(api, served):
         assert api("GET", "info")[0] == 200
     assert svc.pool_size() >= 1
     pair = svc._pool[-1]
-    before = {id(st.conn) for p in svc._pool for st in p}
+    before = {id(st.conn) for p in svc._pool for st in p if st is not None}
     for _ in range(3):
         assert api("GET", "docs")[0] == 200
-    after = {id(st.conn) for p in svc._pool for st in p}
+    after = {id(st.conn) for p in svc._pool for st in p if st is not None}
     assert before == after and len(svc._pool) <= 3
     assert id(pair[0].conn) in after
 
@@ -781,3 +783,257 @@ def test_serve_log_setup(served):
     assert len(handlers) == 1 and handlers[0].maxBytes == 5 * 1024 * 1024 and handlers[0].backupCount == 3
     logging.getLogger("atlas").removeHandler(handlers[0])
     handlers[0].close()
+
+
+# ================================================================================================================
+# Increment 2: concept / framework routes against a fixture project with a finished build (built through the real
+# commands: fixture corpus → ingest → curated set written by the test → `atlas build all`).
+# ================================================================================================================
+import os as _os
+import shutil as _shutil
+import stat as _stat
+
+from atlas.pipeline import build as _B
+from atlas.pipeline import gates as _gates
+from atlas.pipeline.runner import run_stage as _run_stage
+from atlas.pipeline.stages.ingest import register_documents as _register
+from atlas.tools.fixture import make_fixture as _make_fixture
+from tests.test_build_pipeline import write_curated as _write_curated
+
+
+@pytest.fixture(scope="module")
+def served_build(tmp_path_factory):
+    base = tmp_path_factory.mktemp("http build 测试")
+    info = _make_fixture(base / "fx", 1)
+    project = init_project(base / "proj", name="HTTP build project", pdf_dir=str(base / "fx" / "pdf"))
+    _shutil.copy(info["manifest"], project.manifest_path)
+    assert _register(project).items_failed == 0
+    assert _run_stage(project, "ingest").items_failed == 0
+    docs = [d["doc_id"] for d in info["documents"]]
+    _write_curated(project, docs)
+    _gates.confirm_all(project)
+    r = _B.build_all(project, note="http", workers=1)
+    service = AtlasService(project)
+    srv, thread = http_server.run_in_thread(service, "127.0.0.1", 0)
+    base_url = "http://127.0.0.1:%d" % srv.server_address[1]
+    yield {"base": base_url, "project": project, "service": service, "server": srv, "build_id": r["build_id"], "info": info, "docs": docs}
+    srv.shutdown()
+    srv.server_close()
+    thread.join(timeout=5)
+    service.shutdown()
+    for p in project.builds_dir.glob("*/build.sqlite"):
+        _os.chmod(p, _stat.S_IWRITE | _stat.S_IREAD)
+
+
+@pytest.fixture
+def bapi(served_build):
+    base = served_build["base"]
+
+    def call(method, path, body=None, raw=False):
+        return _req(base, method, "/api/v1/" + path.lstrip("/"), body, raw)
+    call.base = base
+    return call
+
+
+def test_build_info_and_header(bapi, served_build):
+    bid = served_build["build_id"]
+    st, hd, body = bapi("GET", "info")
+    assert st == 200 and body["build"] == bid and hd["X-Atlas-Build"] == bid
+    assert body["build_info"]["id"] == bid and body["build_info"]["docs"] == 9 and body["build_info"]["concepts"] == 6
+    assert body["build_info"]["sentences"] > 0 and body["build_info"]["occurrences"] > 0
+    st, _, i18n = bapi("GET", "i18n")
+    assert i18n["data"] == {"微动": "Micromotion"} and [d["id"] for d in i18n["domains"]] == ["DOM_ortho", "DOM_fe"]
+    assert i18n["tiers"]["A"]["zh"] and i18n["ui"]["nav.concepts"] == {"zh": "概念", "en": "Concepts"}
+    assert i18n["sections"]["body"]["en"] == "Body"
+
+
+def test_no_build_routes_answer_409(api):
+    st, hd, body = api("GET", "concepts")
+    assert st == 409 and body["error"] == "no build promoted" and hd["X-Atlas-Build"] == "evidence"
+    assert api("GET", "concepts/C_x")[0] == 409
+    assert api("GET", "framework/terms")[0] == 409 and api("GET", "framework/subdomains")[0] == 409
+    assert api("GET", "subdomains/X")[0] == 409
+    st, _, d = api("GET", "docs/P001")
+    assert st == 200 and d["domains"] == [] and d["subdomains"] == [] and d["top_concepts"] == [] and d["units"][0]["kind"] == "document"
+    st, _, p = api("GET", "docs/P001/pages/1?c=C_x")
+    assert st == 200 and p["sentences"][0]["concepts"] == [] and p["concepts"] == ["C_x"]
+
+
+def test_concept_list_sorting_and_filters(bapi):
+    st, _, body = bapi("GET", "concepts")
+    assert st == 200 and body["total"] == 6 and body["scope"] == "all" and body["sort"] == "papers" and body["dir"] == "desc"
+    papers = [r["papers"] for r in body["rows"]]
+    assert papers == sorted(papers, reverse=True)
+    row = body["rows"][0]
+    assert {"id", "label", "zh", "type", "mode", "papers", "coverage", "topic_rate", "tier", "main_section", "notes"} <= set(row)
+    st, _, asc = bapi("GET", "concepts?sort=label")
+    assert [r["label"] for r in asc["rows"]] == sorted((r["label"] for r in asc["rows"]), key=str.lower) and asc["dir"] == "asc"
+    st, _, desc = bapi("GET", "concepts?sort=label&dir=desc")
+    assert [r["id"] for r in desc["rows"]] == [r["id"] for r in asc["rows"]][::-1]
+    st, _, b = bapi("GET", "concepts?q=" + urllib.parse.quote("微"))
+    assert b["total"] == 1 and b["rows"][0]["id"] == "C_micromotion"
+    st, _, b = bapi("GET", "concepts?domain=DOM_fe")
+    assert {r["id"] for r in b["rows"]} == {"C_micromotion", "C_finiteelement", "C_stressstrainfield"}
+    st, _, b = bapi("GET", "concepts?tier=A")
+    assert b["total"] >= 1 and all(r["tier"] == "A" for r in b["rows"])
+    st, _, b = bapi("GET", "concepts?type=" + urllib.parse.quote("名词术语"))
+    assert {r["id"] for r in b["rows"]} == {"C_stem", "C_femoralstem"}
+    st, _, b = bapi("GET", "concepts?sub=ORT-MM")
+    assert b["total"] >= 1
+    st, _, b = bapi("GET", "concepts?cat=O1")
+    assert [r["id"] for r in b["rows"]] == ["C_micromotion"]
+    st, _, b = bapi("GET", "concepts?scope=DOM_fe")
+    assert b["scope"] == "DOM_fe" and max(r["papers"] for r in b["rows"]) == 5
+    assert bapi("GET", "concepts?scope=DOM_nope")[0] == 400
+    st, _, b = bapi("GET", "concepts?limit=2&offset=2")
+    assert len(b["rows"]) == 2 and b["total"] == 6
+
+
+def test_concept_page(bapi, served_build):
+    st, _, c = bapi("GET", "concepts/C_micromotion")
+    assert st == 200 and c["id"] == "C_micromotion" and c["forms"] == ["micromotion", "micromotions"] and c["zh"] == "微动"
+    scopes = [m["scope"] for m in c["importance"]]
+    assert scopes == ["all", "DOM_ortho", "DOM_fe"]
+    all_ = c["importance"][0]
+    assert all_["papers"] == 9 and all_["coverage"] == 1.0 and all_["tier"] in ("A", "B") and "year_cov" in all_
+    assert any(s["section"] == "body" and s["papers"] == 9 for s in c["sections"])
+    assert c["domains_use"][0]["domain"] == "DOM_ortho" and c["domains_use"][-1]["domain"] is None
+    assert c["years"] and c["year_totals"] and sum(c["year_totals"].values()) == 9
+    assert c["categories"][0]["primary_cat"] == "O1" and c["categories"][0]["primary_zh"] == "指标"
+    assert c["subdomains"] and c["subdomains"][0]["sub_id"] in ("ORT-MM", "X-FEMM") and "score" in c["subdomains"][0]
+    assert [a["sub_id"] for a in c["anchor_of"]] == ["ORT-MM", "X-FEMM"]
+    assert c["term_tree_places"][0]["sub_name"] == "指标"
+    assert len(c["examples"]) == 6
+    ex = c["examples"][0]
+    assert ex["ref"].startswith("S:") and ex["kind"] == "S" and ex["text"] and ex["spans"] and ex["page"] >= 1
+    a, b = ex["spans"][0][:2]
+    assert ex["text"][a:b].lower() == "micromotion"
+    assert c["notes"] == 0 and c["build"] == served_build["build_id"]
+    assert bapi("GET", "concepts/C_nope")[0] == 404
+    st, _, lit = bapi("GET", "concepts/C_stressstrainfield")
+    assert st == 200 and lit["mode"] == "literal" and lit["rx"]
+
+
+def test_concept_sentences_and_docs(bapi, served_build):
+    info = served_build["info"]
+    st, _, s = bapi("GET", "concepts/C_micromotion/sentences?limit=5")
+    assert st == 200 and s["total"] > 9 and len(s["rows"]) == 5
+    row = s["rows"][0]
+    assert {"sid", "doc_id", "title", "year", "page", "section", "text", "spans", "tags", "ref"} <= set(row)
+    for a, b, form, nested in row["spans"]:
+        assert row["text"][a:b].lower() == "micromotion"
+    st, _, s2 = bapi("GET", "concepts/C_micromotion/sentences?doc=P001&standalone=1")
+    assert s2["total"] == info["micromotion_counts"]["P001"] + 1 and all(r["doc_id"] == "P001" for r in s2["rows"])
+    st, _, s3 = bapi("GET", "concepts/C_micromotion/sentences?section=results&sort=year")
+    assert all(r["section"] == "results" for r in s3["rows"])
+    years = [r["year"] for r in s3["rows"]]
+    assert years == sorted(years, reverse=True)
+    st, _, s4 = bapi("GET", "concepts/C_micromotion/sentences?domain=DOM_fe")
+    assert s4["total"] < s["total"]
+    st, _, s5 = bapi("GET", "concepts/C_micromotion/sentences?sub=ORT-MM&tag=quant")
+    assert all("quant" in r["tags"] for r in s5["rows"])
+    assert bapi("GET", "concepts/C_micromotion/sentences?section=nope")[0] == 400
+    assert bapi("GET", "concepts/C_nope/sentences")[0] == 404
+    st, _, d = bapi("GET", "concepts/C_micromotion/docs")
+    assert st == 200 and d["total"] == 9 and d["rows"][0]["body"] >= d["rows"][-1]["body"]
+    assert {"doc_id", "title", "year", "keywords", "abstract", "introduction", "methods", "results", "discussion", "body", "refs"} <= set(d["rows"][0])
+    st, _, d2 = bapi("GET", "concepts/C_micromotion/docs?scope=DOM_fe&sort=year")
+    assert d2["total"] == 5
+    assert bapi("GET", "concepts/C_micromotion/docs?use=nope")[0] == 400
+
+
+def test_framework_routes(bapi):
+    st, _, t = bapi("GET", "framework/terms")
+    assert st == 200 and t["domains"][0]["id"] == "DOM_ortho"
+    sec = t["domains"][0]["sections"][0]
+    assert sec["section"] == "title" and sec["subs"][0]["terms"][0]["concept_id"] == "C_micromotion" and sec["n"] == 1
+    st, _, c = bapi("GET", "framework/categories")
+    assert st == 200 and [d["id"] for d in c["domains"]] == ["DOM_ortho", "DOM_fe"]
+    cat = c["domains"][0]["categories"][0]
+    assert cat["id"] == "O1" and cat["concepts"][0]["id"] == "C_micromotion" and cat["concepts"][0]["papers"] == 9 and cat["papers"] == 9
+    st, _, c2 = bapi("GET", "framework/categories?domain=DOM_fe")
+    assert [d["id"] for d in c2["domains"]] == ["DOM_fe"] and c2["domains"][0]["categories"] == []
+    st, _, s = bapi("GET", "framework/subdomains")
+    groups = {g["id"]: g for g in s["groups"]}
+    assert groups["DOM_ortho"]["subs"][0]["id"] == "ORT-MM" and groups["DOM_ortho"]["subs"][0]["papers"] == 9
+    assert groups["cross"]["subs"][0]["id"] == "X-FEMM" and groups["cross"]["subs"][0]["base"] == 9
+
+
+def test_subdomain_page_and_docs(bapi):
+    st, _, s = bapi("GET", "subdomains/ORT-MM")
+    assert st == 200 and s["id"] == "ORT-MM" and s["kind"] == "within" and s["papers"] == 9 and s["base"] == 9
+    assert s["anchors"] == [[{"id": "C_micromotion", "label": "micromotion", "zh": "微动", "type": "量与指标"},
+                             {"id": "C_primarystability", "label": "primary stability", "zh": "初始稳定性", "type": "量与指标"}]]
+    assert s["concepts"] and s["concepts"][0]["rank"] == 1 and s["n_concepts"] >= 1
+    assert s["docs"] and {"doc_id", "tier", "hits", "n_hits", "title"} <= set(s["docs"][0])
+    assert s["years"] and s["tiers"] and s["notes"] == 0
+    st, _, x = bapi("GET", "subdomains/X-FEMM")
+    assert x["kind"] == "cross" and len(x["anchors"]) == 2 and x["overlaps"][0]["id"] == "ORT-MM"
+    st, _, d = bapi("GET", "subdomains/ORT-MM/docs?tier=core&limit=3")
+    assert st == 200 and len(d["rows"]) <= 3 and all(r["tier"] == "core" for r in d["rows"]) and d["total"] == s["core"]
+    st, _, d2 = bapi("GET", "subdomains/ORT-MM/docs?q=review")
+    assert d2["total"] == 1 and d2["rows"][0]["doc_id"] == "P009"
+    assert bapi("GET", "subdomains/NOPE")[0] == 404 and bapi("GET", "subdomains/NOPE/docs")[0] == 404
+
+
+def test_doc_extension_and_page_marks(bapi):
+    st, _, d = bapi("GET", "docs/P001")
+    assert st == 200 and d["domains"] == ["DOM_ortho", "DOM_fe"] and d["in_build"] is True
+    assert any(s["sub_id"] == "ORT-MM" for s in d["subdomains"]) and d["top_concepts"][0]["n"] >= 1
+    assert d["units"][0]["unit_id"] == "P001" and d["units"][0]["kind"] == "document"
+    st, _, p = bapi("GET", "docs/P001/pages/2?c=C_micromotion,C_stem")
+    assert st == 200 and p["concepts"] == ["C_micromotion", "C_stem"]
+    marked = [s for s in p["sentences"] if s["concepts"]]
+    assert marked
+    for s in marked:
+        for o in s["concepts"]:
+            assert o["id"] in ("C_micromotion", "C_stem")
+            assert s["text"][o["cstart"]:o["cend"]].lower() in ("micromotion", "micromotions", "stem", "stems")
+    st, _, p2 = bapi("GET", "docs/P001/pages/2")
+    assert "concepts" not in p2["sentences"][0]
+
+
+def test_resolve_build_refs(bapi):
+    st, _, r = bapi("GET", "resolve?ref=C:C_micromotion")
+    assert st == 200 and r["status"] == "live" and r["title"] == "micromotion" and r["zh"] == "微动" and r["kind"] == "C"
+    st, _, r = bapi("GET", "resolve?ref=C:C_nope")
+    assert st == 200 and r["status"] == "orphan"
+    st, _, r = bapi("GET", "resolve?ref=SD:ORT-MM")
+    assert st == 200 and r["status"] == "live" and r["zh"] == "微动" and r["en"] == "Micromotion" and r["sub_kind"] == "within"
+    st, _, r = bapi("GET", "resolve?ref=U:P001")
+    assert st == 200 and r["status"] == "live" and r["unit_id"] == "P001"
+    st, _, n = bapi("POST", "notes", {"title": "on micromotion", "body_md": "see [[SD:ORT-MM]]", "tags": ["x"],
+                                       "targets": ["C:C_micromotion", "SD:ORT-MM"]})
+    assert st == 201 and [t["ref"] for t in n["targets"]] == ["C:C_micromotion", "SD:ORT-MM"]
+    assert n["targets"][0]["snapshot_text"] == "micromotion" and n["targets"][0]["status"] == "live"
+    st, _, lst = bapi("GET", "concepts?q=micromotion")
+    assert lst["rows"][0]["notes"] == 1
+    st, _, c = bapi("GET", "concepts/C_micromotion")
+    assert c["notes"] == 1
+    st, _, s = bapi("GET", "subdomains/ORT-MM")
+    assert s["notes"] == 1
+    st, _, nf = bapi("GET", "notes/for?ref=SD:ORT-MM")
+    assert len(nf) == 1
+
+
+def test_build_switch_is_picked_up(bapi, served_build):
+    """Promoting another build changes the X-Atlas-Build header without a restart."""
+    project = served_build["project"]
+    bid = served_build["build_id"]
+    r = _B.build_all(project, note="second", workers=1)
+    try:
+        st, hd, body = bapi("GET", "info")
+        assert hd["X-Atlas-Build"] == r["build_id"] and body["build_info"]["id"] == r["build_id"]
+        assert bapi("GET", "concepts")[2]["build"] == r["build_id"]
+    finally:
+        _B.promote(project, bid)
+    st, hd, _ = bapi("GET", "info")
+    assert hd["X-Atlas-Build"] == bid
+
+
+def test_static_concept_modules(bapi):
+    for name in ("concepts.js", "framework.js"):
+        st, hd, payload = _req(bapi.base, "GET", "/static/" + name, raw=True)
+        assert st == 200 and hd["Content-Type"].startswith("text/javascript") and b"export" in payload
+    st, hd, payload = _req(bapi.base, "GET", "/", raw=True)
+    assert b'data-view="concepts"' in payload and b'data-view="framework"' in payload

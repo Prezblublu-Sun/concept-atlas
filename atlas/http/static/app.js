@@ -2,6 +2,8 @@
 import { api, i18n, t, h, clear, parseHash, go, replaceHash } from "./core.js";
 import { readerView } from "./reader.js";
 import { documentsView, searchView, notesView, noteView, collectionsView, collectionView, refView } from "./views.js";
+import { conceptsView, conceptView, conceptSentencesView } from "./concepts.js";
+import { frameworkView, subdomainView } from "./framework.js";
 
 const main = document.getElementById("view");
 let current = { key: null, view: null };
@@ -20,7 +22,10 @@ async function loadInfo() {
     const info = await api.get("info");
     document.getElementById("project-name").textContent = info.project || t("app.name");
     document.title = `${info.project} · ${t("app.name")}`;
-    document.getElementById("project-sub").textContent = t("info.stats", info.stats || {});
+    const bits = [t("info.stats", info.stats || {})];
+    if (info.build_info) bits.push(t("app.buildLabel", { id: info.build_info.id }) + " · " + t("info.build", info.build_info));
+    else bits.push(t("app.build"));
+    document.getElementById("project-sub").textContent = bits.join(" · ");
   } catch (e) {
     document.getElementById("project-sub").textContent = `${t("common.error")}: ${e.message}`;
   }
@@ -47,6 +52,11 @@ async function route() {
   let view;
   try {
     if (!top || top === "docs" && !id) { setActiveNav("docs"); view = await documentsView(params); }
+    else if (top === "concepts" && !id) { setActiveNav("concepts"); view = await conceptsView(params); }
+    else if (top === "concepts" && path[2] === "sentences") { setActiveNav("concepts"); view = await conceptSentencesView(id, params); }
+    else if (top === "concepts") { setActiveNav("concepts"); view = await conceptView(id, params); }
+    else if (top === "framework") { setActiveNav("framework"); view = await frameworkView(params); }
+    else if (top === "subdomains" && id) { setActiveNav("framework"); view = await subdomainView(id, params); }
     else if (top === "docs") { setActiveNav("docs"); view = await readerView(id, params); }
     else if (top === "search") { setActiveNav(""); view = await searchView(params); }
     else if (top === "notes" && !id) { setActiveNav("notes"); view = await notesView(params); }

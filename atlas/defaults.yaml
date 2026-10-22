@@ -28,9 +28,20 @@ overview:
   stale_ratio: 0.10
   stale_min_added: 30
   per_unit_cap: 40
-stats:
-  trend_recent: [2024, 2026]
-  trend_base_until: 2020
+stats:                                # v2 counting rules (atlas/core/stats.py); every value is a count-derived threshold
+  cov_hi: 0.10                        # tier A/B: coverage >= 10 %
+  topic_hi: 0.10                      # tier A/C: topic rate >= 10 %
+  min_papers: 5                       # tier E below this many documents
+  year_bins: [["≤2015", null, 2015], ["2016–2020", 2016, 2020], ["2021–2023", 2021, 2023], ["2024–2026", 2024, 2026]]
+  trend_early_bins: ["≤2015", "2016–2020"]
+  trend_late_bins: ["2024–2026"]
+  trend_min_n: 30                     # both windows need this many documents for a trend
+  trend_up: 2.0
+  trend_down: 0.5
+  trend_min_k: 10
+  strong_abstract_hits: 2             # sub-domain 'core' when anchors appear this often in the abstract
+  body_extra_sections: [appendix]     # counted as body besides the is_body sentences (the previous system counted appendices)
+  body_includes_title: true           # title-field hits add to 'body' (the previous system's full text began with the title line)
 qa:
   accept_threshold: 0.85
 embedding:

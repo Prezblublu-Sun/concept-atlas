@@ -9,7 +9,12 @@ ThreadingHTTPServer runs every request on a fresh thread, the HTTP adapter wraps
 which binds a pooled (EvidenceStore, UserStore) pair to the request thread and returns it to the pool
 afterwards, so connections (and the user-schema migration check) are not re-opened per request.
 
-Error convention (the HTTP adapter maps these): KeyError → 404, ValueError → 400, everything else → 500.
+Error convention (the HTTP adapter maps these): KeyError → 404, ValueError → 400, NoBuildError → 409,
+everything else → 500.
+
+Increment 2: `build()` is the BuildStore of the promoted build (`builds/current.txt`), pooled like the evidence
+store and re-opened when current.txt changes; the concept / framework routes answer 409 {"error": "no build
+promoted"} without one, the document / reader / notes routes keep working.
 """
 from __future__ import annotations
 
@@ -24,6 +29,9 @@ import atlas
 from atlas.config import Project
 from atlas.core.schemas import REF_KINDS, SECTION_ZH, SECTIONS, TAGS, parse_ref
 from atlas.ingest import pdf as pdf_io
+from atlas.core.stats import TIER_EN, TIER_ZH, TIERS
+from atlas.pipeline.build import read_manifest, resolve_build
+from atlas.store.build import BuildStore, current_build_id
 from atlas.store.evidence import EvidenceStore
 from atlas.store.user import ConflictError, UserStore
 
@@ -39,7 +47,15 @@ TAG_EN = {"def": "Definition", "quant": "Quantitative", "method": "Method", "mec
 KIND_ZH = {"document": "文献", "unit": "单元", "sentence": "句子", "concept": "概念", "statement": "陈述",
            "subdomain": "子领域", "answer": "回答", "note": "笔记", "collection": "摘录册", "query": "查询"}
 
-_RESOLVABLE = ("D", "U", "S", "N", "K")
+_RESOLVABLE = ("D", "U", "S", "N", "K", "C", "SD")
+_NEEDS_BUILD = ("C", "SD")
+
+
+class NoBuildError(Exception):
+    """A concept/framework route was called while no build is promoted (HTTP 409)."""
+
+    def __init__(self):
+        super().__init__("no build promoted")
 
 
 def _ref_object(**kw) -> dict:
@@ -60,10 +76,11 @@ class AtlasService:
     def __init__(self, project: Project):
         self.project = project
         self._local = threading.local()
-        self._pool: list[tuple[EvidenceStore, UserStore]] = []
+        self._pool: list[tuple[EvidenceStore, UserStore, BuildStore | None]] = []
         self._pool_lock = threading.Lock()
         self._ui_strings = self._load_ui_strings()
-        log.info("service for project %s at %s", project.name, project.root)
+        self._build_id: str | None = current_build_id(project.builds_dir)
+        log.info("service for project %s at %s (build %s)", project.name, project.root, self._build_id)
 
     # ---- per-thread stores ----------------------------------------------------------------------------------
     def _open_evidence(self) -> EvidenceStore:
@@ -85,30 +102,95 @@ class AtlasService:
             self._local.user = st
         return st
 
+    # ---- promoted build -----------------------------------------------------------------------------------
+    def _refresh_build_id(self) -> None:
+        """Re-read builds/current.txt (cheap) and drop pooled build stores when it changed."""
+        bid = current_build_id(self.project.builds_dir)
+        if bid != self._build_id:
+            log.info("promoted build changed: %s -> %s", self._build_id, bid)
+            self._build_id = bid
+            with self._pool_lock:
+                pairs, self._pool = self._pool, []
+            for pair in pairs:
+                for st in pair:
+                    if st is not None:
+                        try:
+                            st.close()
+                        except Exception:  # pragma: no cover - defensive
+                            pass
+            b = getattr(self._local, "build", None)
+            if b is not None:
+                try:
+                    b.close()
+                except Exception:  # pragma: no cover - defensive
+                    pass
+                self._local.build = None
+
+    def _open_build(self) -> BuildStore | None:
+        bid = self._build_id
+        if not bid:
+            return None
+        try:
+            d = resolve_build(self.project, bid)
+        except Exception as e:
+            log.warning("promoted build %s cannot be opened: %s", bid, e)
+            return None
+        m = read_manifest(d) or {}
+        mode = "immutable" if m.get("status") == "finished" else "ro"
+        return BuildStore.open(d, mode, evidence_path=self.project.evidence_db)
+
+    def build_optional(self) -> BuildStore | None:
+        """The promoted build's store for this thread, or None when no build is promoted."""
+        if getattr(self._local, "build_bid", None) != self._build_id:
+            b = getattr(self._local, "build", None)
+            if b is not None:
+                try:
+                    b.close()
+                except Exception:  # pragma: no cover - defensive
+                    pass
+            self._local.build = self._open_build()
+            self._local.build_bid = self._build_id
+        return getattr(self._local, "build", None)
+
+    def build(self) -> BuildStore:
+        b = self.build_optional()
+        if b is None:
+            raise NoBuildError()
+        return b
+
+    def build_label(self) -> str:
+        """Value of the X-Atlas-Build header: the promoted build id, else 'evidence'."""
+        return self._build_id or BUILD
+
     @contextmanager
     def lease(self) -> Iterator[None]:
         """Bind a pooled (EvidenceStore, UserStore) pair to the calling thread for the duration of a request and
         hand it back afterwards (review fix: ThreadingHTTPServer uses one thread per request, so plain
         thread-local caching opened two fresh connections per request). A thread that already holds stores
         keeps them."""
+        self._refresh_build_id()
         if getattr(self._local, "evidence", None) is not None or getattr(self._local, "user", None) is not None:
             yield
             return
         with self._pool_lock:
             pair = self._pool.pop() if self._pool else None
         if pair is None:
-            pair = (self._open_evidence(), UserStore.open(self.project.user_db, "rw"))
-        self._local.evidence, self._local.user = pair
+            pair = (self._open_evidence(), UserStore.open(self.project.user_db, "rw"), self._open_build())
+        self._local.evidence, self._local.user, self._local.build = pair
+        self._local.build_bid = self._build_id
         try:
             yield
         finally:
-            self._local.evidence = self._local.user = None
+            self._local.evidence = self._local.user = self._local.build = None
+            self._local.build_bid = None
             with self._pool_lock:
                 keep = len(self._pool) < self.POOL_SIZE
                 if keep:
                     self._pool.append(pair)
             if not keep:
                 for st in pair:
+                    if st is None:
+                        continue
                     try:
                         st.close()
                     except Exception:  # pragma: no cover - defensive
@@ -120,7 +202,7 @@ class AtlasService:
 
     def close(self) -> None:
         """Close this thread's connections (tests; the server's threads close theirs on exit)."""
-        for name in ("evidence", "user"):
+        for name in ("evidence", "user", "build"):
             st = getattr(self._local, name, None)
             if st is not None:
                 try:
@@ -136,6 +218,8 @@ class AtlasService:
             pairs, self._pool = self._pool, []
         for pair in pairs:
             for st in pair:
+                if st is None:
+                    continue
                 try:
                     st.close()
                 except Exception:  # pragma: no cover - defensive
@@ -143,9 +227,17 @@ class AtlasService:
 
     # ---- meta
     def info(self) -> dict:
-        """{project, build: 'evidence' (no builds yet), stats: EvidenceStore.stats(), version}"""
-        return {"project": self.project.name, "build": BUILD, "stats": self.evidence().stats(),
-                "version": atlas.__version__, "doc_type": self.project.get("doc_type", "paper")}
+        """{project, build: build id | 'evidence', build_info: {id, created, docs, sentences, concepts} | None,
+        stats: EvidenceStore.stats(), version}"""
+        b = self.build_optional()
+        binfo = None
+        if b is not None:
+            st = b.stats()
+            binfo = {"id": b.build_id, "created": st.get("created"), "docs": st["docs"], "sentences": st["sentences"],
+                     "concepts": st["concepts"], "occurrences": st.get("occurrences", 0)}
+        return {"project": self.project.name, "build": self.build_label(), "build_info": binfo,
+                "stats": self.evidence().stats(), "version": atlas.__version__,
+                "doc_type": self.project.get("doc_type", "paper")}
 
     @staticmethod
     def _load_ui_strings() -> dict:
@@ -162,13 +254,22 @@ class AtlasService:
         atlas.core.schemas (SECTION_ZH; English = the key capitalised).
 
         Shape: {"ui": {key: {zh, en}}, "sections": {section: {zh, en}}, "tags": {tag: {zh, en}},
-                "kinds": {ref kind letter: {zh, en}}}"""
-        return {
+                "kinds": {ref kind letter: {zh, en}}, "tiers": {A: {zh, en}}, "data": {zh: en} (the promoted
+                build's i18n table: domain / category / sub-domain names and descriptions), "domains": [...]}"""
+        out = {
             "ui": self._ui_strings,
             "sections": {s: {"zh": SECTION_ZH.get(s, s), "en": s.capitalize()} for s in SECTIONS},
             "tags": {t: {"zh": TAG_ZH.get(t, t), "en": TAG_EN.get(t, t.capitalize())} for t in TAGS},
             "kinds": {k: {"zh": KIND_ZH.get(v, v), "en": v.capitalize()} for k, v in REF_KINDS.items()},
+            "tiers": {t: {"zh": TIER_ZH[t], "en": TIER_EN[t]} for t in TIERS},
+            "data": {}, "domains": [],
         }
+        out["sections"]["body"] = {"zh": "正文", "en": "Body"}
+        b = self.build_optional()
+        if b is not None:
+            out["data"] = b.i18n_strings()
+            out["domains"] = b.domains()
+        return out
 
     # ---- documents and reading
     def _notes_count(self, ref: str) -> int:
@@ -193,11 +294,26 @@ class AtlasService:
         d["pages"] = self.evidence().pages_of(doc_id)
         d["notes_count"] = self._notes_count(f"D:{doc_id}")
         d["has_pdf"] = self.pdf_path(doc_id) is not None
+        d["units"] = self.evidence().units_of(doc_id)
+        d["domains"], d["subdomains"], d["top_concepts"] = [], [], []
+        b = self.build_optional()
+        if b is not None:
+            ext = b.doc_extension(doc_id)
+            if ext:
+                d["domains"] = ext["domains"]
+                d["subdomains"] = ext["subdomains"]
+                d["top_concepts"] = ext["top_concepts"]
+                if ext.get("units"):
+                    d["units"] = ext["units"]
+                d["in_build"] = True
+            else:
+                d["in_build"] = False
         return d
 
-    def page(self, doc_id: str, page_no: int) -> dict:
+    def page(self, doc_id: str, page_no: int, c: str | None = None) -> dict:
         """EvidenceStore.page() (sentences carry their stored text) + for each sentence the number of notes
-        targeting it."""
+        targeting it; with `c` (comma-separated concept ids) every sentence gets `concepts: [{id, cstart, cend}]`
+        from the promoted build (empty without one)."""
         d = self._doc(doc_id)
         p = self.evidence().page(doc_id, int(page_no))
         if p is None:
@@ -207,6 +323,13 @@ class AtlasService:
             s["notes"] = counts.get(f"S:{s['sid']}", 0)
         p["n_pages"] = int(d.get("n_pages") or 0)
         p["title"] = d.get("title")
+        ids = [x.strip() for x in (c or "").split(",") if x.strip()]
+        if ids:
+            b = self.build_optional()
+            marks = b.page_concepts(doc_id, int(page_no), ids) if b is not None else {}
+            for s in p["sentences"]:
+                s["concepts"] = marks.get(s["sid"], [])
+            p["concepts"] = ids
         return p
 
     def page_png(self, doc_id: str, page_no: int, highlight: str | None = None,
@@ -305,6 +428,24 @@ class AtlasService:
             out["status"] = "orphan"
             out["flags"] = ["unsupported_kind"]
             return out
+        if r.kind in _NEEDS_BUILD:
+            b = self.build_optional()
+            if b is None:
+                out["flags"] = ["no_build"]
+                return out
+            if r.kind == "C":
+                c = b.concept(r.id)
+                if c is None:
+                    return out
+                out.update({"title": c["label"], "text": c["label"], "zh": c.get("zh"), "status": alias_status,
+                            "concept_id": r.id, "type": c.get("type")})
+                return out
+            sd = b.subdomain_label(r.id)
+            if sd is None:
+                return out
+            out.update({"title": sd.get("zh"), "text": sd.get("zh"), "zh": sd.get("zh"), "en": sd.get("en"),
+                        "status": alias_status, "sub_id": r.id, "sub_kind": sd.get("kind")})
+            return out
         ev = self.evidence()
         if r.kind == "S":
             s = ev.sentence(r.id, 0)
@@ -324,6 +465,15 @@ class AtlasService:
                         "unit_id": r.id if r.kind == "U" else doc_id,
                         "text": d.get("title") if r.kind == "D" else r.id.split("/", 1)[-1],
                         "status": alias_status, "authors": d.get("authors"), "venue": d.get("venue")})
+            if r.kind == "U":
+                units = {u["unit_id"]: u for u in ev.units_of(doc_id)}
+                u = units.get(r.id)
+                if u is None:
+                    b = self.build_optional()
+                    u = b.unit(r.id) if b is not None else None
+                if u:
+                    out.update({"heading": u.get("heading"), "page": u.get("page_from"), "unit_kind": u.get("unit_kind"),
+                                "text": u.get("heading") or out["text"]})
             return out
         if r.kind == "N":
             n = self.user().get_note(r.id)
@@ -339,10 +489,109 @@ class AtlasService:
                     "n_items": len(k.get("items") or [])})
         return out
 
+    # ---- concepts and frameworks (promoted build; NoBuildError → 409) ---------------------------------------
+    def list_concepts(self, q: str | None = None, domain: str | None = None, tier: str | None = None,
+                      type: str | None = None, sub: str | None = None, cat: str | None = None, scope: str = "all",
+                      sort: str = "papers", dir: str | None = None, limit: int = 100, offset: int = 0) -> dict:
+        """{rows: [{id, label, zh, type, mode, papers, coverage, topic_rate, tier, main_section, notes}], total, scope}"""
+        b = self.build()
+        if scope and scope != "all" and scope not in b.scope_ids():
+            raise ValueError(f"unknown scope {scope!r}")
+        res = b.list_concepts(q=q, domain=domain, tier=tier, type=type, sub=sub, cat=cat, scope=scope or "all",
+                              sort=sort or "papers", dir=dir, limit=int(limit), offset=int(offset))
+        counts = self.user().note_counts([f"C:{r['id']}" for r in res["rows"]])
+        for r in res["rows"]:
+            r["notes"] = counts.get(f"C:{r['id']}", 0)
+        res["build"] = b.build_id
+        return res
+
+    def get_concept(self, concept_id: str, scope: str | None = None) -> dict:
+        b = self.build()
+        c = b.concept(concept_id)
+        if c is None:
+            raise KeyError(f"unknown concept {concept_id!r}")
+        c["importance"] = b.importance_of(concept_id)
+        c["scope"] = scope or "all"
+        c["sections"] = b.sections_of(concept_id)
+        c["domains_use"] = b.domains_use(concept_id)
+        c["years"] = b.years_of(concept_id)
+        c["year_totals"] = b.year_totals()
+        c["categories"] = b.categories_of(concept_id)
+        c["subdomains"] = b.subdomains_of(concept_id)
+        c["anchor_of"] = b.anchor_of(concept_id)
+        c["term_tree_places"] = b.term_tree_places(concept_id)
+        c["examples"] = [self._example_ref(e, concept_id) for e in b.examples(concept_id, 6)]
+        c["notes"] = self._notes_count(f"C:{concept_id}")
+        c["build"] = b.build_id
+        return c
+
+    def _example_ref(self, e: dict, concept_id: str) -> dict:
+        meta = self.build().doc_meta(e["doc_id"]) or {}
+        return _ref_object(ref=f"S:{e['sid']}", kind="S", doc_id=e["doc_id"], title=meta.get("title"),
+                           year=meta.get("year"), page=e.get("page_no"), sid=e["sid"], text=e.get("text"),
+                           status="live", section=e.get("section"), spans=e.get("spans") or [],
+                           tags=[t for t in (e.get("tags") or "").split(",") if t], concept_id=concept_id)
+
+    def concept_sentences(self, concept_id: str, section: str | None = None, domain: str | None = None,
+                          sub: str | None = None, doc: str | None = None, tag: str | None = None,
+                          standalone: bool = False, sort: str = "doc", limit: int = 50, offset: int = 0) -> dict:
+        """Every sentence with an occurrence of the concept: {rows: [{sid, doc_id, title, year, page, section, text,
+        spans: [[cstart, cend, form, nested_in]], tags}], total}."""
+        b = self.build()
+        if b.concept(concept_id) is None:
+            raise KeyError(f"unknown concept {concept_id!r}")
+        if section and section not in SECTIONS:
+            raise ValueError(f"unknown section {section!r}")
+        res = b.concept_sentences(concept_id, section=section, domain=domain, sub=sub, doc=doc, tag=tag,
+                                  standalone=bool(standalone), sort=sort or "doc", limit=int(limit), offset=int(offset))
+        for r in res["rows"]:
+            r["ref"] = f"S:{r['sid']}"
+        res["concept_id"] = concept_id
+        return res
+
+    def concept_docs(self, concept_id: str, scope: str | None = None, use: str = "body", sort: str = "count",
+                     limit: int = 50, offset: int = 0) -> dict:
+        b = self.build()
+        if b.concept(concept_id) is None:
+            raise KeyError(f"unknown concept {concept_id!r}")
+        if use not in ("body", "any", "refs"):
+            raise ValueError("use must be body | any | refs")
+        res = b.concept_docs(concept_id, scope=scope, use=use, sort=sort or "count", limit=int(limit), offset=int(offset))
+        res["concept_id"] = concept_id
+        return res
+
+    def framework_terms(self) -> dict:
+        b = self.build()
+        return {"domains": b.term_tree(), "build": b.build_id}
+
+    def framework_categories(self, domain: str | None = None, scope: str = "all") -> dict:
+        b = self.build()
+        return {"domains": b.categories_tree(domain or None, scope or "all"), "build": b.build_id}
+
+    def framework_subdomains(self) -> dict:
+        b = self.build()
+        return {"groups": b.subdomain_tree(), "build": b.build_id}
+
+    def get_subdomain(self, sub_id: str) -> dict:
+        b = self.build()
+        s = b.subdomain(sub_id)
+        if s is None:
+            raise KeyError(f"unknown sub-domain {sub_id!r}")
+        s["notes"] = self._notes_count(f"SD:{sub_id}")
+        s["build"] = b.build_id
+        return s
+
+    def subdomain_docs(self, sub_id: str, tier: str | None = None, q: str | None = None, sort: str = "hits",
+                       limit: int = 50, offset: int = 0) -> dict:
+        b = self.build()
+        if b.subdomain_label(sub_id) is None:
+            raise KeyError(f"unknown sub-domain {sub_id!r}")
+        return b.subdomain_docs(sub_id, tier=tier, q=q, sort=sort or "hits", limit=int(limit), offset=int(offset))
+
     # ---- notes and collections (thin pass-through to UserStore, snapshots taken here)
     def _snapshot(self, ref: str) -> dict:
         obj = self.resolve(ref)
-        return {"ref": ref, "snapshot_text": obj.get("text"), "snapshot_json": obj, "snapshot_build": BUILD,
+        return {"ref": ref, "snapshot_text": obj.get("text"), "snapshot_json": obj, "snapshot_build": self.build_label(),
                 "status": obj.get("status")}
 
     def create_note(self, title: str, body_md: str, tags: list[str], target_refs: list[str]) -> dict:

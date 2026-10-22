@@ -11,7 +11,7 @@
   → 411; the declared body is always read (or the connection closed) so an error response never leaves unread
   bytes on a keep-alive connection. Every handler wrapped: exceptions → 500 {"error"}; KeyError/None → 404;
   ValueError → 400. Errors the stdlib would answer with HTML (501 unsupported method, 400 bad request line) are
-  JSON too.
+  JSON too. A concept/framework route without a promoted build answers 409 {"error": "no build promoted"}.
 - JSON body values are validated by type (see _coerce): wrong types → 400, never a 500 from the store.
 - Parameter precedence: path parameters > JSON body (POST/PUT) or query string (GET/DELETE); the body is
   authoritative for POST/PUT, query parameters are ignored there.
@@ -43,7 +43,7 @@ from typing import Any
 import atlas
 from atlas.config import Project
 from atlas.http.routes import API_PREFIX, BODY_ALIASES, CREATED, match
-from atlas.service.api import BUILD, AtlasService
+from atlas.service.api import AtlasService, NoBuildError
 
 log = logging.getLogger(__name__)
 
@@ -71,10 +71,11 @@ _EXPOSE = "X-Page, X-Pages, X-Hits, X-Hit-Y, X-Atlas-Build"
 # ---- parameter types: every service parameter the adapter may fill from a query string or a JSON body
 _INT_PARAMS = {"limit", "offset", "page_no", "context", "rev"}
 _FLOAT_PARAMS = {"zoom", "seq"}
-_BOOL_PARAMS = {"explicit"}
+_BOOL_PARAMS = {"explicit", "standalone"}
 _LIST_PARAMS = {"tags", "target_refs"}
 _STR_PARAMS = {"title", "body_md", "comment_md", "name", "description", "ref", "after_item", "phrase", "q", "tag",
-               "highlight", "doc_id", "note_id", "coll_id", "item_id", "sid"}
+               "highlight", "doc_id", "note_id", "coll_id", "item_id", "sid", "concept_id", "sub_id", "domain",
+               "tier", "type", "sub", "cat", "scope", "sort", "dir", "section", "doc", "c", "use"}
 MAX_LIMIT = 1000
 _INT_LIMIT = 2 ** 63 - 1
 _TRUE = ("1", "true", "yes", "on")
@@ -223,7 +224,7 @@ class AtlasHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("X-Atlas-Build", BUILD)
+        self.send_header("X-Atlas-Build", self.server.service.build_label())  # type: ignore[attr-defined]
         hdrs = dict(headers or {})
         cache = hdrs.pop("Cache-Control", None)
         if cache is None:
@@ -374,6 +375,8 @@ class AtlasHandler(BaseHTTPRequestHandler):
                     self._error(405, "method not allowed")
         except _HttpError as e:
             self._fail(int(e.code), e.msg)
+        except NoBuildError as e:
+            self._fail(409, str(e))
         except KeyError as e:
             self._fail(404, _key_msg(e))
         except (IndexError, FileNotFoundError) as e:
