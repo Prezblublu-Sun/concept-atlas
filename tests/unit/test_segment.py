@@ -91,7 +91,7 @@ def test_ellipsis_and_multiple_terminators():
 
 
 def test_segment_version_is_a_short_tag():
-    assert SEGMENT_VERSION == "seg5"
+    assert SEGMENT_VERSION == "seg6"
 
 
 # ---- caption labels (review fix: 'Fig. 2. Text' was split after '2.') ------------------------------------------

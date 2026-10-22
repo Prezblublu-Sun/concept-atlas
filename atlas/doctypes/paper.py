@@ -237,7 +237,7 @@ def _ack_reason(s: str) -> str:
 @register
 class PaperDocType:
     name = "paper"
-    version = "paper3"
+    version = "paper4"
     thresholds = Thresholds()
 
     # ---- masks ---------------------------------------------------------------------------------------------
@@ -394,11 +394,16 @@ class PaperDocType:
                     emit(end[0], end[1], "front")
             else:
                 emit(ln.page_no, ln.cstart, e.section)
-        # Fallback: when no body heading was detected at all, the whole document must not vanish as 'front'
-        # (is_body = 0); label it 'other' instead. The mark sits at (1, 0) after the mandatory 'front' mark, and
-        # the ingest stage takes the last mark at a position. The stage reports it as 'no headings detected'.
-        if not any(m.section not in ("front", "keywords") for m in marks):
-            marks.append(SectionMark(1, 0, "other"))
+        # Fallback: when no body heading was detected at all, the document must not vanish as 'front'
+        # (is_body = 0). Without even an abstract the whole document becomes 'other' (a mark at (1, 0) after the
+        # mandatory 'front' mark; the ingest stage takes the last mark at a position). With an abstract and/or a
+        # keywords block but no heading after them, the text that follows the block is the body: its closing
+        # 'front' mark becomes 'other'. The stage reports both cases as 'no headings detected'.
+        if not any(m.section not in ("front", "keywords", "abstract") for m in marks):
+            if not any(m.section == "abstract" for m in marks):
+                marks.append(SectionMark(1, 0, "other"))
+            elif marks[-1].section == "front":
+                marks[-1] = SectionMark(marks[-1].page_no, marks[-1].cstart, "other")
         marks.sort(key=lambda m: (m.page_no, m.cstart))
         return marks
 

@@ -16,9 +16,10 @@ import unicodedata
 
 from atlas.core.schemas import TAGS
 
-SEGMENT_VERSION = "seg5"   # seg3: descriptive (loose) headings, numbered-sequence and run-in headings;
+SEGMENT_VERSION = "seg6"   # seg3: descriptive (loose) headings, numbered-sequence and run-in headings;
                            # seg4: sentence text dehyphenated / ligatures expanded (atlas.core.text.sentence_text);
-                           # seg5: control characters ignored in headings and sentence text
+                           # seg5: control characters ignored in headings and sentence text;
+                           # seg6: bullet-prefixed headings ('■INTRODUCTION')
 
 #: Canonical headings → section (strict forms). Matching is case-insensitive on the whole line after stripping
 #: numbering ('2.', '2', 'II.', 'Chapter 3', '3.1') and trailing punctuation; the line must be ≤ 8 words.
@@ -235,11 +236,15 @@ def detect_heading(line: str) -> str | None:
 
 #: C0 / DEL control characters (not \t \n): PDF fonts emit them as glyph placeholders ('2 \x07Methods').
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+#: Bullet / marker glyphs that some publishers put in front of headings ('■INTRODUCTION' in ACS journals).
+_LEAD_BULLET_RE = re.compile(r"^[\u25a0-\u25ff\u2022\u2023\u2043\u2219\u27a2\u2756\u2605\u2606\uf0a7\uf0b7]+\s*")
 
 
 def heading_line(line: str | None) -> str:
-    """NFKC-normalised, control-character-free, whitespace-collapsed form of a line for heading detection."""
-    return " ".join(_CTRL_RE.sub("", unicodedata.normalize("NFKC", line or "")).split())
+    """NFKC-normalised form of a line for heading detection: control characters and a leading bullet glyph
+    removed, whitespace collapsed."""
+    s = " ".join(_CTRL_RE.sub("", unicodedata.normalize("NFKC", line or "")).split())
+    return _LEAD_BULLET_RE.sub("", s)
 
 
 def detect_heading_ex(line: str) -> tuple[str, str] | None:

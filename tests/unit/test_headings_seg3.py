@@ -33,6 +33,9 @@ from atlas.doctypes.paper import PaperDocType
     ("1. Introductions", ("introduction", "strict")),
     ("2\u2002 \x07Material and\xa0Methods", ("methods", "strict")),     # Springer: en space + BEL glyph
     ("3\u2002 \x07Results", ("results", "strict")),
+    ("\u25a0INTRODUCTION", ("introduction", "strict")),                 # ACS: square bullet glued to the heading
+    ("\u25a0 RESULTS AND DISCUSSION", ("results", "strict")),
+    ("\u2022 Methods", ("methods", "strict")),
 ])
 def test_detect_heading_ex_positive(line, expected):
     assert detect_heading_ex(line) == expected
@@ -211,3 +214,17 @@ def test_abstract_runin_and_keywords_pipe(dt):
     marks = dt.label_sections("D1", [p1], dt.drop_non_body([p1]), [])
     assert [m.section for m in marks][:4] == ["front", "abstract", "keywords", "front"]
     assert marks[-1] == SectionMark(1, p1.text.index("I. INTRODUCTION"), "introduction")
+
+
+def test_body_after_keywords_without_any_heading_is_other(dt):
+    p1 = page(1, ["A Paper Title", "ABSTRACT: Laser additive manufacturing has led to a paradigm shift in implants.",
+                  "KEYWORDS: additive manufacturing, porous titanium", "", BODY, BODY, BODY])
+    marks = dt.label_sections("D1", [p1], dt.drop_non_body([p1]), [])
+    assert [m.section for m in marks] == ["front", "abstract", "keywords", "other"]
+    assert marks[-1].cstart == p1.text.index(BODY) - 1      # the empty line that closes the keywords block
+
+
+def test_abstract_only_document_keeps_its_abstract(dt):
+    p1 = page(1, ["A Paper Title", "Abstract", ABSTRACT, BODY])
+    marks = dt.label_sections("D1", [p1], dt.drop_non_body([p1]), [])
+    assert [m.section for m in marks] == ["front", "abstract"]
