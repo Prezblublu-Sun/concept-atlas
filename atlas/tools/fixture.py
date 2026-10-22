@@ -162,6 +162,7 @@ class _Line:
     size: float = BODY_SIZE
     gap: float = 0.0        # extra space before this line (ignored at the top of a page)
     new_page: bool = False  # start a new page before this line (thesis chapters, front-matter pages)
+    mark: str | None = None  # thesis layout marker ('chapter:3', 'tail:Bibliography', 'front:abstract'); never printed
 
 
 def _font() -> fitz.Font:
@@ -226,18 +227,23 @@ def _paginate(blocks: list[list[_Line]]) -> list[list[tuple[float, _Line]]]:
 
 
 def _write_pdf(path: Path, pages: list[list[tuple[float, _Line]]], header: str, font: fitz.Font,
-               meta: dict, id_key: str = "", footers: list[str] | None = None) -> int:
+               meta: dict, id_key: str = "", footers: list[str | None] | None = None,
+               headers: list[list[str]] | None = None) -> int:
     """Write the pages; `id_key` seeds the PDF trailer /ID so the bytes are identical across runs (MuPDF would
-    otherwise write a fresh random /ID on every save). `footers` (one per page) replaces 'Page i of n'."""
+    otherwise write a fresh random /ID on every save). `footers` (one per page, None = no footer) replaces
+    'Page i of n'; `headers` (lines per page, stacked from the top) replaces the single `header`."""
     doc = fitz.open()
     n = len(pages)
     for i, lines in enumerate(pages, 1):
         page = doc.new_page(width=PAGE_W, height=PAGE_H)
         tw = fitz.TextWriter(page.rect)
-        tw.append((MARGIN_X, HEADER_Y), header, font=font, fontsize=SMALL_SIZE)
+        for h, text in enumerate(headers[i - 1] if headers else [header]):
+            tw.append((MARGIN_X, HEADER_Y + h * (SMALL_SIZE + 3.0)), text, font=font, fontsize=SMALL_SIZE)
         for y, ln in lines:
             tw.append((MARGIN_X, y), ln.text, font=font, fontsize=ln.size)
-        tw.append((MARGIN_X, FOOTER_Y), footers[i - 1] if footers else f"Page {i} of {n}", font=font, fontsize=SMALL_SIZE)
+        footer = footers[i - 1] if footers else f"Page {i} of {n}"
+        if footer:
+            tw.append((MARGIN_X, FOOTER_Y), footer, font=font, fontsize=SMALL_SIZE)
         tw.write_text(page)
     doc.set_metadata({"title": meta["title"], "author": meta["authors"], "subject": "concept-atlas fixture",
                       "keywords": meta["keywords"], "creator": "concept-atlas fixture", "producer": "PyMuPDF",
@@ -454,6 +460,18 @@ def make_fixture(out_dir: str | Path, seed: int = 1, kind: str = "paper") -> dic
 
 
 # ---- theses (increment 2) --------------------------------------------------------------------------------------
+#
+# Three synthetic theses in the three layouts met in the UCL library (see atlas/doctypes/thesis.py):
+#   T001 `word_plain`    'Chapter N' line + title line, one-line dotted TOC entries ('Chapter 1 Introduction …… 1'),
+#                        per-chapter 'References', constant running header, roman / arabic page numbers in the
+#                        footer (printed page = physical page - front pages);
+#   T002 `word_numbered` 'Chapter N. Title' on one line, running header 'Chapter N. Title' on every page of the
+#                        chapter (three pages per chapter, so the header recurs; the first occurrence is the
+#                        heading), page numbers at the TOP of the page, printed page = physical page, the TOC before
+#                        the abstract, a final 'References' instead of a bibliography;
+#   T003 `latex`         the chapter number alone on a line + title line, three-line TOC entries ('1' / 'Introduction'
+#                        / '1'), chapter 1 on printed page 1 (its number line and its page number collide), no
+#                        per-chapter references.
 
 THESIS_TITLES = ["Primary stability of cementless femoral stems: a computational and experimental study",
                  "Surrogate-assisted optimisation of short-stem hip implants",
@@ -477,6 +495,7 @@ THESIS_DECL = ("I, {author}, confirm that the work presented in this thesis is m
 THESIS_PARAS_PER_SECTION = 4
 THESIS_MM_PER_CHAPTER = 2
 THESIS_HEADER = "Doctoral thesis — University of Example"
+THESIS_LAYOUTS = ("word_plain", "word_numbered", "latex")
 
 
 def _dots(left: str, right: str, width: int = 86) -> str:
@@ -497,23 +516,27 @@ class _Thesis:
     def __init__(self, rng: random.Random, doc_id: str, k: int):
         self.rng = rng
         self.doc_id = doc_id
+        self.layout = THESIS_LAYOUTS[k % len(THESIS_LAYOUTS)]
         self.title = THESIS_TITLES[k % len(THESIS_TITLES)]
         self.author = f"{FIRST[k % len(FIRST)]} {LAST[(k * 3) % len(LAST)]}"
         self.year = 2019 + k
         self.n_chapters = 4 + k % 3
         self.chapters = [THESIS_CHAPTERS[i] for i in range(self.n_chapters)]
+        self.per_chapter_refs = self.layout == "word_plain"
+        self.bib_heading = "References" if self.layout == "word_numbered" else "Bibliography"
         self.abstract = list(THESIS_ABSTRACT)
         self.mm_sentences: list[str] = []
         self.body_sentences: list[str] = []
         self.refs = [f"[{i}] {LAST[i % len(LAST)]} {FIRST[i % len(FIRST)][0]}. {REF_TITLES[i % len(REF_TITLES)]}. "
                      f"J Biomech. {2005 + i};{i + 1}:{10 * i + 1}-{10 * i + 9}." for i in range(1, 9)]
         mm_idx = k * 100
+        n_paras = THESIS_PARAS_PER_SECTION + (2 if self.layout == "word_numbered" else 0)   # 3 pages per chapter
         self.chapter_text: list[list[tuple[str, list[list[str]]]]] = []     # per chapter: [(sub heading, [paragraphs])]
         for ci, (heading, kind) in enumerate(self.chapters, start=1):
             subs = []
             for si, sub in enumerate(THESIS_SUBS[heading], start=1):
                 paras = []
-                for pi in range(THESIS_PARAS_PER_SECTION):
+                for pi in range(n_paras):
                     sents = [_filler((mm_idx * 7 + ci * 50 + si * 10 + pi * 3 + j) % N_FILLER) for j in range(5)]
                     if ci >= 2 and pi == 0 and si <= THESIS_MM_PER_CHAPTER:
                         mm = _mm_sentence((mm_idx + ci * 10 + si) % N_MM)
@@ -524,48 +547,123 @@ class _Thesis:
                 subs.append((f"{ci}.{si} {sub}", paras))
             self.chapter_text.append(subs)
 
-    def front_blocks(self, font: fitz.Font, toc_pages: dict[int, int] | None, tail_pages: dict[str, int] | None) -> list[list[_Line]]:
-        blocks: list[list[_Line]] = []
-        blocks.append([_Line(self.title, TITLE_SIZE, new_page=True), _Line(self.author, HEADING_SIZE, HEAD_GAP),
-                       _Line("A thesis submitted to the University of Example", gap=HEAD_GAP),
-                       _Line("for the degree of Doctor of Philosophy"), _Line("Department of Orthopaedic Engineering", gap=PARA_GAP),
-                       _Line(str(self.year), gap=PARA_GAP)])
-        blocks.append([_Line("Declaration", HEADING_SIZE, new_page=True)] + _paragraph([THESIS_DECL.format(author=self.author)], font))
-        blocks.append([_Line("Abstract", HEADING_SIZE, new_page=True)] + _paragraph(self.abstract, font))
-        blocks.append([_Line("Acknowledgements", HEADING_SIZE, new_page=True)] + _paragraph([THESIS_ACK], font))
-        toc = [_Line("Contents", HEADING_SIZE, new_page=True)]
+    # ---- front matter -------------------------------------------------------------------------------------------
+    def _toc_blocks(self, toc_pages: dict[int, int], tail_pages: dict[str, int]) -> list[list[_Line]]:
+        """The TOC as one block per chapter (so a long LaTeX-style TOC paginates like a real one)."""
+        blocks: list[list[_Line]] = [[_Line("Contents", HEADING_SIZE, new_page=True, mark="front:contents")]]
         for ci, (heading, kind) in enumerate(self.chapters, start=1):
-            printed = (toc_pages or {}).get(ci, 0)
-            toc.append(_Line(_dots(f"Chapter {ci} {heading}", str(printed)), gap=PARA_GAP))
+            printed = str(toc_pages.get(ci, 0))
+            if self.layout == "latex":
+                toc = [_Line(str(ci), gap=PARA_GAP), _Line(heading), _Line(printed)]
+            elif self.layout == "word_numbered":
+                toc = [_Line(_dots(f"Chapter {ci}. {heading}", printed), gap=PARA_GAP)]
+            else:
+                toc = [_Line(_dots(f"Chapter {ci} {heading}", printed), gap=PARA_GAP)]
             for si, sub in enumerate(THESIS_SUBS[heading], start=1):
-                toc.append(_Line(_dots(f"    {ci}.{si} {sub}", str(printed))))
-        for name in ("Bibliography", "Appendix A"):
-            toc.append(_Line(_dots(name, str((tail_pages or {}).get(name, 0))), gap=PARA_GAP))
-        blocks.append(toc)
-        blocks.append([_Line("List of Figures", HEADING_SIZE, new_page=True)] +
-                      [_Line(_dots(f"Figure {ci}.1 Example figure of chapter {ci}", str((toc_pages or {}).get(ci, 0) + 1)))
-                       for ci in range(1, self.n_chapters + 1)])
+                if self.layout == "latex":
+                    toc += [_Line(f"{ci}.{si}"), _Line(f"{sub} " + ". " * 20), _Line(printed)]
+                elif self.layout == "word_numbered":
+                    toc.append(_Line(_dots(f"{ci}.{si} {sub}", printed)))
+                else:
+                    toc.append(_Line(_dots(f"    {ci}.{si} {sub}", printed)))
+            blocks.append(toc)
+        tail: list[_Line] = []
+        for name in (self.bib_heading, "Appendix A"):
+            printed = str(tail_pages.get(name, 0))
+            if self.layout == "latex":
+                tail += [_Line(name, gap=PARA_GAP), _Line(printed)]
+            else:
+                tail.append(_Line(_dots(name, printed), gap=PARA_GAP))
+        blocks.append(tail)
         return blocks
+
+    def front_blocks(self, font: fitz.Font, toc_pages: dict[int, int] | None, tail_pages: dict[str, int] | None) -> list[list[_Line]]:
+        title_lines = [_Line(t, TITLE_SIZE, mark="front:title") for t in _wrap(self.title, TITLE_SIZE, font, COLUMN_W + 60)]
+        title_lines[0].new_page = True
+        blocks = {
+            "title": title_lines + [_Line(self.author, HEADING_SIZE, HEAD_GAP),
+                                    _Line("A thesis submitted to the University of Example", gap=HEAD_GAP),
+                                    _Line("for the degree of Doctor of Philosophy"),
+                                    _Line("Department of Orthopaedic Engineering", gap=PARA_GAP), _Line(str(self.year), gap=PARA_GAP)],
+            "declaration": [_Line("Declaration", HEADING_SIZE, new_page=True, mark="front:declaration")]
+                           + _paragraph([THESIS_DECL.format(author=self.author)], font),
+            "abstract": [_Line("Abstract", HEADING_SIZE, new_page=True, mark="front:abstract")] + _paragraph(self.abstract, font),
+            "acknowledgements": [_Line("Acknowledgements", HEADING_SIZE, new_page=True, mark="front:acknowledgements")]
+                                + _paragraph([THESIS_ACK], font),
+            "figures": [_Line("List of Figures", HEADING_SIZE, new_page=True, mark="front:figures")]
+                       + [_Line(_dots(f"Figure {ci}.1 Example figure of chapter {ci}", str((toc_pages or {}).get(ci, 0) + 1)))
+                          for ci in range(1, self.n_chapters + 1)],
+        }
+        order = {"word_plain": ["title", "declaration", "abstract", "acknowledgements", "contents", "figures"],
+                 "word_numbered": ["title", "declaration", "contents", "abstract", "acknowledgements", "figures"],
+                 "latex": ["title", "abstract", "declaration", "acknowledgements", "contents", "figures"]}[self.layout]
+        out: list[list[_Line]] = []
+        for name in order:
+            out.extend(self._toc_blocks(toc_pages or {}, tail_pages or {}) if name == "contents" else [blocks[name]])
+        return out
+
+    # ---- body -----------------------------------------------------------------------------------------------------
+    def chapter_heading_lines(self, ci: int, heading: str) -> list[_Line]:
+        mark = f"chapter:{ci}"
+        if self.layout == "word_numbered":
+            return [_Line(f"Chapter {ci}. {heading}", TITLE_SIZE, new_page=True, mark=mark)]
+        first = str(ci) if self.layout == "latex" else f"Chapter {ci}"
+        return [_Line(first, TITLE_SIZE, new_page=True, mark=mark), _Line(heading, HEADING_SIZE, HEAD_GAP)]
 
     def body_blocks(self, font: fitz.Font) -> list[list[_Line]]:
         blocks: list[list[_Line]] = []
         for ci, (heading, kind) in enumerate(self.chapters, start=1):
-            blocks.append([_Line(f"Chapter {ci}", TITLE_SIZE, new_page=True), _Line(heading, HEADING_SIZE, HEAD_GAP)])
+            blocks.append(self.chapter_heading_lines(ci, heading))
             for sub, paras in self.chapter_text[ci - 1]:
                 blocks.append([_heading(sub)])
                 for para in paras:
                     blocks.append(_paragraph(para, font))
-            blocks.append([_heading("References")] + [_Line(r) for r in self.refs[:3]])
-        blocks.append([_Line("Bibliography", TITLE_SIZE, new_page=True)] + [_Line(r, gap=2.0) for r in self.refs])
-        blocks.append([_Line("Appendix A", TITLE_SIZE, new_page=True), _Line("Supplementary tables", HEADING_SIZE, HEAD_GAP)] +
-                      _paragraph([_filler((900 + j) % N_FILLER) for j in range(6)], font))
+            if self.per_chapter_refs:
+                blocks.append([_heading("References")] + [_Line(r) for r in self.refs[:3]])
+        blocks.append([_Line(self.bib_heading, TITLE_SIZE, new_page=True, mark=f"tail:{self.bib_heading}")]
+                      + [_Line(r, gap=2.0) for r in self.refs])
+        blocks.append([_Line("Appendix A", TITLE_SIZE, new_page=True, mark="tail:Appendix A"),
+                       _Line("Supplementary tables", HEADING_SIZE, HEAD_GAP)]
+                      + _paragraph([_filler((900 + j) % N_FILLER) for j in range(6)], font))
         return blocks
+
+    # ---- page furniture ---------------------------------------------------------------------------------------------
+    def furniture(self, n_front: int, body: list[list[tuple[float, _Line]]]) -> tuple[list[list[str]], list[str | None]]:
+        """(header lines per page, footer per page) for the whole document."""
+        n_body = len(body)
+        if self.layout == "word_numbered":
+            headers: list[list[str]] = [[str(i), THESIS_HEADER] for i in range(1, n_front + 1)]
+            current = THESIS_HEADER
+            for pi, lines in enumerate(body, start=1):
+                first = lines[0][1] if lines else None
+                if first is not None and first.mark and first.mark.startswith("chapter:"):
+                    current = first.text
+                elif first is not None and first.mark and first.mark.startswith("tail:"):
+                    current = THESIS_HEADER
+                headers.append([str(n_front + pi), current])
+            return headers, [None] * (n_front + n_body)
+        headers = [[THESIS_HEADER]] * (n_front + n_body)
+        footers: list[str | None] = [_roman(i) for i in range(1, n_front + 1)] + [str(i) for i in range(1, n_body + 1)]
+        return headers, footers
+
+    def printed(self, n_front: int, body_page: int) -> int:
+        return n_front + body_page if self.layout == "word_numbered" else body_page
 
 
 def _thesis_layout(th: _Thesis, font: fitz.Font, toc_pages: dict[int, int] | None, tail_pages: dict[str, int] | None):
     front = _paginate(th.front_blocks(font, toc_pages, tail_pages))
     body = _paginate(th.body_blocks(font))
     return front, body
+
+
+def _starts(pages: list[list[tuple[float, _Line]]], prefix: str) -> dict[str, int]:
+    """{mark payload: 1-based page} for the pages whose first line carries a mark with `prefix`."""
+    out: dict[str, int] = {}
+    for pi, lines in enumerate(pages, start=1):
+        first = lines[0][1] if lines else None
+        if first is not None and first.mark and first.mark.startswith(prefix):
+            out.setdefault(first.mark.split(":", 1)[1], pi)
+    return out
 
 
 def make_thesis_fixture(out_dir: str | Path, seed: int = 1) -> dict:
@@ -582,43 +680,39 @@ def make_thesis_fixture(out_dir: str | Path, seed: int = 1) -> dict:
         # pass 1: physical pages without TOC numbers → chapter start pages → pass 2 with the printed numbers
         front, body = _thesis_layout(th, font, None, None)
         n_front = len(front)
-
-        def starts(body_pages):
-            ch, tail = {}, {}
-            for pi, lines in enumerate(body_pages, start=1):
-                first = lines[0][1].text if lines else ""
-                if first.startswith("Chapter "):
-                    ch[int(first.split()[1])] = pi
-                elif first in ("Bibliography", "Appendix A"):
-                    tail[first] = pi
-            return ch, tail
-        ch_pages, tail_pages = starts(body)
-        front, body = _thesis_layout(th, font, ch_pages, tail_pages)
-        assert len(front) == n_front and starts(body) == (ch_pages, tail_pages)
+        ch_pages = {int(n): p for n, p in _starts(body, "chapter:").items()}
+        tail_pages = _starts(body, "tail:")
+        printed_ch = {ci: th.printed(n_front, p) for ci, p in ch_pages.items()}
+        printed_tail = {name: th.printed(n_front, p) for name, p in tail_pages.items()}
+        front, body = _thesis_layout(th, font, printed_ch, printed_tail)
+        assert len(front) == n_front and {int(n): p for n, p in _starts(body, "chapter:").items()} == ch_pages
+        assert _starts(body, "tail:") == tail_pages
         pages = front + body
-        footers = [_roman(i) for i in range(1, n_front + 1)] + [str(i) for i in range(1, len(body) + 1)]
+        headers, footers = th.furniture(n_front, body)
         file = f"{th.doc_id}_{th.author.split()[-1]}_{th.year}.pdf"
         path = pdf_dir / file
         n_pages = _write_pdf(path, pages, THESIS_HEADER, font, {"title": th.title, "authors": th.author, "keywords": ""},
-                             id_key=f"concept-atlas thesis fixture {seed} {th.doc_id}", footers=footers)
+                             id_key=f"concept-atlas thesis fixture {seed} {th.doc_id}", footers=footers, headers=headers)
         chapters = []
-        order = sorted(ch_pages)
-        for ci in order:
-            nxt = ch_pages.get(ci + 1) or tail_pages.get("Bibliography") or (len(body) + 1)
+        for ci in sorted(ch_pages):
+            nxt = ch_pages.get(ci + 1) or tail_pages[th.bib_heading]
             chapters.append({"number": ci, "heading": th.chapters[ci - 1][0], "unit_kind": th.chapters[ci - 1][1],
-                             "page_from": n_front + ch_pages[ci], "page_to": n_front + nxt - 1, "printed_from": ch_pages[ci],
+                             "page_from": n_front + ch_pages[ci], "page_to": n_front + nxt - 1, "printed_from": printed_ch[ci],
                              "sections": [sub for sub, _ in th.chapter_text[ci - 1]]})
-        tail = [{"heading": "Bibliography", "kind": "references", "page_from": n_front + tail_pages["Bibliography"],
+        tail = [{"heading": th.bib_heading, "kind": "references", "page_from": n_front + tail_pages[th.bib_heading],
                  "page_to": n_front + tail_pages["Appendix A"] - 1},
                 {"heading": "Appendix A", "kind": "appendix", "page_from": n_front + tail_pages["Appendix A"], "page_to": n_pages}]
+        front_pages = _starts(front, "front:")
         counts[th.doc_id] = len(th.mm_sentences)
         documents.append({"doc_id": th.doc_id, "file": file, "path": str(path), "title": th.title, "year": th.year,
                           "authors": th.author, "doi": "", "venue": "University of Example", "doc_type": "thesis",
-                          "kind": "thesis", "n_pages": n_pages, "n_front_pages": n_front, "header": THESIS_HEADER,
-                          "abstract": list(th.abstract), "chapters": chapters, "tail": tail,
-                          "micromotion_sentences": len(th.mm_sentences), "mm_sentences": list(th.mm_sentences),
-                          "sentences": list(th.body_sentences), "references": list(th.refs),
-                          "acknowledgements": THESIS_ACK, "declaration": THESIS_DECL.format(author=th.author)})
+                          "kind": "thesis", "layout": th.layout, "n_pages": n_pages, "n_front_pages": n_front,
+                          "header": THESIS_HEADER, "abstract": list(th.abstract), "abstract_page": front_pages["abstract"],
+                          "toc_page": front_pages["contents"], "chapters": chapters, "tail": tail,
+                          "per_chapter_references": th.per_chapter_refs, "micromotion_sentences": len(th.mm_sentences),
+                          "mm_sentences": list(th.mm_sentences), "sentences": list(th.body_sentences),
+                          "references": list(th.refs), "acknowledgements": THESIS_ACK,
+                          "declaration": THESIS_DECL.format(author=th.author)})
         rows.append([th.doc_id, th.title, str(th.year), th.author, "", "University of Example", "thesis", file])
     manifest = out / "manifest.csv"
     with open(manifest, "w", encoding="utf-8", newline="") as f:
