@@ -117,7 +117,8 @@ class FinishStage:
         build.set_item(self.name, "*", "done", self.version, {"checks": len(checks)})
         m = build.manifest()
         stages = m.get("stages") or {}
-        stages[self.name] = {"status": "done", "seconds": round(time.perf_counter() - t0, 2), "checks": len(checks)}
+        stages[self.name] = {"status": "done", "version": self.version, "seconds": round(time.perf_counter() - t0, 2),
+                             "checks": len(checks)}
         build.update_manifest(stages=stages)
         report_path = write_report(build, checks, report)
         sha = build.freeze()

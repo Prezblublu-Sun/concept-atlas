@@ -1,10 +1,19 @@
-"""atlas.core.stats: the v2 metric functions over plain dicts."""
+"""atlas.core.stats: the v2 metric functions over plain dicts, and the `stats:` block of defaults.yaml."""
 from __future__ import annotations
 
 import math
 
+from atlas.config import load_defaults
 from atlas.core.stats import (DEFAULT_PARAMS, anchor_hits, characteristic_score, concept_metrics, is_strong, membership,
                               params_with_defaults, rank_concepts, smoothed_ratio, standalone, tier_of, uses, year_bin)
+
+
+def test_defaults_yaml_stats_block_matches_the_module_defaults():
+    y = load_defaults()["stats"]
+    assert {k: y[k] for k in DEFAULT_PARAMS} == DEFAULT_PARAMS
+    assert y["body_extra_sections"] == ["appendix"] and y["body_includes_title"] is True
+    assert y["cov_hi"] == 0.10 and y["topic_hi"] == 0.10 and y["min_papers"] == 5
+    assert [b[0] for b in y["year_bins"]] == ["≤2015", "2016–2020", "2021–2023", "2024–2026"]
 
 
 def test_year_bin():

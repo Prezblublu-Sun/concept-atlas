@@ -114,7 +114,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = lg.add_parser("export-curated", help="terms_v3.db → curated/*.yaml (+ confirmations)")
     p.add_argument("terms_db")
     p.add_argument("root")
-    p.add_argument("--spec", help="v2 subdomain_spec.json (cross-group recovery)")
+    p.add_argument("--spec", help="v2 subdomain_spec.json (cross-group recovery / cross-check; found "
+                                  "automatically next to the v3 db or in the sibling v2 folder when omitted)")
     p.add_argument("--force", action="store_true", help="overwrite an existing curated/")
     p = lg.add_parser("import-highlights", help="v3 highlights.sqlite → notes targeting sentences")
     p.add_argument("highlights_db")

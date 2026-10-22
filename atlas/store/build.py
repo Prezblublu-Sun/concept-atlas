@@ -494,17 +494,22 @@ class BuildStore:
         if current is not None:
             yield current, per_doc
 
-    def topic_hits_by_unit(self) -> dict[str, dict[str, tuple[int, int, int]]]:
-        """{unit_id: {concept_id: (title, keywords, abstract)}} standalone counts (literal: n)."""
+    def topic_hits_by_unit(self, standalone: bool = False) -> dict[str, dict[str, tuple[int, int, int]]]:
+        """{unit_id: {concept_id: (title, keywords, abstract)}} counts. Default: every occurrence, nested ones
+        included — the sub-domain assignment of the previous system read the first version's `term_paper`
+        title / keywords / abstract columns, which had no nested distinction. `standalone=True` gives n - n_nested
+        (literal concepts: n), the counting used by `importance`."""
         lits = self.literal_ids()
         out: dict[str, dict[str, list[int]]] = {}
         for r in self.conn.execute("SELECT unit_id, concept_id, field, n, n_nested FROM topic_hits"):
             if r["field"] not in TOPIC_FIELDS:
                 continue
-            sa = r["n"] if r["concept_id"] in lits else max(0, r["n"] - r["n_nested"])
-            if sa <= 0:
+            n = r["n"]
+            if standalone and r["concept_id"] not in lits:
+                n = max(0, n - r["n_nested"])
+            if n <= 0:
                 continue
-            out.setdefault(r["unit_id"], {}).setdefault(r["concept_id"], [0, 0, 0])[TOPIC_FIELDS.index(r["field"])] = sa
+            out.setdefault(r["unit_id"], {}).setdefault(r["concept_id"], [0, 0, 0])[TOPIC_FIELDS.index(r["field"])] = n
         return {u: {c: tuple(v) for c, v in d.items()} for u, d in out.items()}
 
     def write_importance(self, rows: Iterable[dict]) -> int:

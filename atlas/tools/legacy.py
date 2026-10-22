@@ -4,7 +4,14 @@ highlights → notes. Implemented by: increment 2 (derived layer).
 `export_curated(terms_db, project, spec=None, force=False)` writes domains, concepts, patterns, term_tree,
 categories, concept_categories, subdomains, doc_domains, i18n and confirmations.json (the files are the user's
 own curated system, so the export confirms them) and returns a report dict. It refuses to overwrite an existing
-`curated/` without `force`.
+`curated/` without `force` (then every file is rewritten and re-confirmed).
+
+Cross sub-domain groups: v3 stores the anchors of a cross sub-domain as a list of lists (one list per group),
+which is used as is. The v2 `subdomain_spec.json` (`spec`; found automatically next to the v3 db or in the
+sibling v2 folder when not given) holds the same groups as concept *labels*: they are mapped to ids
+(`item.label` → `item.id`; unmapped labels are reported), used to recover the groups when v3 holds a flat list,
+and otherwise compared with the v3 groups (differences are reported as `spec_mismatch`). Without a spec a flat
+list is split by the domain of its concepts; both recoveries set `groups_recovered: true` on the row.
 
 `import_highlights(highlights_db, sentences_db, project)`: v3 `hl(kind='sent')` rows become notes targeting
 `S:<new sid>`; the v3 integer sid resolves through `sentences.db` (paper, text) to the new sid by
@@ -70,6 +77,46 @@ def _ro(path: str | Path) -> sqlite3.Connection:
     return connect(path, "ro")
 
 
+SPEC_CANDIDATES = (("_work", "subdomain_spec.json"), ("_work", "subdomains", "subdomain_spec.json"))
+V2_FOLDER = "术语阅览系统_v2_2026-10-19"
+
+
+def find_spec(terms_db: str | Path, spec: str | Path | None = None) -> Path | None:
+    """The v2 sub-domain spec to use: the given path, else the first existing candidate next to the v3 db or in
+    the sibling v2 folder (`_work/subdomain_spec.json` as the contract names it, or `_work/subdomains/…` where
+    the v2 scripts wrote it)."""
+    if spec:
+        p = Path(spec)
+        return p if p.is_file() else None
+    base = Path(terms_db).resolve().parent
+    for folder in (base, base.parent / V2_FOLDER):
+        for parts in SPEC_CANDIDATES:
+            p = folder.joinpath(*parts)
+            if p.is_file():
+                return p
+    return None
+
+
+def spec_groups(spec_path: Path, label2id: dict[str, str], report: dict) -> dict[str, list[list[str]]]:
+    """{cross sub-domain id: [[concept ids], …]} from the v2 spec; labels without a concept go to
+    report['unknown_anchor_labels'] as {sub, label}."""
+    sp = json.loads(spec_path.read_text(encoding="utf-8"))
+    out: dict[str, list[list[str]]] = {}
+    for s in sp.get("cross", []) or []:
+        groups = []
+        for g in s.get("groups", []) or []:
+            ids = []
+            for lab in g:
+                cid = label2id.get(lab)
+                if cid is None:
+                    report["unknown_anchor_labels"].append({"sub": s["id"], "label": lab})
+                else:
+                    ids.append(cid)
+            groups.append(ids)
+        out[s["id"]] = groups
+    return out
+
+
 def export_curated(terms_db: str | Path, project: Project, spec: str | Path | None = None, force: bool = False) -> dict:
     cdir = project.curated_dir
     existing = [n for n in CURATED_FILES if curated_path(cdir, n).exists()]
@@ -77,8 +124,12 @@ def export_curated(terms_db: str | Path, project: Project, spec: str | Path | No
         raise FileExistsError(f"curated/ already has {', '.join(existing)} — use --force to overwrite")
     con = _ro(terms_db)
     unknown_domains: set[str] = set()
-    report: dict = {"source": str(terms_db), "project": str(project.root), "files": {}, "unknown_domain_items": [],
-                    "groups_recovered": [], "unknown_anchor_labels": [], "warnings": []}
+    spec_path = find_spec(terms_db, spec)
+    report: dict = {"source": str(terms_db), "project": str(project.root), "spec": str(spec_path) if spec_path else None,
+                    "files": {}, "unknown_domain_items": [], "groups_recovered": [], "unknown_anchor_labels": [],
+                    "spec_mismatch": [], "warnings": []}
+    if spec and spec_path is None:
+        report["warnings"].append(f"spec not found: {spec}")
     try:
         i18n_rows = [dict(r) for r in con.execute("SELECT zh, en, grp FROM i18n ORDER BY grp, zh")]
         en_of = {r["zh"]: r["en"] for r in i18n_rows if r["en"]}
@@ -162,21 +213,7 @@ def export_curated(terms_db: str | Path, project: Project, spec: str | Path | No
         report["concept_categories"] = len(rows)
 
         # ---- sub-domains (cross groups from the v3 db when already grouped, else from the spec, else by domain)
-        spec_groups: dict[str, list[list[str]]] = {}
-        if spec and Path(spec).is_file():
-            sp = json.loads(Path(spec).read_text(encoding="utf-8"))
-            for s in sp.get("cross", []) or []:
-                groups = []
-                for g in s.get("groups", []) or []:
-                    ids = []
-                    for lab in g:
-                        cid = label2id.get(lab)
-                        if cid is None:
-                            report["unknown_anchor_labels"].append(lab)
-                        else:
-                            ids.append(cid)
-                    groups.append(ids)
-                spec_groups[s["id"]] = groups
+        sgroups = spec_groups(spec_path, label2id, report) if spec_path else {}
         concept_doms = {c["id"]: c["domains"] for c in concepts}
         subs = []
         for s in con.execute("SELECT * FROM subdomain ORDER BY ord"):
@@ -193,10 +230,12 @@ def export_curated(terms_db: str | Path, project: Project, spec: str | Path | No
             else:
                 if anchors and all(isinstance(g, list) for g in anchors):
                     row["groups"] = anchors
-                elif s["id"] in spec_groups:
-                    row["groups"] = spec_groups[s["id"]]
+                    if s["id"] in sgroups and [sorted(g) for g in sgroups[s["id"]]] != [sorted(g) for g in anchors]:
+                        report["spec_mismatch"].append({"sub": s["id"], "v3": anchors, "spec": sgroups[s["id"]]})
+                elif s["id"] in sgroups:
+                    row["groups"] = sgroups[s["id"]]
                     row["groups_recovered"] = True
-                    report["groups_recovered"].append(s["id"])
+                    report["groups_recovered"].append({"sub": s["id"], "from": "spec"})
                 else:
                     by_dom: dict[str, list[str]] = {}
                     for a in anchors:
@@ -204,7 +243,7 @@ def export_curated(terms_db: str | Path, project: Project, spec: str | Path | No
                             by_dom.setdefault(d, []).append(a)
                     row["groups"] = [sorted(set(v)) for _, v in sorted(by_dom.items())]
                     row["groups_recovered"] = True
-                    report["groups_recovered"].append(s["id"])
+                    report["groups_recovered"].append({"sub": s["id"], "from": "domain"})
             flat = row.get("anchors") or [a for g in row.get("groups", []) for a in g]
             missing = [a for a in flat if a not in concept_doms]
             if missing:
@@ -246,6 +285,7 @@ def format_export_report(r: dict) -> str:
              f"  concepts {r.get('concepts')}, term entries {r.get('term_entries')}, categories {r.get('categories')}, "
              f"concept categories {r.get('concept_categories')}, sub-domains {r.get('subdomains')}, "
              f"documents {r.get('docs')} ({r.get('docs_with_domain')} with a domain), i18n strings {r.get('i18n')}",
+             f"  sub-domain spec: {r.get('spec') or '(none)'}",
              f"  confirmed: {', '.join(r.get('confirmed', []))}"]
     if r.get("unknown_domain_items"):
         lines.append(f"  items with an unknown domain: {len(r['unknown_domain_items'])} "
@@ -253,9 +293,13 @@ def format_export_report(r: dict) -> str:
     if r.get("unknown_domains"):
         lines.append(f"  unknown domain names: {r['unknown_domains']}")
     if r.get("groups_recovered"):
-        lines.append(f"  cross sub-domains whose groups were recovered: {r['groups_recovered']}")
+        lines.append("  cross sub-domains whose groups were recovered: "
+                     + ", ".join(f"{g['sub']} (from {g['from']})" for g in r["groups_recovered"]))
     if r.get("unknown_anchor_labels"):
-        lines.append(f"  spec anchor labels not found: {sorted(set(r['unknown_anchor_labels']))}")
+        lines.append("  spec anchor labels without a concept: "
+                     + ", ".join(f"{u['sub']}: {u['label']}" for u in r["unknown_anchor_labels"]))
+    for mm in r.get("spec_mismatch", []):
+        lines.append(f"  warning: groups of {mm['sub']} differ between the v3 db and the spec (v3 kept)")
     for w in r.get("warnings", []):
         lines.append(f"  warning: {w}")
     return "\n".join(lines)

@@ -4,9 +4,14 @@
 Per document (doc_id order; `--doc-ids a,b` reruns those documents after deleting their outputs):
  1. sentences of the pinned extraction (ids + membership from the build, text from the attached evidence);
  2. `Matcher.sentence(text)` for every sentence → occurrence rows (cstart/cend index the stored text);
- 3. topic fields per unit: document unit = meta title / meta keywords + the 'keywords' sentences (label stripped)
-    / meta abstract + the 'abstract' sentences; chapter unit = heading (title field) + the first 300 words of the
-    chapter (abstract field). `Matcher.text` on each text; counts summed per (unit, concept, field).
+ 3. topic fields per unit (`topic_hits`, the source of the title / keywords / abstract counts and of the
+    sub-domain assignment). Document unit: `title` = `document_meta.title` (manifest or PDF); `keywords` =
+    `document_meta.keywords` when the manifest/PDF provided one, else the pinned sentences of section 'keywords'
+    (the 'Keywords:' label stripped); `abstract` = `document_meta.abstract` when provided, else the sentences of
+    section 'abstract'. The fallback order avoids counting the same abstract twice (which would inflate the
+    sub-domain 'core' rule of >= 2 abstract mentions). Chapter unit (theses): `title` = the chapter heading,
+    `abstract` = the first 300 words of the chapter's body sentences. `Matcher.text` on each text; counts summed
+    per (unit, concept, field).
  4. stage_items(match, doc_id) with the fingerprint `m<matcher version>:<sha of concepts+patterns>`; a document
     whose item is `done` with the same fingerprint is skipped (unless named in --doc-ids).
 After the documents: `counts` is rebuilt from occurrences + topic hits ('body' = is_body sentences plus
@@ -67,11 +72,11 @@ def topic_texts(unit: dict, sentences: list[tuple[str, str, str, str, int]], met
         kws = [clean(meta.get("keywords"))]
         abstract = [clean(meta.get("abstract"))]
         for sid, text, section, unit_id, is_body in sentences:
-            if section == "keywords":
+            if section == "keywords" and not kws[0]:
                 t = clean(KEYWORDS_LINE.sub("", text, count=1))
                 if t and not KEYWORDS_LINE.fullmatch(text.strip()):
                     kws.append(t)
-            elif section == "abstract":
+            elif section == "abstract" and not abstract[0]:
                 t = clean(text)
                 if t and t.lower() not in ("abstract", "summary"):
                     abstract.append(t)
@@ -172,7 +177,7 @@ def compute_importance(store: BuildStore, params: dict | None = None) -> list[di
 
 class MatchStage:
     name = "match"
-    version = "match1"
+    version = "match2"      # match1 summed meta abstract/keywords with the same sentences; match2 falls back instead
     llm = False
     requires: tuple[str, ...] = ()
     gate: tuple[str, ...] = ("concepts", "patterns")
@@ -202,17 +207,12 @@ class MatchStage:
         units_by_doc: dict[str, list[dict]] = {}
         for u in build.units_all():
             units_by_doc.setdefault(u["doc_id"], []).append(u)
-        meta = build.doc_meta_all()
-        meta_full = {}
-
         def job_for(doc_id: str) -> _Job:
-            m = meta_full.get(doc_id)
-            if m is None:
-                m = build.doc_meta(doc_id) or {}
             sents = [(r["sid"], r["text"] or "", r["section"], r["unit_id"], int(r["is_body"]))
                      for r in build.sentences_of_doc(doc_id)]
             return _Job(doc_id=doc_id, sentences=sents, units=units_by_doc.get(doc_id) or
-                        [{"unit_id": doc_id, "doc_id": doc_id, "kind": "document", "heading": None}], meta=m)
+                        [{"unit_id": doc_id, "doc_id": doc_id, "kind": "document", "heading": None}],
+                        meta=build.doc_meta(doc_id) or {})
 
         n_occ = n_topic = 0
         batch: list[_Job] = []
@@ -282,7 +282,7 @@ class MatchStage:
         build.set_item(self.name, "*", "failed" if report.items_failed else "done", fp, detail)
         m = build.manifest()
         stages = m.get("stages") or {}
-        stages[self.name] = {"status": "done" if not report.items_failed else "failed",
+        stages[self.name] = {"status": "done" if not report.items_failed else "failed", "version": self.version,
                              "seconds": round(time.perf_counter() - t0, 2), **detail}
         build.update_manifest(stages=stages)
         report.details.update(detail)
