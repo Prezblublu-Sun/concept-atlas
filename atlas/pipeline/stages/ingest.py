@@ -55,7 +55,7 @@ from pathlib import Path
 import yaml
 
 from atlas.config import Project
-from atlas.core.ids import canonical_json, extraction_id, norm, sentence_id, text_sha256
+from atlas.core.ids import canonical_json, extraction_id, norm, sentence_id, text_sha256, unit_id as make_unit_id
 from atlas.core.schemas import BODY_SECTIONS, DocMeta, LineMask, PageText, SectionMark, SentenceRow, Unit
 from atlas.core.segment import SEGMENT_VERSION, garbage_flags, split_sentences, tag_sentence
 from atlas.core.text import hyphen_vocab, sentence_text
@@ -77,6 +77,7 @@ SCAN_ID_PREFIX = "D"
 SCAN_ID_WIDTH = 4
 ALIAS_MIN_OVERLAP = 0.5
 UNITS_OVERRIDE_FILE = "units_override.yaml"
+UNIT_KINDS = frozenset({"intro", "lit_review", "methods", "results", "discussion", "conclusion", "other"})
 CHAPTER_DRAFTS = ("work", "drafts", "chapters")
 INGEST_LOG = "ingest.log"
 _FILE_LOGGER = "atlas.ingest.file"
@@ -238,42 +239,55 @@ def drop_ratio_of(pages: Sequence[PageText], masks: Sequence[LineMask]) -> float
     return min(1.0, dropped / total)
 
 
-def _override_entry(project: Project, doc_id: str) -> dict | None:
+def load_units_overrides(project: Project, report: Report | None = None) -> dict[str, dict]:
+    """{doc_id: entry} from `curated/units_override.yaml` (read once per run); an unreadable file is reported as a
+    warning and ignored, entries that are not mappings are dropped."""
     try:
         data = read_units_override(project.curated_dir)
     except Exception as e:
-        log.warning("cannot read %s: %s", project.curated_dir / UNITS_OVERRIDE_FILE, e)
-        return None
-    entry = data.get(doc_id)
-    return entry if isinstance(entry, dict) else None
+        msg = f"cannot read {project.curated_dir / UNITS_OVERRIDE_FILE}: {type(e).__name__}: {e}"
+        log.warning(msg)
+        if report is not None:
+            report.warnings.append(msg)
+        return {}
+    return {str(k): v for k, v in data.items() if isinstance(v, dict)}
 
 
-def _override_sha(project: Project, doc_id: str) -> str:
-    entry = _override_entry(project, doc_id)
-    if entry is None:
-        return "-"
-    return text_sha256(canonical_json(entry))[:12]
+def _override_sha(entry: dict | None) -> str:
+    return "-" if entry is None else text_sha256(canonical_json(entry))[:12]
 
 
 def apply_units_override(doc_id: str, units: list[Unit], override: dict | None, n_pages: int) -> list[Unit]:
-    """Replace the chapter units by the override's chapters (document unit kept). Pure."""
+    """Replace the chapter units by the override's chapters (document unit kept). Pure. Chapters are taken in the
+    listed order; pages are clipped to 1..n_pages (page_to defaults to page_from), unknown unit kinds become
+    `other`, entries without a usable page_from are skipped."""
     chapters = (override or {}).get("chapters") if override else None
-    if not chapters:
+    if not chapters or not isinstance(chapters, list):
         return units
     doc_unit = next((u for u in units if u.kind == "document"), None) or Unit(doc_id, doc_id, "document", 0, None, 1, n_pages)
     out = [doc_unit]
     taken: set[str] = set()
-    from atlas.core.ids import unit_id as make_unit_id
-    for k, ch in enumerate(chapters, start=1):
-        heading = str(ch.get("heading") or f"Chapter {k}")
+    for ch in chapters:
+        if not isinstance(ch, dict):
+            continue
+        try:
+            pf = int(ch.get("page_from") or 0)
+            pt = int(ch.get("page_to") or pf)
+        except (TypeError, ValueError):
+            continue
+        if pf < 1:
+            continue
+        pf = min(pf, max(1, n_pages))
+        pt = min(max(pf, pt), max(1, n_pages))
+        k = len(out)
+        heading = " ".join(str(ch.get("heading") or f"Chapter {k}").split())
         uid = make_unit_id(doc_id, heading, taken)
         taken.add(uid)
-        pf = int(ch.get("page_from") or 1)
-        pt = int(ch.get("page_to") or pf)
+        kind = str(ch.get("unit_kind") or "other")
         out.append(Unit(unit_id=uid, doc_id=doc_id, kind="chapter", ordinal=k, heading=heading, page_from=pf,
-                        page_to=max(pf, pt), confidence=1.0, reasons=("override",), parent_unit=doc_id,
-                        unit_kind=str(ch.get("unit_kind") or "other")))
-    return out
+                        page_to=pt, confidence=1.0, reasons=("override",), parent_unit=doc_id,
+                        unit_kind=kind if kind in UNIT_KINDS else "other"))
+    return out if len(out) > 1 else units
 
 
 def chapter_draft(job) -> dict:
@@ -377,8 +391,8 @@ class IngestStage:
         min_chars = int(project.get("ingest.sentence_min_chars", 3) or 3)
         default_type = str(project.get("doc_type", "paper") or "paper")
         flog, handler = _file_logger(project)
+        overrides = load_units_overrides(project, report)
         store = EvidenceStore.open(project.evidence_db, "rw")
-        store._project = project          # for the chapter drafts written next to the evidence
         try:
             docs = sorted(store.list_documents(limit=10 ** 9)["rows"], key=lambda d: d["doc_id"])
             if doc_ids:
@@ -409,7 +423,7 @@ class IngestStage:
                         store.add_document(doc_id, doc_type, d.get("source") or "scan", path,
                                            d.get("rel_path") or str(path), sha)
                     version = (f"{SEGMENT_VERSION}+{doctype.name}:{doctype.version}+{extractor_tag()}"
-                               f"+ovr:{_override_sha(project, doc_id)}")
+                               f"+ovr:{_override_sha(overrides.get(doc_id))}")
                     ext_id = extraction_id(doc_id, sha, version)
                 except Exception as e:
                     log.exception("ingest planning failed for %s", doc_id)
@@ -425,7 +439,7 @@ class IngestStage:
                     continue
                 jobs.append(_Job(doc_id=doc_id, doc_type=doc_type, path=path, pdf_sha256=sha,
                                  extractor_version=version, ext_id=ext_id, doctype=doctype, min_chars=min_chars,
-                                 override=_override_entry(project, doc_id)))
+                                 override=overrides.get(doc_id)))
 
             # ---- steps 3–6: compute (optionally in worker processes), steps 7–8: write in doc_id order
             if workers and workers > 1 and len(jobs) > 1:
@@ -442,7 +456,7 @@ class IngestStage:
                     for job in results:
                         batch.append(job)
                         if len(batch) >= batch_size:
-                            self._finish_batch(batch, store, report, details, flog)
+                            self._finish_batch(batch, store, report, details, flog, project)
                             batch = []
                             n_batches += 1
                             if n_batches % CHECKPOINT_BATCHES == 0:
@@ -450,7 +464,7 @@ class IngestStage:
                                 flog.info("checkpoint after %d batches: wal_frames=%d checkpointed=%d busy=%d",
                                           n_batches, frames, done_frames, busy)
                     if batch:
-                        self._finish_batch(batch, store, report, details, flog)
+                        self._finish_batch(batch, store, report, details, flog, project)
             finally:
                 if pool is not None:
                     pool.shutdown(wait=True)
@@ -463,12 +477,12 @@ class IngestStage:
 
     @classmethod
     def _finish_batch(cls, batch: list[_Job], store: EvidenceStore, report: Report, details: dict,
-                      flog: logging.Logger) -> None:
+                      flog: logging.Logger, project: Project) -> None:
         """Steps 7–8 for several documents in ONE transaction (fewer commits, fewer FTS segments). Bookkeeping
         happens only after the commit; if anything fails the whole batch rolls back and every document is
         stored again on its own through _finish, which records the failure of the bad one."""
         if len(batch) == 1:
-            cls._finish(batch[0], store, report, details, flog)
+            cls._finish(batch[0], store, report, details, flog, project)
             return
         stored: list[tuple[_Job, list[str], int]] = []
         try:
@@ -482,14 +496,14 @@ class IngestStage:
             log.warning("batch of %d documents rolled back (%s: %s); storing them one by one",
                         len(batch), type(e).__name__, e)
             for job in batch:
-                cls._finish(job, store, report, details, flog)
+                cls._finish(job, store, report, details, flog, project)
             return
         for job in batch:
             if job.error:
                 cls._record_failure(job, report, details, flog, job.error)
         for job, warns, n_aliases in stored:
             cls._record_done(job, warns, n_aliases, report, details, flog)
-            path = cls._write_draft(job, getattr(store, "_project", None))
+            path = cls._write_draft(job, project)
             if path:
                 flog.info("%s chapter draft %s", job.doc_id, path)
 
@@ -540,8 +554,9 @@ class IngestStage:
         return warns, len(aliases)
 
     @staticmethod
-    def _write_draft(job: _Job, project: Project | None) -> str | None:
-        if not job.draft or project is None:
+    def _write_draft(job: _Job, project: Project) -> str | None:
+        """Write `work/drafts/chapters/<doc_id>.yaml` for a thesis whose chapters need the user's eye; its path."""
+        if not job.draft:
             return None
         d = project.root.joinpath(*CHAPTER_DRAFTS)
         d.mkdir(parents=True, exist_ok=True)
@@ -569,7 +584,8 @@ class IngestStage:
         log.info("%s: %d pages, %d sentences (ext %s)", doc_id, len(job.pages), len(job.sentences), job.ext_id)
 
     @classmethod
-    def _finish(cls, job: _Job, store: EvidenceStore, report: Report, details: dict, flog: logging.Logger) -> None:
+    def _finish(cls, job: _Job, store: EvidenceStore, report: Report, details: dict, flog: logging.Logger,
+                project: Project) -> None:
         """Steps 7–8 for one document in its own transaction; a storage error is recorded, never raised."""
         if job.error:
             cls._record_failure(job, report, details, flog, job.error)
@@ -581,7 +597,7 @@ class IngestStage:
             cls._record_failure(job, report, details, flog, f"{type(e).__name__}: {e}")
             return
         cls._record_done(job, warns, n_aliases, report, details, flog)
-        path = cls._write_draft(job, getattr(store, "_project", None))
+        path = cls._write_draft(job, project)
         if path:
             flog.info("%s chapter draft %s", job.doc_id, path)
 
