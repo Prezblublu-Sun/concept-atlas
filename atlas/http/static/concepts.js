@@ -1,10 +1,17 @@
-// Concept views (increment 2): sortable concept list, concept page with prev/next, all-sentences view.
-import { api, ApiError, h, clear, t, i18n, clip, debounce, go, replaceHash, fmtDate, store } from "./core.js";
+// Concept views (increment 2): sortable concept list, concept page with prev/next, all-sentences / documents view.
+//
+// List state (filters, sort, page) lives in the hash (`#/concepts?sort=…`) so that back/forward and reload restore
+// it; `update(params)` re-syncs a live view when the hash changes under the same route key. The list the user came
+// from is kept in sessionStorage (`atlas.conceptList`: every id of the filtered list in list order, with labels and
+// the hash to go back to) so the concept page can offer previous/next like the previous viewer; a concept opened
+// directly falls back to the concepts of its first content category.
+import { api, ApiError, h, clear, t, i18n, clip, debounce, go, replaceHash, fmtDate } from "./core.js";
 import { createEditor } from "./editor.js";
 import { sectionBadge, tagBadges } from "./reader.js";
 
-const LIST_KEY = "atlas.conceptList";       // sessionStorage: {ids, query} of the list the user came from
+const LIST_KEY = "atlas.conceptList";       // sessionStorage: {ids, labels, title, back}
 const LIMIT = 100;
+const LIST_FIELDS = ["q", "domain", "tier", "type", "scope", "sort", "dir", "offset", "sub", "cat"];
 const errBox = (e) => h("div.error-box", `${t("common.error")}: ${e.message}`);
 
 export function noBuildBox(e) {
@@ -33,17 +40,32 @@ export function domainLabel(id) {
   return d ? dataLabel(d.zh, d.en) : (id || "");
 }
 function mainSection(s) { return s ? i18n.section(s) : ""; }
+function scopeLabel(scope) { return scope === "all" ? t("concepts.scopeAll") : domainLabel(scope); }
 
-function saveList(ids, query) { try { sessionStorage.setItem(LIST_KEY, JSON.stringify({ ids, query })); } catch { /* ignore */ } }
+function saveList(ctx) { try { sessionStorage.setItem(LIST_KEY, JSON.stringify(ctx)); } catch { /* tab-local convenience only */ } }
 function loadList() { try { return JSON.parse(sessionStorage.getItem(LIST_KEY) || "null"); } catch { return null; } }
+
+function listStateFrom(params) {
+  return {
+    q: params.q || "", domain: params.domain || "", tier: params.tier || "", type: params.type || "",
+    scope: params.scope || "all", sort: params.sort || "papers", dir: params.dir || "",
+    offset: Math.max(0, Number(params.offset) || 0), sub: params.sub || "", cat: params.cat || "",
+  };
+}
+function listKey(state) { return LIST_FIELDS.map((k) => `${k}=${state[k]}`).join("&"); }
+function listHashParams(state) {
+  return { q: state.q || undefined, domain: state.domain || undefined, tier: state.tier || undefined, type: state.type || undefined,
+    scope: state.scope !== "all" ? state.scope : undefined, sort: state.sort !== "papers" ? state.sort : undefined,
+    dir: state.dir || undefined, offset: state.offset || undefined, sub: state.sub || undefined, cat: state.cat || undefined };
+}
+function listQuery(state) {
+  return { q: state.q || undefined, domain: state.domain || undefined, tier: state.tier || undefined, type: state.type || undefined,
+    scope: state.scope, sort: state.sort, dir: state.dir || undefined, sub: state.sub || undefined, cat: state.cat || undefined };
+}
 
 // ---------------------------------------------------------------- concept list
 export async function conceptsView(params) {
-  const state = {
-    q: params.q || "", domain: params.domain || "", tier: params.tier || "", type: params.type || "",
-    scope: params.scope || "all", sort: params.sort || "papers", dir: params.dir || "",
-    offset: Number(params.offset) || 0, sub: params.sub || "", cat: params.cat || "",
-  };
+  const state = listStateFrom(params);
   const COLS = [
     ["label", "concepts.col.label", ""], ["zh", "concepts.col.zh", null], ["type", "concepts.col.type", null],
     ["papers", "concepts.col.papers", "num"], ["coverage", "concepts.col.coverage", "num"],
@@ -55,13 +77,13 @@ export async function conceptsView(params) {
   const input = h("input", { type: "search", placeholder: t("concepts.search"), value: state.q, style: "flex:1;min-width:220px;max-width:420px" });
   const domainSel = h("select", h("option", { value: "" }, t("concepts.allDomains")));
   const tierSel = h("select", h("option", { value: "" }, t("concepts.allTiers")), ...["A", "B", "C", "D", "E"].map((x) => h("option", { value: x }, x + " · " + i18n.pick(i18n.tiers[x], x))));
-  const typeSel = h("select", h("option", { value: "" }, t("concepts.allTypes")));
+  const typeSel = h("select", h("option", { value: "" }, t("concepts.allTypes")), ...(i18n.types || []).map((x) => h("option", { value: x.type }, `${dataLabel(x.type)} (${x.n})`)));
   const scopeSel = h("select", h("option", { value: "all" }, t("concepts.scopeAll")));
   for (const d of i18n.domains || []) {
     domainSel.appendChild(h("option", { value: d.id }, dataLabel(d.zh, d.en)));
     if (d.scope) scopeSel.appendChild(h("option", { value: d.id }, dataLabel(d.zh, d.en)));
   }
-  domainSel.value = state.domain; tierSel.value = state.tier; scopeSel.value = state.scope;
+  if (state.type && !(i18n.types || []).some((x) => x.type === state.type)) typeSel.appendChild(h("option", { value: state.type }, dataLabel(state.type)));
   const total = h("span.muted");
   const table = h("div.tw");
   const prev = h("button.btn.small", { type: "button", on: { click: () => { state.offset = Math.max(0, state.offset - LIMIT); load(); } } }, "‹ " + t("common.prevPage"));
@@ -73,13 +95,15 @@ export async function conceptsView(params) {
     h("div.muted", { style: "font-size:12px;margin:-6px 0 8px" }, t("concepts.sortHint")),
     table, h("div.pager", prev, pageInfo, next));
   let seq = 0;
-  const types = new Set();
 
-  function syncHash() {
-    replaceHash(["concepts"], { q: state.q || undefined, domain: state.domain || undefined, tier: state.tier || undefined,
-      type: state.type || undefined, scope: state.scope !== "all" ? state.scope : undefined, sort: state.sort !== "papers" ? state.sort : undefined,
-      dir: state.dir || undefined, offset: state.offset || undefined, sub: state.sub || undefined, cat: state.cat || undefined });
+  function syncControls() {
+    input.value = state.q; domainSel.value = state.domain; tierSel.value = state.tier; typeSel.value = state.type; scopeSel.value = state.scope;
+    if (scopeSel.value !== state.scope) { state.scope = "all"; scopeSel.value = "all"; }
   }
+  function readControls() {
+    state.q = input.value.trim(); state.domain = domainSel.value; state.tier = tierSel.value; state.type = typeSel.value; state.scope = scopeSel.value;
+  }
+  function syncHash() { replaceHash(["concepts"], listHashParams(state)); }
 
   function header() {
     const tr = h("tr");
@@ -87,7 +111,8 @@ export async function conceptsView(params) {
       const th = h("th" + (cls === "num" ? ".num" : ""), t(i18nKey));
       if (SORTABLE.has(key)) {
         th.classList.add("sortable");
-        if (state.sort === key) { th.classList.add("sorted"); if (state.dir === "asc" || (!state.dir && key === "label")) th.classList.add("asc"); }
+        th.title = t("concepts.sortHint");
+        if (state.sort === key) { th.classList.add("sorted"); if (state.dir === "asc" || (!state.dir && (key === "label" || key === "tier"))) th.classList.add("asc"); }
         th.addEventListener("click", () => {
           const defaultDir = (key === "label" || key === "tier") ? "asc" : "desc";
           if (state.sort === key) state.dir = (state.dir || defaultDir) === "desc" ? "asc" : "desc";
@@ -115,37 +140,61 @@ export async function conceptsView(params) {
       h("td", h("span.muted", { style: "font-size:11px" }, t("concepts.overviewLater"))));
   }
 
+  function chips() {
+    clear(extra);
+    if (state.sub) extra.appendChild(h("a.chip.on", { href: `#/subdomains/${encodeURIComponent(state.sub)}`, title: t("fw.subdomains") }, "SD: " + state.sub,
+      h("span", { title: t("common.clear"), on: { click: (ev) => { ev.preventDefault(); state.sub = ""; state.offset = 0; load(); } } }, " ×")));
+    if (state.cat) extra.appendChild(h("a.chip.on", { href: "#/framework?tab=categories", title: t("fw.categories") }, "cat: " + state.cat,
+      h("span", { title: t("common.clear"), on: { click: (ev) => { ev.preventDefault(); state.cat = ""; state.offset = 0; load(); } } }, " ×")));
+  }
+
+  /** Remember the whole filtered list (ids in list order) for prev/next on the concept pages. */
+  async function rememberList(mySeq) {
+    try {
+      const res = await api.get("concepts", { ...listQuery(state), ids: 1 });
+      if (mySeq !== seq) return;
+      saveList({ ids: res.ids, labels: res.labels, title: `${t("concepts.title")} · ${scopeLabel(res.scope)}`, back: location.hash });
+    } catch { /* the page is still usable without prev/next */ }
+  }
+
   async function load() {
     const mySeq = ++seq;
-    state.q = input.value.trim(); state.domain = domainSel.value; state.tier = tierSel.value; state.type = typeSel.value; state.scope = scopeSel.value;
+    readControls();
     syncHash();
+    chips();
     clear(table).appendChild(h("div.loading", t("common.loading")));
-    clear(extra);
-    if (state.sub) extra.appendChild(h("a.chip.on", { href: `#/subdomains/${encodeURIComponent(state.sub)}` }, "SD: " + state.sub, h("span", { on: { click: (ev) => { ev.preventDefault(); state.sub = ""; load(); } } }, " ×")));
-    if (state.cat) extra.appendChild(h("span.chip.on", "cat: " + state.cat, h("span", { on: { click: () => { state.cat = ""; load(); } } }, " ×")));
     try {
-      const res = await api.get("concepts", { q: state.q || undefined, domain: state.domain || undefined, tier: state.tier || undefined,
-        type: state.type || undefined, scope: state.scope, sort: state.sort, dir: state.dir || undefined, limit: LIMIT, offset: state.offset,
-        sub: state.sub || undefined, cat: state.cat || undefined });
+      const res = await api.get("concepts", { ...listQuery(state), limit: LIMIT, offset: state.offset });
       if (mySeq !== seq) return;
       total.textContent = t("concepts.total", { n: res.total });
       clear(table);
       if (!res.rows.length) { table.appendChild(h("div.empty", t("concepts.empty"))); prev.disabled = next.disabled = true; pageInfo.textContent = ""; return; }
-      const tbody = h("tbody", res.rows.map(row));
-      table.appendChild(h("table.t", header(), tbody));
-      for (const r of res.rows) if (r.type && !types.has(r.type)) { types.add(r.type); typeSel.appendChild(h("option", { value: r.type }, dataLabel(r.type))); }
-      typeSel.value = state.type;
-      saveList(res.rows.map((r) => r.id), { ...state });
+      table.appendChild(h("table.t", header(), h("tbody", res.rows.map(row))));
       const pages = Math.max(1, Math.ceil(res.total / LIMIT));
       pageInfo.textContent = t("concepts.page", { p: Math.floor(state.offset / LIMIT) + 1, n: pages });
       prev.disabled = state.offset <= 0;
       next.disabled = state.offset + LIMIT >= res.total;
-    } catch (e) { if (mySeq === seq) clear(table).appendChild(noBuildBox(e)); }
+      rememberList(mySeq);
+    } catch (e) {
+      if (mySeq !== seq) return;
+      clear(table).appendChild(noBuildBox(e));
+      total.textContent = ""; pageInfo.textContent = ""; prev.disabled = next.disabled = true;
+    }
   }
   input.addEventListener("input", debounce(() => { state.offset = 0; load(); }, 250));
   for (const s of [domainSel, tierSel, typeSel, scopeSel]) s.addEventListener("change", () => { state.offset = 0; load(); });
+  syncControls();
   load();
-  return { el, update(p) { /* hash changes come from this view itself */ } };
+  return {
+    el,
+    update(p) {                       // back/forward or a typed hash under the same route: adopt the new state
+      const next_ = listStateFrom(p);
+      if (listKey(next_) === listKey(state)) return;
+      Object.assign(state, next_);
+      syncControls();
+      load();
+    },
+  };
 }
 
 // ---------------------------------------------------------------- helpers for the concept page
@@ -171,7 +220,7 @@ function sparkline(years, totals) {
     svg.appendChild(tx);
   }
   const tm = document.createElementNS("http://www.w3.org/2000/svg", "text");
-  tm.setAttribute("x", W - P); tm.setAttribute("y", P - 2); tm.setAttribute("text-anchor", "end"); tm.textContent = `max ${maxN}`;
+  tm.setAttribute("x", W - P); tm.setAttribute("y", P - 2); tm.setAttribute("text-anchor", "end"); tm.textContent = t("concept.yearMax", { n: maxN });
   svg.appendChild(tm);
   const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
   title.textContent = ys.map((y) => `${y}: ${n[y] || 0}/${totals[y]}`).join("\n");
@@ -214,6 +263,59 @@ function exampleRow(e, conceptId) {
     h("div", markedText(e.text, e.spans)));
 }
 
+/** The list context for prev/next: the stored list when it contains the concept, else (like v3) the concepts of the
+ *  concept's first content category, else null. */
+async function navContext(c) {
+  const stored = loadList();
+  if (stored && Array.isArray(stored.ids) && stored.ids.includes(c.id)) return stored;
+  const k = (c.categories || [])[0];
+  if (!k) return null;
+  try {
+    const res = await api.get("framework/categories", { domain: k.domain });
+    const cat = ((res.domains[0] || {}).categories || []).find((x) => x.id === k.primary_cat);
+    if (!cat || !cat.concepts.some((x) => x.id === c.id)) return null;
+    const ctx = { ids: cat.concepts.map((x) => x.id), labels: cat.concepts.map((x) => x.label),
+      title: `${t("fw.categories")} · ${domainLabel(k.domain)} › ${k.primary_cat} ${dataLabel(k.primary_zh, k.primary_en)}`,
+      back: `#/concepts?cat=${encodeURIComponent(k.primary_cat)}` };
+    saveList(ctx);
+    return ctx;
+  } catch { return null; }
+}
+
+function navBar(c, ctx) {
+  const pn = h("div.pn");
+  if (!ctx) return pn;
+  const i = ctx.ids.indexOf(c.id), n = ctx.ids.length;
+  const mk = (idx, arrow, labelKey) => {
+    const ok = idx >= 0 && idx < n;
+    const a = h("a.btn.small", { href: ok ? `#/concepts/${encodeURIComponent(ctx.ids[idx])}` : "#", title: ok ? clip(ctx.labels[idx] || ctx.ids[idx], 80) : "" },
+      arrow === "prev" ? ["‹ ", t(labelKey)] : [t(labelKey), " ›"]);
+    if (!ok) a.setAttribute("aria-disabled", "true");
+    a.dataset.nav = arrow;
+    return a;
+  };
+  pn.appendChild(mk(i - 1, "prev", "common.prev"));
+  pn.appendChild(h("span.muted", { title: ctx.title || "" }, ctx.back ? h("a", { href: ctx.back }, t("concepts.backToList")) : null, ctx.back ? " · " : null,
+    t("concepts.listPos", { i: i + 1, n }), " ", h("span.muted", { style: "font-size:11px" }, t("concepts.navKeys"))));
+  pn.appendChild(mk(i + 1, "next", "common.next"));
+  return pn;
+}
+
+function navKeys(el) {
+  const onKey = (ev) => {
+    if (!el.isConnected) { document.removeEventListener("keydown", onKey); return; }
+    if (ev.altKey || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
+    const tag = (document.activeElement && document.activeElement.tagName) || "";
+    if (/INPUT|TEXTAREA|SELECT/.test(tag) || String(window.getSelection() || "").trim()) return;
+    const which = ev.key === "ArrowLeft" ? "prev" : ev.key === "ArrowRight" ? "next" : null;
+    if (!which) return;
+    const a = el.querySelector(`.pn a[data-nav="${which}"]:not([aria-disabled])`);
+    if (a) { ev.preventDefault(); location.hash = a.getAttribute("href"); }
+  };
+  document.addEventListener("keydown", onKey);
+  return () => document.removeEventListener("keydown", onKey);
+}
+
 // ---------------------------------------------------------------- concept page
 export async function conceptView(id, params) {
   let c;
@@ -224,28 +326,16 @@ export async function conceptView(id, params) {
   const side = h("div.side");
   el.appendChild(h("div.crumb", h("a", { href: "#/concepts" }, t("nav.concepts")), " / ", h("span.mono", c.id)));
 
-  // prev / next through the list the user came from
-  const lst = loadList();
-  const pn = h("div.pn");
-  if (lst && lst.ids && lst.ids.includes(c.id)) {
-    const i = lst.ids.indexOf(c.id);
-    const mk = (idx, label) => {
-      const a = h("a.btn.small", { href: idx >= 0 && idx < lst.ids.length ? `#/concepts/${encodeURIComponent(lst.ids[idx])}` : "#" }, label);
-      if (idx < 0 || idx >= lst.ids.length) a.setAttribute("aria-disabled", "true");
-      return a;
-    };
-    pn.appendChild(mk(i - 1, "‹ " + t("common.prev")));
-    pn.appendChild(h("span.muted", `${i + 1} / ${lst.ids.length}`));
-    pn.appendChild(mk(i + 1, t("common.next") + " ›"));
-  }
+  const pnHost = h("div");
   const all = c.importance.find((m) => m.scope === "all") || {};
   const head = h("div.concept-head",
     h("div", h("span.lab", c.label), h("span.zh", c.zh || ""),
       h("div.row.tight", { style: "margin-top:4px" }, h("span.badge", dataLabel(c.type)), h("span.badge", t("mode." + (c.mode || "forms"))),
-        ...c.importance.map((m) => h("span.row.tight", { style: "gap:2px" }, h("span.muted", { style: "font-size:11px" }, m.scope === "all" ? t("concepts.scopeAll") : domainLabel(m.scope)), tierBadge(m.tier)))),
-      h("div.forms", c.forms.map((f) => h("span.badge", f)), c.case_forms.map((f) => h("span.badge.accent", { title: t("concept.caseForms") }, f)),
+        ...c.importance.map((m) => h("span.row.tight", { style: "gap:2px" }, h("span.muted", { style: "font-size:11px" }, scopeLabel(m.scope)), tierBadge(m.tier)))),
+      h("div.forms", { title: t("concept.forms") }, c.forms.map((f) => h("span.badge", f)), c.gen_forms.map((f) => h("span.badge", { title: t("concept.genForms") }, f)),
+        c.case_forms.map((f) => h("span.badge.accent", { title: t("concept.caseForms") }, f)),
         c.mode === "literal" ? h("span.badge.warn", { title: c.rx || "" }, t("concept.literal") + ": " + (c.readable || c.rx || "")) : null)),
-    h("span.spacer"), pn);
+    h("span.spacer"), pnHost);
   main.appendChild(head);
 
   // importance table
@@ -256,10 +346,10 @@ export async function conceptView(id, params) {
     ["main", "concept.mainSection", (m) => mainSection(m.main_section)], ["lift", "concept.lift", (m) => m.lift === null ? "–" : num(m.lift)],
     ["trend", "concept.trend", (m) => (m.trend === null ? "–" : num(m.trend)) + (m.trend_flag ? " " + t("trend." + m.trend_flag) : "")],
     ["tier", "concept.tier", (m) => tierBadge(m.tier)]];
-  const imp = h("table.t", h("thead", h("tr", h("th", t("concept.scope")), ...c.importance.map((m) => h("th.num", m.scope === "all" ? t("concepts.scopeAll") : domainLabel(m.scope))))),
+  const imp = h("table.t", h("thead", h("tr", h("th", t("concept.scope")), ...c.importance.map((m) => h("th.num", scopeLabel(m.scope))))),
     h("tbody", metrics.map(([k, lk, f]) => h("tr", h("td", t(lk)), ...c.importance.map((m) => h("td.num", f(m)))))));
   main.appendChild(h("h2", t("concept.importance")));
-  main.appendChild(h("div.tw", imp));
+  main.appendChild(c.importance.length ? h("div.tw", imp) : h("div.muted", t("concept.noImportance")));
 
   // sections + domains + years
   const maxSec = Math.max(1, ...c.sections.map((s) => s.papers));
@@ -267,14 +357,15 @@ export async function conceptView(id, params) {
   for (const s of c.sections) {
     bars.appendChild(h("span", i18n.section(s.section)));
     bars.appendChild(h("span.bar", h("i", { style: `width:${(100 * s.papers / maxSec).toFixed(1)}%` })));
-    bars.appendChild(h("span.n", `${s.papers} / ${s.occ}`));
+    bars.appendChild(h("span.n", { title: t("concept.barHint") }, `${s.papers} / ${s.occ}`));
   }
+  if (!c.sections.length) bars.appendChild(h("div.muted", t("common.none")));
   const dom = h("div.bars");
   const maxDom = Math.max(1, ...c.domains_use.map((d) => d.total));
   for (const d of c.domains_use) {
     dom.appendChild(h("span", d.domain ? domainLabel(d.domain) : dataLabel(d.zh, d.en)));
     dom.appendChild(h("span.bar", h("i", { style: `width:${(100 * d.papers / maxDom).toFixed(1)}%` })));
-    dom.appendChild(h("span.n", `${d.papers} / ${d.total}`));
+    dom.appendChild(h("span.n", { title: t("concept.domainHint") }, `${d.papers} / ${d.total}`));
   }
   main.appendChild(h("div.grid2",
     h("div.card", h("div.card-h", t("concept.sections")), bars),
@@ -301,15 +392,16 @@ export async function conceptView(id, params) {
   if (!c.term_tree_places.length) places.appendChild(h("div.muted", t("common.none")));
   for (const p of c.term_tree_places) {
     places.appendChild(h("div.row.tight", { style: "margin:3px 0;font-size:13px" }, h("span.badge", domainLabel(p.domain)), h("span.badge", i18n.section(p.section)),
-      h("span", dataLabel(p.sub_name)), h("span.muted", "· " + p.term), p.note ? h("span.muted", { style: "font-size:12px" }, "— " + dataLabel(p.note)) : null));
+      h("span", dataLabel(p.sub_name)), h("span.muted", "· " + p.term), p.note ? h("span.muted", { style: "font-size:12px" }, "— " + dataLabel(p.note)) : null,
+      p.example ? h("span.muted", { style: "font-size:12px", title: p.example_doc ? `${t("concept.exampleOf")} ${p.example_doc}` : "" }, "“" + clip(p.example, 100) + "”") : null));
   }
   main.appendChild(h("div.grid2", cats, subs));
   main.appendChild(places);
 
   // examples
   main.appendChild(h("div.row", { style: "margin-top:18px" }, h("h2", { style: "margin:0" }, t("concept.examples")), h("span.spacer"),
-    h("a.btn.primary", { href: `#/concepts/${encodeURIComponent(c.id)}/sentences` }, `${t("concept.allSentences")} (${all.occ ?? ""})`),
-    h("a.btn", { href: `#/concepts/${encodeURIComponent(c.id)}/sentences?docs=1` }, `${t("concept.docs")} (${all.papers ?? ""})`)));
+    h("a.btn.primary", { href: `#/concepts/${encodeURIComponent(c.id)}/sentences` }, `${t("concept.allSentences")} (${all.occ ?? 0})`),
+    h("a.btn", { href: `#/concepts/${encodeURIComponent(c.id)}/sentences?docs=1` }, `${t("concept.docs")} (${all.papers ?? 0})`)));
   const ex = h("div.results");
   if (!c.examples.length) ex.appendChild(h("div.empty", t("concept.noExamples")));
   for (const e of c.examples) ex.appendChild(exampleRow(e, c.id));
@@ -318,14 +410,18 @@ export async function conceptView(id, params) {
   // side: notes
   side.appendChild(notesCard(`C:${c.id}`, c.label));
   el.appendChild(h("div.concept-page", main, side));
-  return { el };
+
+  // prev / next through the list the user came from (or the concept's category when opened directly)
+  navContext(c).then((ctx) => clear(pnHost).appendChild(navBar(c, ctx)));
+  const offKeys = navKeys(el);
+  return { el, destroy: offKeys };
 }
 
 /** Notes card for a C:/SD: target: existing notes + a new-note editor. */
 export function notesCard(ref, label) {
   const list = h("div.list");
   const editor = createEditor({ targets: [ref], onSaved: (n, created) => { if (created) reload(); } });
-  const card = h("div.card", h("div.card-h", t("concept.notes"), " ", h("span.mono", ref)), list, h("div", { style: "height:8px" }), editor.el);
+  const card = h("div.card", h("div.card-h", t("concept.notes"), " ", h("span.mono", { title: label || "" }, ref)), list, h("div", { style: "height:8px" }), editor.el);
   async function reload() {
     clear(list).appendChild(h("div.loading", t("common.loading")));
     try {
@@ -342,13 +438,20 @@ export function notesCard(ref, label) {
 }
 
 // ---------------------------------------------------------------- all sentences / documents of a concept
+const SENT_FIELDS = ["section", "domain", "doc", "tag", "standalone", "sort", "offset", "sub"];
+const DOC_SECTIONS = ["title", "keywords", "abstract", "introduction", "methods", "results", "discussion", "conclusion", "other", "body"];
+
+function sentStateFrom(params, docsMode) {
+  return { section: params.section || "", domain: params.domain || "", doc: params.doc || "", tag: params.tag || "",
+    standalone: params.standalone === "1", sort: params.sort || (docsMode ? "count" : "doc"), offset: Math.max(0, Number(params.offset) || 0), sub: params.sub || "" };
+}
+
 export async function conceptSentencesView(id, params) {
   let c;
   try { c = await api.get(`concepts/${encodeURIComponent(id)}`); }
   catch (e) { return { el: h("div.page", noBuildBox(e)) }; }
   const docsMode = params.docs === "1";
-  const state = { section: params.section || "", domain: params.domain || "", doc: params.doc || "", tag: params.tag || "",
-    standalone: params.standalone === "1", sort: params.sort || (docsMode ? "count" : "doc"), offset: Number(params.offset) || 0, sub: params.sub || "" };
+  const state = sentStateFrom(params, docsMode);
   const LIM = 50;
   const el = h("div.page");
   el.appendChild(h("div.crumb", h("a", { href: "#/concepts" }, t("nav.concepts")), " / ", h("a", { href: `#/concepts/${encodeURIComponent(c.id)}` }, c.label), " / ", docsMode ? t("concept.docs") : t("sent.title")));
@@ -361,24 +464,39 @@ export async function conceptSentencesView(id, params) {
   const tagSel = h("select", h("option", { value: "" }, t("sent.allTags")), ...Object.keys(i18n.tags).map((x) => h("option", { value: x }, i18n.tag(x))));
   const saChk = h("input", { type: "checkbox", checked: state.standalone });
   const sortSel = docsMode
-    ? h("select", h("option", { value: "count" }, t("concepts.col.papers")), h("option", { value: "year" }, t("sent.sortYear")), h("option", { value: "title" }, t("docs.col.title")))
+    ? h("select", h("option", { value: "count" }, t("sent.sortCount")), h("option", { value: "year" }, t("sent.sortYear")), h("option", { value: "title" }, t("sent.sortTitle")))
     : h("select", h("option", { value: "doc" }, t("sent.sortDoc")), h("option", { value: "year" }, t("sent.sortYear")), h("option", { value: "section" }, t("sent.sortSection")));
-  secSel.value = state.section; domSel.value = state.domain; tagSel.value = state.tag; sortSel.value = state.sort;
   const total = h("span.muted");
   const box = h("div.results");
   const prev = h("button.btn.small", { type: "button", on: { click: () => { state.offset = Math.max(0, state.offset - LIM); load(); } } }, "‹ " + t("common.prevPage"));
   const next = h("button.btn.small", { type: "button", on: { click: () => { state.offset += LIM; load(); } } }, t("common.nextPage") + " ›");
+  const pageInfo = h("span.muted");
+  const subChip = h("span");
   el.appendChild(h("div.filters", docsMode ? null : [secSel, tagSel, h("label.row.tight", saChk, t("sent.standaloneOnly"))], domSel, docsMode ? null : docInp,
-    h("span.muted", t("sent.sort") + ":"), sortSel, state.sub ? h("a.chip.on", { href: `#/subdomains/${encodeURIComponent(state.sub)}` }, "SD: " + state.sub) : null, total));
-  el.appendChild(box); el.appendChild(h("div.pager", prev, next));
+    h("span.muted", t("sent.sort") + ":"), sortSel, subChip, total));
+  el.appendChild(box); el.appendChild(h("div.pager", prev, pageInfo, next));
   let seq = 0;
+  function syncControls() {
+    secSel.value = state.section; domSel.value = state.domain; docInp.value = state.doc; tagSel.value = state.tag; saChk.checked = state.standalone; sortSel.value = state.sort;
+    if (sortSel.value !== state.sort) { state.sort = docsMode ? "count" : "doc"; sortSel.value = state.sort; }
+    clear(subChip);
+    if (state.sub) subChip.appendChild(h("a.chip.on", { href: `#/subdomains/${encodeURIComponent(state.sub)}`, title: t("fw.subdomains") }, "SD: " + state.sub,
+      h("span", { title: t("common.clear"), on: { click: (ev) => { ev.preventDefault(); state.sub = ""; state.offset = 0; load(); } } }, " ×")));
+  }
+  function readControls() {
+    state.section = secSel.value; state.domain = domSel.value; state.doc = docInp.value.trim(); state.tag = tagSel.value; state.standalone = saChk.checked; state.sort = sortSel.value;
+  }
   function syncHash() {
     replaceHash(["concepts", c.id, "sentences"], { docs: docsMode ? 1 : undefined, section: state.section || undefined, domain: state.domain || undefined,
       doc: state.doc || undefined, tag: state.tag || undefined, standalone: state.standalone ? 1 : undefined, sort: state.sort, offset: state.offset || undefined, sub: state.sub || undefined });
   }
+  function pager(n) {
+    prev.disabled = state.offset <= 0; next.disabled = state.offset + LIM >= n;
+    pageInfo.textContent = n ? t("concepts.page", { p: Math.floor(state.offset / LIM) + 1, n: Math.max(1, Math.ceil(n / LIM)) }) : "";
+  }
   async function load() {
     const my = ++seq;
-    state.section = secSel.value; state.domain = domSel.value; state.doc = docInp.value.trim(); state.tag = tagSel.value; state.standalone = saChk.checked; state.sort = sortSel.value;
+    readControls();
     syncHash();
     clear(box).appendChild(h("div.loading", t("common.loading")));
     try {
@@ -388,11 +506,11 @@ export async function conceptSentencesView(id, params) {
         total.textContent = t("sd.docTotal", { n: res.total });
         clear(box);
         if (!res.rows.length) box.appendChild(h("div.empty", t("sent.empty")));
-        const secs = ["title", "keywords", "abstract", "introduction", "methods", "results", "discussion", "conclusion", "other", "body"];
-        box.appendChild(h("div.tw", h("table.t", h("thead", h("tr", h("th", t("docs.col.title")), h("th.num", t("docs.col.year")), h("th", t("docs.col.id")), ...secs.map((s) => h("th.num", i18n.section(s))), h("th.num", "refs"))),
+        else box.appendChild(h("div.tw", h("table.t", h("thead", h("tr", h("th", t("docs.col.doc")), h("th.num", t("docs.col.year")), h("th", t("docs.col.id")),
+          ...DOC_SECTIONS.map((s) => h("th.num", { title: t("sent.countHint") }, i18n.section(s))), h("th.num", { title: t("sent.refsHint") }, i18n.section("references")))),
           h("tbody", res.rows.map((r) => h("tr.click", { on: { click: () => go(["docs", r.doc_id], { c: c.id }) } }, h("td", clip(r.title || r.doc_id, 100)), h("td.num", r.year ?? ""), h("td.mono", r.doc_id),
-            ...secs.map((s) => h("td.num", r[s] ? String(r[s]) : "")), h("td.num", r.refs ? String(r.refs) : "")))))));
-        prev.disabled = state.offset <= 0; next.disabled = state.offset + LIM >= res.total;
+            ...DOC_SECTIONS.map((s) => h("td.num", r[s] ? String(r[s]) : "")), h("td.num", r.refs ? String(r.refs) : "")))))));
+        pager(res.total);
         return;
       }
       const res = await api.get(`concepts/${encodeURIComponent(c.id)}/sentences`, { section: state.section || undefined, domain: state.domain || undefined,
@@ -401,13 +519,28 @@ export async function conceptSentencesView(id, params) {
       total.textContent = t("sent.total", { n: res.total });
       clear(box);
       if (!res.rows.length) box.appendChild(h("div.empty", t("sent.empty")));
-      for (const r of res.rows) box.appendChild(exampleRow({ ...r, tags: r.tags }, c.id));
-      prev.disabled = state.offset <= 0; next.disabled = state.offset + LIM >= res.total;
-    } catch (e) { if (my === seq) clear(box).appendChild(noBuildBox(e)); }
+      for (const r of res.rows) box.appendChild(exampleRow(r, c.id));
+      pager(res.total);
+    } catch (e) {
+      if (my !== seq) return;
+      clear(box).appendChild(noBuildBox(e));
+      total.textContent = ""; pager(0); prev.disabled = next.disabled = true;
+    }
   }
   for (const s of [secSel, domSel, tagSel, sortSel]) s.addEventListener("change", () => { state.offset = 0; load(); });
   saChk.addEventListener("change", () => { state.offset = 0; load(); });
   docInp.addEventListener("input", debounce(() => { state.offset = 0; load(); }, 300));
+  syncControls();
   load();
-  return { el, update() { /* own hash */ } };
+  return {
+    el,
+    update(p) {
+      if ((p.docs === "1") !== docsMode) return false;    // sentences ↔ documents tab: the router re-renders
+      const next_ = sentStateFrom(p, docsMode);
+      if (SENT_FIELDS.every((k) => next_[k] === state[k])) return;
+      Object.assign(state, next_);
+      syncControls();
+      load();
+    },
+  };
 }

@@ -108,9 +108,12 @@ def served(tmp_path_factory):
     for doc_id, sha, pages, sents in (("P001", SHA1, P1_PAGES, P1_SENTS), ("P002", SHA2, P2_PAGES, P2_SENTS)):
         ext = extraction_id(doc_id, sha, "test")
         pt = [PageText(n, t, 595.0, 842.0) for n, t in sorted(pages.items())]
+        units = [Unit(doc_id, doc_id, "document", 0, None, 1, 2)]
+        if doc_id == "P002":    # thesis-shaped chapter units (what docs/{id} and resolve U: carry for theses)
+            units += [Unit("P002/porous-coatings", "P002", "chapter", 1, "Porous coatings", 1, 1, 0.9, ("toc_matched",), "P002", "intro"),
+                      Unit("P002/micromotion", "P002", "chapter", 2, "Micromotion", 2, 2, 0.6, ("no_toc",), "P002", "results")]
         ev.add_extraction(ext_id=ext, doc_id=doc_id, pdf_sha256=sha, extractor_version="test", doc_type="paper",
-                          pages=pt, masks=[LineMask(1, 0, pages[1].index("\n"), "header_footer")],
-                          units=[Unit(doc_id, doc_id, "document", 0, None, 1, 2)],
+                          pages=pt, masks=[LineMask(1, 0, pages[1].index("\n"), "header_footer")], units=units,
                           sentences=_rows(doc_id, ext, pages, sents), text_ratio=0.9, drop_ratio=0.05)
     ev.close()
     UserStore.open(project.user_db).close()
@@ -213,8 +216,16 @@ def test_get_doc(api):
     assert [p["page_no"] for p in d["pages"]] == [1, 2]
     assert [p["n_sentences"] for p in d["pages"]] == [2, 3]
     assert d["notes_count"] == 0 and d["has_pdf"] is True
+    assert [u["kind"] for u in d["units"]] == ["document"]
     st, _, d = api("GET", "docs/P002")
     assert st == 200 and d["has_pdf"] is False
+    # chapter units carry what the reader's chapter list shows: heading, pages, unit_kind, confidence, reasons
+    assert [(u["unit_id"], u["kind"], u["ordinal"]) for u in d["units"]] == \
+        [("P002", "document", 0), ("P002/porous-coatings", "chapter", 1), ("P002/micromotion", "chapter", 2)]
+    ch = d["units"][1]
+    assert ch["heading"] == "Porous coatings" and ch["page_from"] == 1 and ch["page_to"] == 1 and ch["unit_kind"] == "intro"
+    assert ch["confidence"] == 0.9 and ch["reasons"] == ["toc_matched"] and ch["parent_unit"] == "P002"
+    assert d["units"][2]["confidence"] == 0.6 and d["units"][2]["unit_kind"] == "results"
     st, _, body = api("GET", "docs/NOPE")
     assert st == 404 and "NOPE" in body["error"]
 
@@ -313,6 +324,11 @@ def test_resolve(api):
     assert r["text"] == "Stem loading study" and r["doc_id"] == "P001"
     st, _, r = api("GET", "resolve?ref=U:P001/methods")
     assert st == 200 and r["status"] == "live" and r["unit_id"] == "P001/methods"
+    st, _, r = api("GET", "resolve?ref=U:P002/micromotion")     # a chapter unit resolves with its heading and page
+    assert st == 200 and r["status"] == "live" and r["unit_id"] == "P002/micromotion" and r["doc_id"] == "P002"
+    assert r["text"] == "Micromotion" and r["heading"] == "Micromotion" and r["page"] == 2 and r["unit_kind"] == "results"
+    st, _, r = api("GET", "resolve?ref=U:NOPE/x")
+    assert st == 200 and r["status"] == "orphan"
     st, _, r = api("GET", "resolve?ref=S:S1nope")
     assert st == 200 and r["status"] == "orphan"
     st, _, r = api("GET", "resolve?ref=N:N_nope")
@@ -889,6 +905,59 @@ def test_concept_list_sorting_and_filters(bapi):
     assert len(b["rows"]) == 2 and b["total"] == 6
 
 
+def test_concept_list_every_sort_is_stable(bapi):
+    """Every sort column with both directions; ties broken by label then id, so repeated calls give the same order."""
+    for sort, key, default_dir in (("papers", "papers", "desc"), ("coverage", "coverage", "desc"), ("topic_rate", "topic_rate", "desc"),
+                                   ("tier", "tier", "asc"), ("label", "label", "asc")):
+        st, _, a = bapi("GET", f"concepts?sort={sort}")
+        assert st == 200 and a["sort"] == sort and a["dir"] == default_dir, sort
+        vals = [(r[key] if r[key] is not None else "Z") for r in a["rows"]]
+        if sort == "label":
+            vals = [v.lower() for v in vals]
+        assert vals == sorted(vals, reverse=default_dir == "desc"), sort
+        st, _, b = bapi("GET", f"concepts?sort={sort}")
+        assert [r["id"] for r in b["rows"]] == [r["id"] for r in a["rows"]]
+        other = "asc" if default_dir == "desc" else "desc"
+        st, _, c = bapi("GET", f"concepts?sort={sort}&dir={other}")
+        assert c["dir"] == other
+        rev = [(r[key] if r[key] is not None else "Z") for r in c["rows"]]
+        if sort == "label":
+            rev = [v.lower() for v in rev]
+        assert rev == sorted(rev, reverse=other == "desc"), sort
+        # ties keep the same relative (label, id) order in both directions
+        groups_a = [[r["id"] for r in a["rows"] if r[key] == v] for v in dict.fromkeys(r[key] for r in a["rows"])]
+        groups_c = [[r["id"] for r in c["rows"] if r[key] == v] for v in dict.fromkeys(r[key] for r in c["rows"])]
+        assert sorted(map(tuple, groups_a)) == sorted(map(tuple, groups_c)), sort
+    st, _, d = bapi("GET", "concepts?sort=nope")
+    assert st == 400 and "sort" in d["error"]
+    st, _, d = bapi("GET", "concepts?sort=papers&dir=sideways")
+    assert st == 400 and "dir" in d["error"]
+    assert bapi("GET", "concepts?sort=&dir=")[2]["sort"] == "papers"
+    # paging walks the same order as the full list
+    full = [r["id"] for r in bapi("GET", "concepts?sort=label&limit=100")[2]["rows"]]
+    paged = []
+    for off in range(0, len(full), 2):
+        paged += [r["id"] for r in bapi("GET", f"concepts?sort=label&limit=2&offset={off}")[2]["rows"]]
+    assert paged == full
+
+
+def test_concept_list_ids_mode_and_type_facet(bapi):
+    """`ids=1` returns the whole filtered list in list order (the UI's prev/next context); `i18n.types` is the type
+    facet of the build."""
+    st, _, res = bapi("GET", "concepts?ids=1&sort=label&limit=2")
+    assert st == 200 and set(res) >= {"ids", "labels", "total", "scope", "sort", "dir", "build"} and "rows" not in res
+    assert len(res["ids"]) == res["total"] == 6 and len(res["labels"]) == 6
+    assert res["ids"] == [r["id"] for r in bapi("GET", "concepts?sort=label&limit=100")[2]["rows"]]
+    assert [x.lower() for x in res["labels"]] == sorted(x.lower() for x in res["labels"])
+    st, _, sub = bapi("GET", "concepts?ids=1&domain=DOM_fe&sort=papers&dir=asc")
+    assert set(sub["ids"]) == {"C_micromotion", "C_finiteelement", "C_stressstrainfield"} and sub["dir"] == "asc"
+    assert bapi("GET", "concepts?ids=1&scope=DOM_nope")[0] == 400
+    assert bapi("GET", "concepts?ids=maybe")[0] == 400
+    st, _, i18n = bapi("GET", "i18n")
+    assert i18n["types"][0] == {"type": "量与指标", "n": 3}
+    assert sum(x["n"] for x in i18n["types"]) == 6 and [x["type"] for x in i18n["types"]] == ["量与指标", "名词术语", "方法或模型名"]
+
+
 def test_concept_page(bapi, served_build):
     st, _, c = bapi("GET", "concepts/C_micromotion")
     assert st == 200 and c["id"] == "C_micromotion" and c["forms"] == ["micromotion", "micromotions"] and c["zh"] == "微动"
@@ -909,6 +978,14 @@ def test_concept_page(bapi, served_build):
     a, b = ex["spans"][0][:2]
     assert ex["text"][a:b].lower() == "micromotion"
     assert c["notes"] == 0 and c["build"] == served_build["build_id"]
+    # examples are deterministic (one per document, most standalone body occurrences first) and are body sentences
+    again = bapi("GET", "concepts/C_micromotion")[2]["examples"]
+    assert [e["sid"] for e in again] == [e["sid"] for e in c["examples"]]
+    assert len({e["doc_id"] for e in c["examples"]}) == 6
+    assert all(e["section"] not in ("references", "front") for e in c["examples"])
+    # the scope parameter is echoed and validated like the list's
+    assert bapi("GET", "concepts/C_micromotion?scope=DOM_fe")[2]["scope"] == "DOM_fe"
+    assert bapi("GET", "concepts/C_micromotion?scope=DOM_nope")[0] == 400
     assert bapi("GET", "concepts/C_nope")[0] == 404
     st, _, lit = bapi("GET", "concepts/C_stressstrainfield")
     assert st == 200 and lit["mode"] == "literal" and lit["rx"]
@@ -1037,3 +1114,26 @@ def test_static_concept_modules(bapi):
         assert st == 200 and hd["Content-Type"].startswith("text/javascript") and b"export" in payload
     st, hd, payload = _req(bapi.base, "GET", "/", raw=True)
     assert b'data-view="concepts"' in payload and b'data-view="framework"' in payload
+
+
+def test_every_chrome_string_has_both_languages():
+    """No untranslated chrome: every `t("key")` literal in the SPA (and every data-i18n attribute) has a {zh, en}
+    entry in i18n.json; dynamic keys (`t("prefix." + x)`) have at least one entry per prefix."""
+    import re
+    static = Path(http_server.STATIC_DIR)
+    strings = json.loads((static / "i18n.json").read_text(encoding="utf-8"))
+    assert all(set(v) == {"zh", "en"} and v["zh"].strip() and v["en"].strip() for v in strings.values())
+    used, prefixes = set(), set()
+    for js in static.glob("*.js"):
+        src = js.read_text(encoding="utf-8")
+        used |= set(re.findall(r'\bt\("([^"]+)"', src))
+        prefixes |= set(re.findall(r'\bt\("([\w.]+\.)" \+', src))
+    html = (static / "index.html").read_text(encoding="utf-8")
+    used |= set(re.findall(r'data-i18n(?:-ph|-title)?="([^"]+)"', html))
+    missing = sorted(k for k in used if k not in strings and not any(k == p for p in prefixes))
+    assert not missing, missing
+    for p in prefixes:
+        assert any(k.startswith(p) for k in strings), p
+    for key in ("unit.kind.intro", "unit.kind.lit_review", "unit.kind.other", "doctype.thesis", "trend.up", "trend.down",
+                "mode.literal", "status.orphan", "sd.core", "sd.related"):
+        assert key in strings, key

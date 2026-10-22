@@ -250,3 +250,10 @@ mark.occ.nested { background: transparent; border-bottom: 2px dotted var(--warn)
 .chip .n { color: var(--ink2); }
 .kv.wide { grid-template-columns: 140px 1fr; }
 .hint { background: var(--accent-soft); border-radius: 10px; padding: 10px 14px; margin: 8px 0; line-height: 1.6; }
+.units { margin-top: 6px; font-size: 12.5px; }
+.units > summary { cursor: pointer; color: var(--ink2); }
+.chapter-list { margin: 4px 0 2px; display: flex; flex-direction: column; gap: 2px; }
+.chapter { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 2px 6px; border-radius: 6px; cursor: pointer; }
+.chapter:hover { background: var(--soft); }
+.chapter .no { width: 18px; text-align: right; color: var(--ink2); font-variant-numeric: tabular-nums; }
+.chapter .hd { font-weight: 600; }
