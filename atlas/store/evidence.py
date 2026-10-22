@@ -9,7 +9,8 @@ import json
 import logging
 import sqlite3
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -299,6 +300,20 @@ class EvidenceStore:
             c.execute("INSERT INTO sentence_fts(sentence_fts) VALUES ('rebuild')")
             c.execute("INSERT INTO page_fts(page_fts) VALUES ('rebuild')")
         log.info("FTS indexes rebuilt")
+
+    @contextmanager
+    def bulk_writes(self) -> Iterator[None]:
+        """Bulk-load mode for many add_extraction() calls: the WAL auto-checkpoint is switched off (each
+        per-document checkpoint rewrote thousands of FTS pages into the main file — seconds on a hard disk) and
+        one TRUNCATE checkpoint runs at the end; the normal setting is restored even on error."""
+        self.conn.execute("PRAGMA wal_autocheckpoint = 0")
+        try:
+            yield
+        finally:
+            try:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                self.conn.execute("PRAGMA wal_autocheckpoint = 1000")
 
     def add_aliases(self, rows: Iterable[tuple[str, str, str, str, float]]) -> None:
         """(old_sid, new_sid, from_ext, to_ext, overlap) rows, INSERT OR IGNORE."""

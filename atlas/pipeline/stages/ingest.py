@@ -59,6 +59,8 @@ from atlas.pipeline.runner import Report
 from atlas.store.db import transaction
 from atlas.store.evidence import EvidenceStore
 
+BATCH_DOCS = 16        # documents per write transaction during `run ingest` (project key ingest.batch_docs)
+
 log = logging.getLogger(__name__)
 
 MANIFEST_COLUMNS = ("doc_id", "title", "year", "authors", "doi", "venue", "doc_type", "file")
@@ -382,9 +384,17 @@ class IngestStage:
             else:
                 pool = None
                 results = map(_compute, jobs)
+            batch_size = max(1, int(project.get("ingest.batch_docs", BATCH_DOCS) or BATCH_DOCS))
             try:
-                for job in results:
-                    self._finish(job, store, report, details, flog)
+                with store.bulk_writes():
+                    batch: list[_Job] = []
+                    for job in results:
+                        batch.append(job)
+                        if len(batch) >= batch_size:
+                            self._finish_batch(batch, store, report, details, flog)
+                            batch = []
+                    if batch:
+                        self._finish_batch(batch, store, report, details, flog)
             finally:
                 if pool is not None:
                     pool.shutdown(wait=True)
@@ -395,15 +405,46 @@ class IngestStage:
         log.info(report.summary())
         return report
 
-    @staticmethod
-    def _finish(job: _Job, store: EvidenceStore, report: Report, details: dict, flog: logging.Logger) -> None:
-        doc_id = job.doc_id
-        if job.error:
-            report.items_failed += 1
-            report.warnings.append(f"{doc_id}: {job.error}")
-            details[doc_id] = {"status": "failed", "error": job.error, "ext_id": job.ext_id}
-            flog.info("%s failed ext=%s %s", doc_id, job.ext_id, job.error)
+    @classmethod
+    def _finish_batch(cls, batch: list[_Job], store: EvidenceStore, report: Report, details: dict,
+                      flog: logging.Logger) -> None:
+        """Steps 7–8 for several documents in ONE transaction (fewer commits, fewer FTS segments). Bookkeeping
+        happens only after the commit; if anything fails the whole batch rolls back and every document is
+        stored again on its own through _finish, which records the failure of the bad one."""
+        if len(batch) == 1:
+            cls._finish(batch[0], store, report, details, flog)
             return
+        stored: list[tuple[_Job, list[str], int]] = []
+        try:
+            with transaction(store.conn):
+                for job in batch:
+                    if job.error:
+                        continue
+                    warns, n_aliases = cls._store(job, store)
+                    stored.append((job, warns, n_aliases))
+        except Exception as e:
+            log.warning("batch of %d documents rolled back (%s: %s); storing them one by one",
+                        len(batch), type(e).__name__, e)
+            for job in batch:
+                cls._finish(job, store, report, details, flog)
+            return
+        for job in batch:
+            if job.error:
+                cls._record_failure(job, report, details, flog, job.error)
+        for job, warns, n_aliases in stored:
+            cls._record_done(job, warns, n_aliases, report, details, flog)
+
+    @staticmethod
+    def _record_failure(job: _Job, report: Report, details: dict, flog: logging.Logger, error: str) -> None:
+        report.items_failed += 1
+        report.warnings.append(f"{job.doc_id}: {error}")
+        details[job.doc_id] = {"status": "failed", "error": error, "ext_id": job.ext_id}
+        flog.info("%s failed ext=%s %s", job.doc_id, job.ext_id, error)
+
+    @staticmethod
+    def _store(job: _Job, store: EvidenceStore) -> tuple[list[str], int]:
+        """Steps 7–8 for one computed job inside the caller's transaction: (warnings, number of aliases).
+        Raises on storage errors."""
         warns: list[str] = []
         th = job.doctype.thresholds
         if job.text_ratio < th.min_text_ratio:
@@ -414,39 +455,51 @@ class IngestStage:
             warns.append("no sentences")
         elif not any(m.section not in ("front", "keywords", "other") for m in job.marks):
             warns.append("no headings detected (whole document labelled 'other')")
-        try:
-            prev = store.current_extraction(doc_id)
-            aliases: list[tuple[str, str, str, str, float]] = []
-            if prev is not None and prev["ext_id"] != job.ext_id:
-                old = store.sentences_of_extraction(prev["ext_id"])
-                aliases = compute_aliases(old, job.sentences, prev["ext_id"], job.ext_id)
-            stats = _stats(job)
-            stats["warnings"] = warns
-            with transaction(store.conn):
-                store.add_extraction(ext_id=job.ext_id, doc_id=doc_id, pdf_sha256=job.pdf_sha256,
-                                     extractor_version=job.extractor_version, doc_type=job.doc_type,
-                                     pages=job.pages, masks=job.masks, units=job.units, sentences=job.sentences,
-                                     text_ratio=job.text_ratio, drop_ratio=job.drop_ratio, stats=stats)
-                if aliases:
-                    store.add_aliases(aliases)
-        except Exception as e:
-            log.exception("storing extraction failed for %s", doc_id)
-            report.items_failed += 1
-            report.warnings.append(f"{doc_id}: {type(e).__name__}: {e}")
-            details[doc_id] = {"status": "failed", "error": str(e), "ext_id": job.ext_id}
-            flog.info("%s failed ext=%s %s", doc_id, job.ext_id, e)
-            return
+        prev = store.current_extraction(job.doc_id)
+        aliases: list[tuple[str, str, str, str, float]] = []
+        if prev is not None and prev["ext_id"] != job.ext_id:
+            old = store.sentences_of_extraction(prev["ext_id"])
+            aliases = compute_aliases(old, job.sentences, prev["ext_id"], job.ext_id)
+        stats = _stats(job)
+        stats["warnings"] = warns
+        with transaction(store.conn):
+            store.add_extraction(ext_id=job.ext_id, doc_id=job.doc_id, pdf_sha256=job.pdf_sha256,
+                                 extractor_version=job.extractor_version, doc_type=job.doc_type,
+                                 pages=job.pages, masks=job.masks, units=job.units, sentences=job.sentences,
+                                 text_ratio=job.text_ratio, drop_ratio=job.drop_ratio, stats=stats)
+            if aliases:
+                store.add_aliases(aliases)
+        return warns, len(aliases)
+
+    @staticmethod
+    def _record_done(job: _Job, warns: list[str], n_aliases: int, report: Report, details: dict,
+                     flog: logging.Logger) -> None:
+        doc_id = job.doc_id
         report.items_done += 1
         for w in warns:
             report.warnings.append(f"{doc_id}: {w}")
         details[doc_id] = {"status": "done", "ext_id": job.ext_id, "n_pages": len(job.pages),
-                           "n_sentences": len(job.sentences), "n_aliases": len(aliases),
+                           "n_sentences": len(job.sentences), "n_aliases": n_aliases,
                            "text_ratio": round(job.text_ratio, 4), "drop_ratio": round(job.drop_ratio, 4),
                            "warnings": warns}
         flog.info("%s done ext=%s pages=%d sentences=%d masks=%d aliases=%d text_ratio=%.3f drop_ratio=%.3f%s",
-                  doc_id, job.ext_id, len(job.pages), len(job.sentences), len(job.masks), len(aliases),
+                  doc_id, job.ext_id, len(job.pages), len(job.sentences), len(job.masks), n_aliases,
                   job.text_ratio, job.drop_ratio, (" warnings=" + "; ".join(warns)) if warns else "")
         log.info("%s: %d pages, %d sentences (ext %s)", doc_id, len(job.pages), len(job.sentences), job.ext_id)
+
+    @classmethod
+    def _finish(cls, job: _Job, store: EvidenceStore, report: Report, details: dict, flog: logging.Logger) -> None:
+        """Steps 7–8 for one document in its own transaction; a storage error is recorded, never raised."""
+        if job.error:
+            cls._record_failure(job, report, details, flog, job.error)
+            return
+        try:
+            warns, n_aliases = cls._store(job, store)
+        except Exception as e:
+            log.exception("storing extraction failed for %s", job.doc_id)
+            cls._record_failure(job, report, details, flog, f"{type(e).__name__}: {e}")
+            return
+        cls._record_done(job, warns, n_aliases, report, details, flog)
 
 
 # ---- registration (`atlas docs add`) ---------------------------------------------------------------------------
