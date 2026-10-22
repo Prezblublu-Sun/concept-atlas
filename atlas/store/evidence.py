@@ -315,6 +315,14 @@ class EvidenceStore:
             finally:
                 self.conn.execute("PRAGMA wal_autocheckpoint = 1000")
 
+    def checkpoint(self, mode: str = "PASSIVE") -> tuple[int, int, int]:
+        """PRAGMA wal_checkpoint(mode) → (busy, log_frames, checkpointed_frames). Used by bulk loads to keep the
+        WAL bounded between the periodic and the final checkpoint."""
+        if mode not in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
+            raise ValueError(f"bad checkpoint mode {mode!r}")
+        r = self.conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+        return int(r[0]), int(r[1]), int(r[2])
+
     def add_aliases(self, rows: Iterable[tuple[str, str, str, str, float]]) -> None:
         """(old_sid, new_sid, from_ext, to_ext, overlap) rows, INSERT OR IGNORE."""
         with transaction(self.conn) as c:

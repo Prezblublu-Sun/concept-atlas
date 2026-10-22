@@ -63,6 +63,15 @@ def test_failing_document_in_a_batch_falls_back_to_single_writes(project, monkey
     assert _current(project)["P003"] is not None
 
 
+def test_periodic_checkpoint_runs_between_batches(project, monkeypatch, tmp_path):
+    monkeypatch.setattr(ingest_mod, "BATCH_DOCS", 2)
+    monkeypatch.setattr(ingest_mod, "CHECKPOINT_BATCHES", 2)      # 9 documents → checkpoints after batches 2 and 4
+    rep = IngestStage().run(project)
+    assert rep.items_done == 9, rep.summary()
+    log = (project.root / "work" / "logs" / "ingest.log").read_text(encoding="utf-8")
+    assert log.count("checkpoint after") == 2
+
+
 def test_auto_checkpoint_is_restored_after_the_run(project):
     IngestStage().run(project)
     store = EvidenceStore.open(project.evidence_db, "rw")

@@ -60,6 +60,8 @@ from atlas.store.db import transaction
 from atlas.store.evidence import EvidenceStore
 
 BATCH_DOCS = 16        # documents per write transaction during `run ingest` (project key ingest.batch_docs)
+CHECKPOINT_BATCHES = 32   # PASSIVE WAL checkpoint every 32 batches (~500 documents): the femstem corpus wrote a
+                          # 6 GB WAL in one go before the final checkpoint; this keeps it near 1.5 GB
 
 log = logging.getLogger(__name__)
 
@@ -388,11 +390,17 @@ class IngestStage:
             try:
                 with store.bulk_writes():
                     batch: list[_Job] = []
+                    n_batches = 0
                     for job in results:
                         batch.append(job)
                         if len(batch) >= batch_size:
                             self._finish_batch(batch, store, report, details, flog)
                             batch = []
+                            n_batches += 1
+                            if n_batches % CHECKPOINT_BATCHES == 0:
+                                busy, frames, done_frames = store.checkpoint("PASSIVE")
+                                flog.info("checkpoint after %d batches: wal_frames=%d checkpointed=%d busy=%d",
+                                          n_batches, frames, done_frames, busy)
                     if batch:
                         self._finish_batch(batch, store, report, details, flog)
             finally:
