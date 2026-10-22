@@ -49,6 +49,8 @@ KIND_ZH = {"document": "文献", "unit": "单元", "sentence": "句子", "concep
 
 _RESOLVABLE = ("D", "U", "S", "N", "K", "C", "SD")
 _NEEDS_BUILD = ("C", "SD")
+_IDS_PAGE = 1000            # page size when the service walks a whole concept list (ids mode, type facet)
+CONCEPT_SORTS = ("papers", "coverage", "topic_rate", "label", "tier")   # contract §6; anything else is a 400
 
 
 class NoBuildError(Exception):
@@ -80,6 +82,7 @@ class AtlasService:
         self._pool_lock = threading.Lock()
         self._ui_strings = self._load_ui_strings()
         self._build_id: str | None = current_build_id(project.builds_dir)
+        self._types_cache: tuple[str, list[dict]] | None = None   # (build id, concept type facet) — builds are immutable
         log.info("service for project %s at %s (build %s)", project.name, project.root, self._build_id)
 
     # ---- per-thread stores ----------------------------------------------------------------------------------
@@ -255,21 +258,46 @@ class AtlasService:
 
         Shape: {"ui": {key: {zh, en}}, "sections": {section: {zh, en}}, "tags": {tag: {zh, en}},
                 "kinds": {ref kind letter: {zh, en}}, "tiers": {A: {zh, en}}, "data": {zh: en} (the promoted
-                build's i18n table: domain / category / sub-domain names and descriptions), "domains": [...]}"""
+                build's i18n table: domain / category / sub-domain names and descriptions), "domains": [...],
+                "types": [{type, n}] (the concept types of the build, most frequent first; the list view's filter)}"""
         out = {
             "ui": self._ui_strings,
             "sections": {s: {"zh": SECTION_ZH.get(s, s), "en": s.capitalize()} for s in SECTIONS},
             "tags": {t: {"zh": TAG_ZH.get(t, t), "en": TAG_EN.get(t, t.capitalize())} for t in TAGS},
             "kinds": {k: {"zh": KIND_ZH.get(v, v), "en": v.capitalize()} for k, v in REF_KINDS.items()},
             "tiers": {t: {"zh": TIER_ZH[t], "en": TIER_EN[t]} for t in TIERS},
-            "data": {}, "domains": [],
+            "data": {}, "domains": [], "types": [],
         }
         out["sections"]["body"] = {"zh": "正文", "en": "Body"}
         b = self.build_optional()
         if b is not None:
             out["data"] = b.i18n_strings()
             out["domains"] = b.domains()
+            out["types"] = self._concept_types(b)
         return out
+
+    def _all_concepts(self, b: BuildStore, **filters) -> dict:
+        """BuildStore.list_concepts() result with *every* row matching `filters` in list order (the service walks
+        the store's pages)."""
+        rows: list[dict] = []
+        while True:
+            res = b.list_concepts(limit=_IDS_PAGE, offset=len(rows), **filters)
+            rows += res["rows"]
+            if not res["rows"] or len(rows) >= res["total"]:
+                res["rows"] = rows
+                return res
+
+    def _concept_types(self, b: BuildStore) -> list[dict]:
+        cached = self._types_cache
+        if cached is not None and cached[0] == b.build_id:
+            return cached[1]
+        counts: dict[str, int] = {}
+        for r in self._all_concepts(b)["rows"]:
+            if r.get("type"):
+                counts[r["type"]] = counts.get(r["type"], 0) + 1
+        types = [{"type": k, "n": n} for k, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+        self._types_cache = (b.build_id, types)
+        return types
 
     # ---- documents and reading
     def _notes_count(self, ref: str) -> int:
@@ -492,13 +520,26 @@ class AtlasService:
     # ---- concepts and frameworks (promoted build; NoBuildError → 409) ---------------------------------------
     def list_concepts(self, q: str | None = None, domain: str | None = None, tier: str | None = None,
                       type: str | None = None, sub: str | None = None, cat: str | None = None, scope: str = "all",
-                      sort: str = "papers", dir: str | None = None, limit: int = 100, offset: int = 0) -> dict:
-        """{rows: [{id, label, zh, type, mode, papers, coverage, topic_rate, tier, main_section, notes}], total, scope}"""
+                      sort: str = "papers", dir: str | None = None, limit: int = 100, offset: int = 0,
+                      ids: bool = False) -> dict:
+        """{rows: [{id, label, zh, type, mode, papers, coverage, topic_rate, tier, main_section, notes}], total, scope,
+        sort, dir}. With `ids` the whole filtered list in list order is returned instead of a page (`limit`/`offset`
+        ignored): {ids: [...], labels: [...], total, scope, sort, dir} — what the UI keeps for prev/next."""
         b = self.build()
         if scope and scope != "all" and scope not in b.scope_ids():
             raise ValueError(f"unknown scope {scope!r}")
-        res = b.list_concepts(q=q, domain=domain, tier=tier, type=type, sub=sub, cat=cat, scope=scope or "all",
-                              sort=sort or "papers", dir=dir, limit=int(limit), offset=int(offset))
+        if sort and sort not in CONCEPT_SORTS:
+            raise ValueError(f"sort must be one of {', '.join(CONCEPT_SORTS)}")
+        if dir and dir.lower() not in ("asc", "desc"):
+            raise ValueError("dir must be asc | desc")
+        filters = dict(q=q, domain=domain, tier=tier, type=type, sub=sub, cat=cat, scope=scope or "all",
+                       sort=sort or "papers", dir=dir or None)
+        if ids:
+            res = self._all_concepts(b, **filters)
+            return {"ids": [r["id"] for r in res["rows"]], "labels": [r["label"] for r in res["rows"]],
+                    "total": res["total"], "scope": res["scope"], "sort": res["sort"], "dir": res["dir"],
+                    "build": b.build_id}
+        res = b.list_concepts(limit=int(limit), offset=int(offset), **filters)
         counts = self.user().note_counts([f"C:{r['id']}" for r in res["rows"]])
         for r in res["rows"]:
             r["notes"] = counts.get(f"C:{r['id']}", 0)
@@ -510,6 +551,8 @@ class AtlasService:
         c = b.concept(concept_id)
         if c is None:
             raise KeyError(f"unknown concept {concept_id!r}")
+        if scope and scope != "all" and scope not in b.scope_ids():
+            raise ValueError(f"unknown scope {scope!r}")
         c["importance"] = b.importance_of(concept_id)
         c["scope"] = scope or "all"
         c["sections"] = b.sections_of(concept_id)

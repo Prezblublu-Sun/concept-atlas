@@ -2,6 +2,14 @@
 import { api, h, clear, t, i18n, markPhrase, clip, store, replaceHash, go, fmtDate } from "./core.js";
 import { createEditor } from "./editor.js";
 
+/** Data labels from the build's i18n table (duplicated from concepts.js to keep the module graph acyclic:
+ *  concepts.js imports the badges below). */
+function dataLabel(zh, en) { return i18n.lang === "en" ? (en || i18n.data(zh) || zh || "") : (zh || en || ""); }
+function domainLabel(id) {
+  const d = (i18n.domains || []).find((x) => x.id === id);
+  return d ? dataLabel(d.zh, d.en) : (id || "");
+}
+
 const ZOOM_KEY = "atlas.zoom";
 const MODE_KEY = "atlas.readerMode";
 
@@ -48,24 +56,33 @@ export async function readerView(docId, params) {
   const chips = h("div.chips", { style: "margin-top:4px" });
   function renderChips() {
     clear(chips);
-    for (const d of doc.domains || []) chips.appendChild(h("span.badge", (i18n.domains.find((x) => x.id === d) || { zh: d }).zh));
-    for (const s of doc.subdomains || []) chips.appendChild(h("a.chip" + (s.tier === "core" ? ".on" : ""), { href: `#/subdomains/${encodeURIComponent(s.sub_id)}`, title: s.sub_id }, i18n.lang === "en" ? (s.en || s.zh) : s.zh));
+    for (const d of doc.domains || []) chips.appendChild(h("span.badge", { title: t("doc.domains") }, domainLabel(d)));
+    for (const s of doc.subdomains || []) chips.appendChild(h("a.chip" + (s.tier === "core" ? ".on" : ""),
+      { href: `#/subdomains/${encodeURIComponent(s.sub_id)}`, title: `${t("doc.subdomains")} · ${s.sub_id} · ${t("sd." + s.tier)}` }, dataLabel(s.zh, s.en)));
     for (const c of doc.top_concepts || []) {
       const on = state.c.includes(c.id);
       chips.appendChild(h("a.chip" + (on ? ".on" : ""), { href: "#", title: (c.zh || "") + " · " + t("doc.markHint"), on: { click: (ev) => { ev.preventDefault(); toggleConcept(c.id); } } }, c.label, h("span.n", String(c.n))));
     }
     if (state.c.length) chips.appendChild(h("button.btn.small", { type: "button", on: { click: () => { state.c = []; syncHash(); renderChips(); state.pageCache.clear(); render(); } } }, t("doc.clearMarks")));
   }
+  // chapter units (thesis doctype): heading, pages, kind, confidence; click → first page of the chapter
+  const chapters = (doc.units || []).filter((u) => u.kind !== "document");
+  const unitsBox = chapters.length ? h("details.units", h("summary", t("doc.chapters", { n: chapters.length })),
+    h("div.chapter-list", chapters.map((u) => h("div.chapter", { on: { click: () => setPage(u.page_from || 1) } },
+      h("span.no", u.ordinal !== null && u.ordinal !== undefined ? String(u.ordinal) : ""), h("span.hd", u.heading || u.unit_id),
+      u.unit_kind ? h("span.badge", t("unit.kind." + u.unit_kind)) : null,
+      h("span.muted", u.page_from ? (u.page_to && u.page_to !== u.page_from ? t("doc.pagesRange", { a: u.page_from, b: u.page_to }) : t("common.page", { p: u.page_from })) : ""),
+      u.confidence !== null && u.confidence !== undefined ? h("span.badge" + (u.confidence < 0.7 ? ".warn" : ""), t("unit.confidence", { c: Math.round(u.confidence * 100) })) : null)))) : null;
   function toggleConcept(cid) {
     state.c = state.c.includes(cid) ? state.c.filter((x) => x !== cid) : [...state.c, cid];
     syncHash(); renderChips(); state.pageCache.clear(); render();
   }
   const head = h("div.reader-head",
     h("div.crumb", h("a", { href: "#/docs" }, t("nav.docs")), " / ", h("span.mono", doc.doc_id),
-      (doc.units || []).length > 1 ? [" · ", h("span.muted", `${doc.units.length - 1} ${t("doc.units")}`)] : null),
+      doc.doc_type && doc.doc_type !== "paper" ? [" · ", h("span.badge", t("doctype." + doc.doc_type))] : null),
     h("div.reader-title", doc.title || t("common.untitled")),
     h("div.reader-meta", metaBits, doc.doi ? [" · ", h("a", { href: "https://doi.org/" + doc.doi, target: "_blank", rel: "noopener" }, doc.doi)] : null),
-    chips,
+    chips, unitsBox,
   );
   renderChips();
   const pageInput = h("input.pageno", { type: "number", min: 1, max: Math.max(1, nPages), value: state.page,

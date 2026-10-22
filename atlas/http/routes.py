@@ -19,6 +19,7 @@ GET  search?phrase=&limit=&offset=           -> service.search
 GET  sentences/{sid}?context=                -> service.sentence
 GET  resolve?ref=                            -> service.resolve (D: U: S: N: K: and, with a build, C: SD:)
 GET  concepts?q=&domain=&tier=&type=&sub=&cat=&scope=&sort=&dir=&limit=&offset=  -> service.list_concepts (409 without a build)
+GET  concepts?ids=1&<same filters>            -> {ids, labels, total, …}: the whole filtered list in list order (prev/next)
 GET  concepts/{concept_id}?scope=            -> service.get_concept
 GET  concepts/{concept_id}/sentences?section=&domain=&sub=&doc=&tag=&standalone=&sort=&limit=&offset=
 GET  concepts/{concept_id}/docs?scope=&use=&sort=&limit=&offset=

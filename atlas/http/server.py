@@ -71,7 +71,7 @@ _EXPOSE = "X-Page, X-Pages, X-Hits, X-Hit-Y, X-Atlas-Build"
 # ---- parameter types: every service parameter the adapter may fill from a query string or a JSON body
 _INT_PARAMS = {"limit", "offset", "page_no", "context", "rev"}
 _FLOAT_PARAMS = {"zoom", "seq"}
-_BOOL_PARAMS = {"explicit", "standalone"}
+_BOOL_PARAMS = {"explicit", "standalone", "ids"}
 _LIST_PARAMS = {"tags", "target_refs"}
 _STR_PARAMS = {"title", "body_md", "comment_md", "name", "description", "ref", "after_item", "phrase", "q", "tag",
                "highlight", "doc_id", "note_id", "coll_id", "item_id", "sid", "concept_id", "sub_id", "domain",

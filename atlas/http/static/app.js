@@ -43,8 +43,7 @@ async function route() {
   }
   const [top, id] = path;
   if (current.key === key && current.view && current.view.update) {
-    current.view.update(params);
-    return;
+    if (current.view.update(params) !== false) return;   // false: the view wants a full re-render for these params
   }
   if (current.view && current.view.destroy) current.view.destroy();
   current = { key, view: null };
