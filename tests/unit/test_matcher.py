@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import pytest
 
-from atlas.core.matcher import (DEFAULT_PATTERNS, MATCHER_VERSION, Matcher, Occurrence, fold_map, in_caps_run, lit_norm,
-                                lit_norm_map, norm_key)
+from atlas.core.matcher import (DEFAULT_PATTERNS, MATCHER_VERSION, Matcher, Occurrence, case_key, fold_map, form_keys,
+                                has_intra_hyphen, in_caps_run, lit_norm, lit_norm_map, norm_key)
 from tests.unit._golden_matcher import GOLDEN, GOLDEN_CONCEPTS
 
 
@@ -137,7 +137,104 @@ def test_forms_match_through_ligatures_and_folded_letters():
     occ = {o.concept_id: o for o in mm.sentence(s2)}
     assert s2[occ["C_relativel2error"].cstart:occ["C_relativel2error"].cend] == "relative ℓ2 error"
     assert s2[occ["C_igd"].cstart:occ["C_igd"].cend] == "𝐼𝐺𝐷"
-    assert MATCHER_VERSION == "m2"
+    assert MATCHER_VERSION == "m3"
+
+
+# ---- hyphen readings (matcher m3) -----------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def h():
+    patterns = dict(DEFAULT_PATTERNS)
+    patterns["bad_next"] = {**DEFAULT_PATTERNS["bad_next"], "micromotion": ["sensor"]}
+    return Matcher.from_curated([
+        C("C_ppb", ["periprosthetic bone", "periprosthetic bones"]),
+        C("C_bone", ["bone"]),
+        C("C_cok", ["co-kriging"]),                           # a curated form written with the hyphen
+        C("C_kriging", ["kriging"]),
+        C("C_micromotion", ["micromotion"]),
+        C("C_motion", ["motion"]),
+        C("C_fe", ["finite element"], ["finiteelement"], ["FE"]),
+        C("C_fea", ["finite element analysis"]),
+        C("C_sota", ["stateoftheart"]),
+        C("C_mct", [], [], ["micro-CT"]),                     # a case form written with the hyphen
+        C("C_gp", [], [], ["GP"]),
+        C("C_gpucb", [], [], ["GP-UCB"]),
+        C("C_stem", ["stem"]),
+        C("C_abaqus", ["abaqus"], [], ["ABAQUS"]),
+        C("C_ei", ["expected improvement"], [], ["EI"]),
+    ], patterns)
+
+
+def occ_of(m, s, cid):
+    return [(s[o.cstart:o.cend], o.form, o.nested_in) for o in m.sentence(s) if o.concept_id == cid]
+
+
+def test_form_keys_and_case_key_fold_hyphens_both_ways():
+    assert form_keys("co-kriging") == ["co kriging", "cokriging"]
+    assert form_keys("Co‑Kriging") == ["co kriging", "cokriging"]                 # U+2011, NFKC → U+2010
+    assert form_keys("state-of-the-art") == ["state of the art", "stateoftheart"]
+    assert form_keys("finite element") == ["finite element"] and form_keys("") == []
+    assert form_keys("a - b") == ["a b"]                                         # a spaced hyphen is a separator only
+    assert case_key("micro-CT") == "microCT" and case_key("FE") == "FE"
+    assert norm_key("co‑kriging") == "co kriging" and fold_map("a‑b‐c")[0] == "a b c"
+
+
+def test_joined_reading_matches_a_form_written_without_the_hyphen(h):
+    s = "Loss of peri-prosthetic bone was seen."
+    assert occ_of(h, s, "C_ppb") == [("peri-prosthetic bone", "periprosthetic bone", None)]
+    assert occ_of(h, s, "C_bone") == [("bone", "bone", "C_ppb")]                   # nested as usual
+    s = "Simultaneously, peri-prosthetic bone remodeling was simulated."          # a real corpus sentence
+    o = [o for o in h.sentence(s) if o.concept_id == "C_ppb"]
+    assert [(o[0].cstart, o[0].cend)] == [(16, 36)] and s[16:36] == "peri-prosthetic bone"
+    s = "the co‑Kriging model"                                                   # non-breaking hyphen
+    assert occ_of(h, s, "C_cok") == [("co‑Kriging", "co kriging", None)]
+    assert occ_of(h, s, "C_kriging") == [("Kriging", "kriging", "C_cok")]
+    s = "a state-of-the-art method"                                              # a run of four tokens joins too
+    assert occ_of(h, s, "C_sota") == [("state-of-the-art", "stateoftheart", None)]
+
+
+def test_hyphenated_curated_form_matches_text_written_either_way(h):
+    assert occ_of(h, "ordinary cokriging works", "C_cok") == [("cokriging", "cokriging", None)]
+    assert occ_of(h, "ordinary co kriging works", "C_cok") == [("co kriging", "co kriging", None)]
+    assert occ_of(h, "ordinary co-kriging works", "C_cok") == [("co-kriging", "co kriging", None)]
+
+
+def test_both_readings_of_one_span_count_once_and_the_split_reading_wins_the_tie(h):
+    s = "a finite-element analysis"
+    assert occ_of(h, s, "C_fe") == [("finite-element", "finite element", "C_fea")]     # not 'finiteelement' as well
+    assert occ_of(h, s, "C_fea") == [("finite-element analysis", "finite element analysis", None)]
+    assert h.counts(s) == {"C_fea": (1, 0), "C_fe": (1, 1)}
+    s = "the micro-motion of the stem"
+    assert h.counts(s) == {"C_micromotion": (1, 0), "C_motion": (1, 1), "C_stem": (1, 0)}   # two concepts, two readings
+    assert occ_of(h, s, "C_micromotion") == [("micro-motion", "micromotion", None)]
+    assert occ_of(h, s, "C_motion") == [("motion", "motion", "C_micromotion")]
+    assert h.sentence(s) == h.sentence(s)
+
+
+def test_hyphen_reading_negative_cases(h):
+    assert occ_of(h, "peri - prosthetic bone", "C_ppb") == []                      # a spaced hyphen does not join
+    assert occ_of(h, "peri–prosthetic bone", "C_ppb") == []                        # nor an en dash
+    assert occ_of(h, "periprosthetic", "C_ppb") == [] and occ_of(h, "micro motion", "C_micromotion") == []
+    assert occ_of(h, "the stem-cell line", "C_stem") == []                         # bad_next looks past the hyphen
+    assert occ_of(h, "a micro-motion sensor", "C_micromotion") == []               # … and past the joined word
+    assert occ_of(h, "a micro-motion probe", "C_micromotion") == [("micro-motion", "micromotion", None)]
+
+
+def test_hyphenated_case_forms_match_the_joined_word(h):
+    assert occ_of(h, "micro-CT scans", "C_mct") == [("micro-CT", "microCT", None)]
+    assert occ_of(h, "microCT scans", "C_mct") == [("microCT", "microCT", None)]
+    assert occ_of(h, "micro CT scans", "C_mct") == [] and occ_of(h, "Micro-CT scans", "C_mct") == []   # case-sensitive
+    s = "the GP-UCB rule"
+    assert occ_of(h, s, "C_gpucb") == [("GP-UCB", "GPUCB", None)]
+    assert occ_of(h, s, "C_gp") == [("GP", "GP", "C_gpucb")]
+    # a plain case form never matches a hyphen-joined word: 'E-I' / 'F-E' are relations, not spellings of EI / FE
+    assert occ_of(h, "the EI criterion", "C_ei") == [("EI", "EI", None)]
+    assert occ_of(h, "in example E-I the", "C_ei") == [] and occ_of(h, "an F-E coupling", "C_fe") == []
+    assert case_key("EI") == "EI" and not has_intra_hyphen("EI") and has_intra_hyphen("micro-CT")
+
+
+def test_tie_between_a_key_and_a_case_form_is_deterministic(h):
+    assert occ_of(h, "ABAQUS; 2006.", "C_abaqus") == [("ABAQUS", "abaqus", None)]   # the key, not the case form
+    assert occ_of(h, "in Abaqus.", "C_abaqus") == [("Abaqus", "abaqus", None)]
 
 
 def test_deterministic_order_and_counts(m):
