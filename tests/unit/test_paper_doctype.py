@@ -144,7 +144,7 @@ def dt() -> PaperDocType:
 
 def test_registered_and_versioned(dt):
     assert isinstance(get_doctype("paper"), PaperDocType)
-    assert dt.name == "paper" and dt.version == "paper4"
+    assert dt.name == "paper" and dt.version == "paper5"
     assert dt.thresholds.max_drop_ratio == pytest.approx(0.15)
 
 

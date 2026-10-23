@@ -9,9 +9,13 @@ which had no nested distinction — `neural network` inside `convolutional neura
 anchor `neural network`); `core` when an anchor is in the title or keywords or anchors are mentioned >= 2 times
 in the abstract (`stats.strong_abstract_hits`), else `related`; a cross sub-domain needs every anchor group to
 hit, `core` needs every group strong. The ranked concepts of a sub-domain use the standalone body users of
-`counts` (as the v2 sub-domain framework).
+`counts` (as the v2 sub-domain framework); the candidates are the tiered concepts (origin 概念…) whose `domains`
+contain the sub-domain's domain (a cross sub-domain: any counting-scope domain), and their `topic_rate` counts any
+title/keywords hit, nested ones included — both exactly as v2's `subdomain_framework.py`.
 
-Version history: assign1 used standalone topic hits for the anchors; assign2 counts every hit (v1/v2 semantics).
+Version history: assign1 used standalone topic hits for the anchors; assign2 counts every hit (v1/v2 semantics);
+assign3 restricts the ranked candidates to the sub-domain's domain and tiered concepts and counts the ranking's
+topic_rate over every title/keywords hit.
 """
 from __future__ import annotations
 
@@ -73,7 +77,9 @@ def rank_subdomain_concepts(store: BuildStore, assignments: list[tuple[str, str,
         if tier == "core":
             sub_core.setdefault(sub_id, set()).add(doc_id)
     users = store.body_users()
-    topic = store.topic_users()
+    topic = store.topic_users(standalone=False)       # any title/keywords hit, as v2's subdomain_framework.py
+    scope = store.concept_scope()
+    scope_domains = [d["id"] for d in store.domains() if d["scope"]]
     labels = store.concept_labels(users)
     sc_rows: list[dict] = []
     fs_rows: list[dict] = []
@@ -81,9 +87,15 @@ def rank_subdomain_concepts(store: BuildStore, assignments: list[tuple[str, str,
         P = sub_docs.get(s["id"], set())
         base = dom_docs.get(s["domain"], set()) if s["kind"] == "within" and s["domain"] else all_docs
         rest = base - P
+        # candidates (v2): tiered concepts (origin 概念…) whose domains contain the sub-domain's domain — any
+        # counting-scope domain for a cross sub-domain; phrases / journal names / foreign-domain concepts never rank
+        doms = [s["domain"]] if s["kind"] == "within" and s["domain"] else scope_domains
         ranked_in: list[dict] = []
         if P:
             for cid, U in users.items():
+                cs = scope.get(cid)
+                if cs is None or not cs["tiered"] or not any(d in cs["domains"] for d in doms):
+                    continue
                 k_in = len(U & P)
                 if k_in < MIN_PAPERS_IN_SUB:
                     continue
@@ -140,7 +152,7 @@ def category_stats(store: BuildStore) -> list[dict]:
 
 class AssignStage:
     name = "assign"
-    version = "assign2"
+    version = "assign3"
     llm = False
     requires: tuple[str, ...] = ("match",)
     gate: tuple[str, ...] = ("subdomains", "domains", "doc_domains")

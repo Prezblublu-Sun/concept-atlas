@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import pytest
 
-from atlas.core.matcher import DEFAULT_PATTERNS, Matcher, Occurrence, in_caps_run, lit_norm, lit_norm_map, norm_key
+from atlas.core.matcher import (DEFAULT_PATTERNS, MATCHER_VERSION, Matcher, Occurrence, fold_map, in_caps_run, lit_norm,
+                                lit_norm_map, norm_key)
 from tests.unit._golden_matcher import GOLDEN, GOLDEN_CONCEPTS
 
 
@@ -104,6 +105,39 @@ def test_nested_in_names_the_longest_container(m):
 
 def test_merged_concepts_are_ignored(m):
     assert ids(m.sentence("An old label here.")) == []
+
+
+# ---- NFKC fold of the stored text (review fix, matcher m2) ---------------------------------------------------
+def test_fold_map_expands_ligatures_and_maps_offsets_back():
+    s = "Using ﬁnite element (FE) models"
+    f, idx = fold_map(s)
+    assert f == "Using finite element (FE) models" and len(idx) == len(f)
+    a = f.index("finite")
+    assert idx[a] == idx[a + 1] == s.index("ﬁ")                   # both letters of the ligature map to its one offset
+    assert fold_map("ℓ2 x")[0] == "l2 x" and fold_map("𝐼𝐺𝐷+")[0] == "IGD+" and fold_map("a˜b")[0] == "a b"
+    assert fold_map("a-b")[0] == "a b" and fold_map("x")[1] == [0]                  # '-' is a token separator
+
+
+def test_forms_match_through_ligatures_and_folded_letters():
+    """v2 scanned NFKC-normalised text: 'ﬁnite element', 'relative ℓ2 error' and '𝐼𝐺𝐷' must match, and the spans
+    must still index the stored (unfolded) text."""
+    mm = Matcher.from_curated([
+        C("C_fe", ["finite element"], [], ["FE"]),
+        C("C_relativel2error", ["relative l2 error"]),
+        C("C_igd", ["inverted generational distance"], [], ["IGD"]),
+        C("C_stem", ["stem"]),
+    ], DEFAULT_PATTERNS)
+    s = "Using ﬁnite element (FE) models of the stem"
+    occ = {}
+    for o in mm.sentence(s):
+        occ.setdefault(o.concept_id, o)                       # the first occurrence of each concept
+    assert s[occ["C_fe"].cstart:occ["C_fe"].cend] == "ﬁnite element" and s[occ["C_stem"].cstart:occ["C_stem"].cend] == "stem"
+    assert sum(1 for o in mm.sentence(s) if o.concept_id == "C_fe") == 2            # … and 'FE' as the case form
+    s2 = "the relative ℓ2 error and 𝐼𝐺𝐷+ were reported"
+    occ = {o.concept_id: o for o in mm.sentence(s2)}
+    assert s2[occ["C_relativel2error"].cstart:occ["C_relativel2error"].cend] == "relative ℓ2 error"
+    assert s2[occ["C_igd"].cstart:occ["C_igd"].cend] == "𝐼𝐺𝐷"
+    assert MATCHER_VERSION == "m2"
 
 
 def test_deterministic_order_and_counts(m):

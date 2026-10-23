@@ -38,7 +38,7 @@ def write_curated(project, docs: list[str]) -> None:
     write_yaml(curated_path(cd, "concepts"), {"concepts": [
         {"id": "C_micromotion", "label": "micromotion", "zh": "微动", "type": "量与指标", "mode": "forms",
          "forms": ["micromotion", "micromotions"], "gen_forms": [], "case_forms": [], "rx": None, "probe": "", "readable": "",
-         "domains": ["DOM_ortho", "DOM_fe"], "place": [], "shared_with": [], "origin": "test", "merged_into": None, "source": "test"},
+         "domains": ["DOM_ortho", "DOM_fe"], "place": [], "shared_with": [], "origin": "概念（test）", "merged_into": None, "source": "test"},
         {"id": "C_stem", "label": "stem", "zh": "柄", "type": "名词术语", "mode": "forms", "forms": ["stem", "stems"], "domains": ["DOM_ortho"]},
         {"id": "C_femoralstem", "label": "femoral stem", "zh": "股骨柄", "type": "名词术语", "mode": "forms",
          "forms": ["femoral stem", "femoral stems"], "domains": ["DOM_ortho"]},
@@ -134,8 +134,8 @@ def test_build_all_and_results(built):
     assert m["status"] == "finished" and len(m["sha256"]) == 64 and m["stages"]["match"]["status"] == "done"
     assert {"build_id", "created", "status", "project", "evidence_sha_at_pin", "curated", "docs", "sentences", "stages"} <= set(m)
     assert len(m["evidence_sha_at_pin"]) == 64 and m["curated"] == before and m["docs"] == 9
-    assert m["stages"]["match"]["version"] == "match2" and m["stages"]["assign"]["version"] == "assign2"
-    assert m["stages"]["match"]["fingerprint"].startswith("m1:")
+    assert m["stages"]["match"]["version"] == "match4" and m["stages"]["assign"]["version"] == "assign3"
+    assert m["stages"]["match"]["fingerprint"].startswith("m2:")
     report = (project.builds_dir / bid / "report.md").read_text(encoding="utf-8")
     assert report.startswith(f"# Build {bid}") and "## Tier histogram" in report and "## Checks" in report
     assert "| all |" in report and "C_micromotion" in report and "ORT-MM" in report

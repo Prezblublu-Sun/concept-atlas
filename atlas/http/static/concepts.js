@@ -15,7 +15,16 @@ const LIST_FIELDS = ["q", "domain", "tier", "type", "scope", "sort", "dir", "off
 const errBox = (e) => h("div.error-box", `${t("common.error")}: ${e.message}`);
 
 export function noBuildBox(e) {
-  if (e instanceof ApiError && e.status === 409) return h("div.hint", t("app.noBuild"));
+  if (e instanceof ApiError && e.status === 409) {
+    // 409 covers two states: no build promoted, or a promoted build this code refuses (older schema); the
+    // second carries the server's own message, which names the build and the command that fixes it
+    const err = (e.body && e.body.error) || e.message || "";
+    if (err && err !== "no build promoted") {
+      const m = /promoted build (\S+)/.exec(err);
+      return h("div.hint", m ? t("app.buildStaleHint", { id: m[1] }) : err);
+    }
+    return h("div.hint", t("app.noBuild"));
+  }
   return errBox(e);
 }
 
@@ -400,7 +409,8 @@ export async function conceptView(id, params) {
 
   // examples
   main.appendChild(h("div.row", { style: "margin-top:18px" }, h("h2", { style: "margin:0" }, t("concept.examples")), h("span.spacer"),
-    h("a.btn.primary", { href: `#/concepts/${encodeURIComponent(c.id)}/sentences` }, `${t("concept.allSentences")} (${all.occ ?? 0})`),
+    // the count is what the sentences view reports (distinct sentences, nested occurrences included), not importance.occ
+    h("a.btn.primary", { href: `#/concepts/${encodeURIComponent(c.id)}/sentences`, title: t("concept.sentencesNested", { n: c.sentences ?? 0 }) }, `${t("concept.allSentences")} (${c.sentences ?? all.occ ?? 0})`),
     h("a.btn", { href: `#/concepts/${encodeURIComponent(c.id)}/sentences?docs=1` }, `${t("concept.docs")} (${all.papers ?? 0})`)));
   const ex = h("div.results");
   if (!c.examples.length) ex.appendChild(h("div.empty", t("concept.noExamples")));
@@ -516,7 +526,7 @@ export async function conceptSentencesView(id, params) {
       const res = await api.get(`concepts/${encodeURIComponent(c.id)}/sentences`, { section: state.section || undefined, domain: state.domain || undefined,
         doc: state.doc || undefined, tag: state.tag || undefined, standalone: state.standalone ? 1 : undefined, sort: state.sort, limit: LIM, offset: state.offset, sub: state.sub || undefined });
       if (my !== seq) return;
-      total.textContent = t("sent.total", { n: res.total });
+      total.textContent = t("sent.total", { n: res.total_capped ? `${res.total}+` : res.total });
       clear(box);
       if (!res.rows.length) box.appendChild(h("div.empty", t("sent.empty")));
       for (const r of res.rows) box.appendChild(exampleRow(r, c.id));

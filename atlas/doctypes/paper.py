@@ -95,6 +95,8 @@ _TAIL_RANK = 7
 _TAIL_NEEDS_RANK = 4
 _KEYWORDS_MAX_RANK = 2      # keywords events are only accepted before the introduction
 ABSTRACT_MAX_PAGE = 3       # an 'Abstract' heading counts on the first 3 pages or the first quarter of the paper
+ABSTRACT_MAX_WORDS = 600    # an abstract range longer than this (no heading closes it in time) is cut: the rest is
+ABSTRACT_MAX_PAGES = 2      # 'introduction'; it also ends with the page after the one it starts on (v2 capped at 6,000 chars)
 STRUCTURED_MAX_PAGE = 2     # a structured abstract (Background / Methods / Results / Conclusions) sits on pages 1–2 …
 STRUCTURED_MAX_GAP = 30     # … with at most this many lines between consecutive headings …
 STRUCTURED_MAX_TAIL = 80    # … and at most this many lines (keywords, affiliations, footnotes) before the body heading
@@ -237,7 +239,7 @@ def _ack_reason(s: str) -> str:
 @register
 class PaperDocType:
     name = "paper"
-    version = "paper4"
+    version = "paper5"      # paper5: methods-at-the-end layouts, heading numbers on their own line, abstract cap
     thresholds = Thresholds()
 
     # ---- masks ---------------------------------------------------------------------------------------------
@@ -287,11 +289,17 @@ class PaperDocType:
         'numbered'; classified by keyword, or 'methods' when they carry no keyword and follow the introduction).
         Rules: the order must be monotone in IMRaD order — a lower-ranked heading after higher ones is ignored,
         unless the higher ones are all loose (a strict 'Methods' retracts a loose 'Previous results') or form a
-        structured abstract on the first pages (then they become 'abstract'); 'references' needs 'results' or
-        later first; an 'Abstract' heading counts only on the first pages, a late 'Summary' is a conclusion; if
-        no 'abstract' heading exists but a body heading does, the text between the first paragraph of ≥ 40
-        words on page 1 and that heading is 'abstract'; before that it is 'front' (title, authors). A
-        'Keywords:'/'Key words' line yields a 'keywords' mark that ends at the next blank line or heading."""
+        structured abstract on the first pages (then they become 'abstract'), or it is the paper's only strict
+        'Methods' / 'Materials and methods' heading after the results / conclusions (methods-at-the-end layouts
+        such as ACS Omega's '2. Results and discussion, 3. Conclusions, 4. Materials and methods'); 'references'
+        needs 'results' or later first; an 'Abstract' heading counts only on the first pages, a late 'Summary' is
+        a conclusion; if no 'abstract' heading exists but a body heading does, the text between the first
+        paragraph of ≥ 40 words on page 1 and that heading is 'abstract'; before that it is 'front' (title,
+        authors); an abstract range longer than ABSTRACT_MAX_WORDS words or running past the page after its own
+        is cut there and the remainder is 'introduction' (the previous system capped the abstract at 6,000
+        chars). A 'Keywords:'/'Key words' line yields a 'keywords' mark that ends at the next blank line or
+        heading. A heading number standing on its own line ('3' / 'Mechanics of Lattice Materials', ASME
+        journals) is joined with the next line (see _numbered_headings)."""
         lines = _all_lines(pages)
         hf_masked = {(m.page_no, m.cstart) for m in masks if m.reason == "header_footer"}
         masked = {(m.page_no, m.cstart) for m in masks}
@@ -347,6 +355,8 @@ class PaperDocType:
                 higher = [a for a in accepted if a.rank > rank]
                 if all(a.strength == "loose" for a in higher):
                     accepted = [a for a in accepted if not (a.rank > rank and a.strength == "loose")]
+                elif _late_methods(accepted, ev, sec, max_rank, ln.text):
+                    pass                        # methods at the end of the paper: accepted, the order stays
                 elif _structured_abstract(accepted, ev.idx, rank, sec, lines):
                     dropped = [a for a in accepted if a.rank >= rank]
                     accepted = [a for a in accepted if a.rank < rank]
@@ -394,6 +404,11 @@ class PaperDocType:
                     emit(end[0], end[1], "front")
             else:
                 emit(ln.page_no, ln.cstart, e.section)
+        # 5. abstract cap: a range that no heading closes in time ends after ABSTRACT_MAX_WORDS words or with the
+        # page after its own; the remainder is 'introduction'
+        for cut in _abstract_cuts(marks, lines):
+            marks.append(cut)
+        marks.sort(key=lambda m: (m.page_no, m.cstart))
         # Fallback: when no body heading was detected at all, the document must not vanish as 'front'
         # (is_body = 0). Without even an abstract the whole document becomes 'other' (a mark at (1, 0) after the
         # mandatory 'front' mark; the ingest stage takes the last mark at a position). With an abstract and/or a
@@ -469,24 +484,81 @@ class _Event:
     rank: int
 
 
+_BARE_NUMBER_RE = re.compile(r"^\d{1,2}$")
+
+
+def _heading_text_line(s: str) -> bool:
+    """A line that can carry the text of a heading whose number stands on the line before it: short, capitalised,
+    no terminal period, no formula / caption shape."""
+    return (0 < len(s) <= 60 and len(s.split()) <= 8 and s[0].isupper() and not s.endswith(".")
+            and not segment._NOT_HEAD_RE.search(s))
+
+
 def _numbered_headings(lines: Sequence[_Line], hf_masked: set[tuple[int, int]]) -> dict[int, str]:
     """Line index → heading text for top-level numbered headings whose numbers run in sequence (1, 2, 3 … with
     at most one skipped; the first may be 1 or 2). A strict heading line resets the sequence to its own number
-    ('1 Introduction' after affiliation markers '1 Department …', '2 Department …')."""
+    ('1 Introduction' after affiliation markers '1 Department …', '2 Department …'). A bare number on its own
+    line followed by a heading-shaped line ('3' / 'Mechanics of Lattice Materials', ASME journals) counts as the
+    numbered heading '3 Mechanics of Lattice Materials' at the number's line."""
     out: dict[int, str] = {}
     prev = 0
     for i, ln in enumerate(lines):
         if not ln.text or (ln.page_no, ln.cstart) in hf_masked:
             continue
-        hit = segment.split_numbered_heading(ln.text)
+        text = ln.text
+        if _BARE_NUMBER_RE.match(text):
+            nxt = next((x for x in lines[i + 1:i + 3] if x.text), None)
+            if nxt is None or nxt.page_no != ln.page_no or not _heading_text_line(nxt.text):
+                continue
+            text = f"{text} {nxt.text}"
+        hit = segment.split_numbered_heading(text)
         if hit is None:
             continue
         n, head = hit
-        strict = (h := segment.detect_heading_ex(ln.text)) is not None and h[1] == "strict"
+        strict = (h := segment.detect_heading_ex(text)) is not None and h[1] == "strict"
         if strict or (prev == 0 and n <= 2) or n in (prev + 1, prev + 2):
             out[i] = head
             prev = n
     return out
+
+
+def _late_methods(accepted: Sequence[_Event], ev: _Event, sec: str, max_rank: int, line: str) -> bool:
+    """True for the paper's first strict 'Methods' / 'Materials and methods' / 'Experimental' heading arriving after
+    the results or later (methods-at-the-end layouts); numbered keyword headings ('5 Model limitations') and loose
+    forms do not qualify."""
+    if sec != "methods" or ev.strength == "loose" or max_rank < _RANK["results"]:
+        return False
+    if any(a.section == "methods" for a in accepted):
+        return False
+    h = segment.detect_heading_ex(line)
+    return h is not None and h[0] == "methods" and h[1] == "strict"
+
+
+def _abstract_cuts(marks: Sequence[SectionMark], lines: Sequence[_Line]) -> list[SectionMark]:
+    """'introduction' marks that cut every abstract range exceeding ABSTRACT_MAX_WORDS words or running past the
+    page after its own (R2129: abstract on page 2, next heading on page 44; P2022: no Introduction heading, the
+    abstract ran to the 'Methods' on page 14). The cut sits at the first line past the limit, before the next mark."""
+    ordered = sorted(marks, key=lambda m: (m.page_no, m.cstart))
+    pos = {(ln.page_no, ln.cstart): i for i, ln in enumerate(lines)}
+    cuts: list[SectionMark] = []
+    for k, m in enumerate(ordered):
+        if m.section != "abstract":
+            continue
+        start = pos.get((m.page_no, m.cstart))
+        if start is None:
+            continue
+        nxt = ordered[k + 1] if k + 1 < len(ordered) else None
+        words = 0
+        for ln in lines[start:]:
+            if nxt is not None and (ln.page_no, ln.cstart) >= (nxt.page_no, nxt.cstart):
+                break
+            if ln.page_no > m.page_no + ABSTRACT_MAX_PAGES - 1 or words > ABSTRACT_MAX_WORDS:
+                if ln.text:
+                    cuts.append(SectionMark(ln.page_no, ln.cstart, "introduction"))
+                    break
+                continue
+            words += len(ln.text.split())
+    return cuts
 
 
 def _structured_abstract(accepted: Sequence[_Event], idx: int, rank: int, sec: str,

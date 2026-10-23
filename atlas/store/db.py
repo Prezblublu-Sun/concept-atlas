@@ -11,10 +11,14 @@ Rules (Windows-proof):
   other URI authority than localhost).
 - `row_factory = sqlite3.Row`; `check_same_thread=False` (callers keep one connection per thread).
 - `migrate()` executes the .sql file (CREATE … IF NOT EXISTS) and sets `PRAGMA user_version` to the file's
-  version; `sql/migrations/<n>.sql` are applied in order when user_version < n (user.sqlite: 2.sql).
-- Never VACUUM evidence.sqlite: `sentences` and `page_text` have TEXT primary keys, so VACUUM may renumber
-  their rowids, on which the external-content FTS tables are keyed. If it ever happens, run
-  `EvidenceStore.rebuild_fts()`.
+  version; `sql/migrations/<schema>_<n>.sql` (idempotent scripts, e.g. `user_2.sql`) are applied in order when
+  user_version < n. The prefix keeps the migrations of the three schemas apart.
+- Never VACUUM evidence.sqlite by hand: `sentences` and `page_text` have TEXT primary keys, so VACUUM may renumber
+  their rowids, on which the external-content FTS tables are keyed. The one sanctioned VACUUM is
+  `atlas evidence gc --vacuum`, which runs `EvidenceStore.rebuild_fts()` right after it.
+- A build.sqlite older than BUILD_SCHEMA_VERSION cannot be opened for writing (its `occurrences` table lacks the
+  denormalised columns of version 2); the service refuses to serve it until `atlas build upgrade <id>`
+  (`upgrade_build` below, seconds) has brought it to the current schema — or it is rebuilt.
 
 Connections are opened in autocommit mode (`isolation_level=None`); the stores wrap each write in an explicit
 `BEGIN IMMEDIATE … COMMIT` through `transaction()`.
@@ -33,8 +37,9 @@ log = logging.getLogger(__name__)
 SQL_DIR = Path(__file__).with_name("sql")
 MIGRATIONS_DIR = SQL_DIR / "migrations"
 EVIDENCE_SCHEMA_VERSION = 1
-USER_SCHEMA_VERSION = 2     # 2: index on note_targets.resolved_ref (migrations/2.sql)
-BUILD_SCHEMA_VERSION = 1    # build.sqlite (increment 2)
+USER_SCHEMA_VERSION = 2     # 2: index on note_targets.resolved_ref (migrations/user_2.sql)
+BUILD_SCHEMA_VERSION = 2    # build.sqlite (increment 2); 2: occurrences carries doc_id/seq/page_no/section/is_body
+                            # + the covering index occ_concept_doc (performance work after increment 2)
 
 _MODES = ("rw", "ro", "immutable")
 
@@ -93,14 +98,16 @@ def user_version(conn: sqlite3.Connection) -> int:
 
 
 def migrate(conn: sqlite3.Connection, schema_file: str, target_version: int) -> None:
-    """Run `sql/<schema_file>` (idempotent CREATE … IF NOT EXISTS), then every `sql/migrations/<n>.sql` with
-    current < n <= target_version in order, and set PRAGMA user_version = target_version."""
+    """Run `sql/<schema_file>` (idempotent CREATE … IF NOT EXISTS), then every `sql/migrations/<stem>_<n>.sql`
+    (stem = the schema file without `.sql`) with current < n <= target_version in order, and set
+    PRAGMA user_version = target_version."""
     current = user_version(conn)
     sql_path = SQL_DIR / schema_file
     script = sql_path.read_text(encoding="utf-8")
     conn.executescript(script)
+    stem = Path(schema_file).stem
     for n in range(current + 1, target_version + 1):
-        mig = MIGRATIONS_DIR / f"{n}.sql"
+        mig = MIGRATIONS_DIR / f"{stem}_{n}.sql"
         if mig.exists():
             log.info("applying migration %s", mig.name)
             conn.executescript(mig.read_text(encoding="utf-8"))
@@ -152,8 +159,61 @@ def open_user(path: str | Path, mode: str = "rw") -> sqlite3.Connection:
 
 
 def open_build(path: str | Path, mode: str = "rw") -> sqlite3.Connection:
-    """connect + migrate('build.sql') when mode == 'rw'. Finished builds are opened with mode='immutable'."""
+    """connect + migrate('build.sql') when mode == 'rw'. Finished builds are opened with mode='immutable'.
+    A build file written by an older schema (user_version between 1 and BUILD_SCHEMA_VERSION - 1) is refused
+    for writing: the stage outputs of the two shapes are not interchangeable, and builds are disposable."""
     conn = connect(path, mode)
     if mode == "rw":
+        v = user_version(conn)
+        if 0 < v < BUILD_SCHEMA_VERSION:
+            conn.close()
+            raise BuildSchemaError(f"build.sqlite has schema {v} < {BUILD_SCHEMA_VERSION}: create a new build "
+                                   f"(`atlas build all`) instead of reusing {Path(path).parent.name}")
         migrate(conn, "build.sql", BUILD_SCHEMA_VERSION)
     return conn
+
+
+#: Schema 1 → 2 of build.sqlite: the denormalised occurrence columns (filled from build_sentences) and the
+#: covering index that replaces occ_concept. The ALTERs cannot live in sql/migrations (the schema script's
+#: CREATE INDEX on the new columns would run first), so the step is explicit here.
+_BUILD_1_TO_2 = (
+    "ALTER TABLE occurrences ADD COLUMN doc_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE occurrences ADD COLUMN seq INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE occurrences ADD COLUMN page_no INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE occurrences ADD COLUMN section TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE occurrences ADD COLUMN is_body INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE occurrences ADD COLUMN tags TEXT NOT NULL DEFAULT ''",
+    "UPDATE occurrences SET (doc_id, seq, page_no, section, is_body, tags) = "
+    "(SELECT b.doc_id, b.seq, b.page_no, b.section, b.is_body, b.tags FROM build_sentences b WHERE b.sid = occurrences.sid)",
+    "DROP INDEX IF EXISTS occ_concept",
+)
+
+
+def upgrade_build(path: str | Path) -> tuple[int, int]:
+    """Bring a build.sqlite of an older schema to BUILD_SCHEMA_VERSION in place (`atlas build upgrade`): the
+    1 → 2 step above, then the schema script (which creates the covering index) and `PRAGMA user_version`.
+    Returns (version before, version after); a current file is left untouched. The caller clears the read-only
+    attribute first and re-freezes afterwards (BuildStore.upgrade)."""
+    conn = connect(path, "rw")
+    try:
+        before = user_version(conn)
+        if before >= BUILD_SCHEMA_VERSION or before == 0:
+            if before == 0:
+                migrate(conn, "build.sql", BUILD_SCHEMA_VERSION)
+            return before, user_version(conn)
+        if before == 1:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(occurrences)")}
+            with transaction(conn) as c:
+                for stmt in _BUILD_1_TO_2:
+                    if stmt.startswith("ALTER TABLE occurrences ADD COLUMN") and stmt.split()[5] in cols:
+                        continue                                    # a previous, interrupted upgrade got this far
+                    c.execute(stmt)
+                log.info("build %s: occurrences upgraded to schema 2", Path(path).parent.name)
+        migrate(conn, "build.sql", BUILD_SCHEMA_VERSION)
+        return before, user_version(conn)
+    finally:
+        conn.close()
+
+
+class BuildSchemaError(Exception):
+    """The build file was written by an older schema than this code expects."""

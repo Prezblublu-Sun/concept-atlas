@@ -4,8 +4,10 @@ bad-neighbour lists, thresholds) comes from `concepts.yaml` / `patterns.yaml`, n
 Implemented by: increment 2 (derived layer).
 
 Forms mode (`mode: forms`):
-- tokens: `TOKEN = [A-Za-z0-9]*[A-Za-z][A-Za-z0-9]*` over the sentence with '-' replaced by a space (same length,
-  so token spans index the stored sentence text); keys are lower-cased tokens joined by one space;
+- tokens: `TOKEN = [A-Za-z0-9]*[A-Za-z][A-Za-z0-9]*` over a per-character NFKC-folded copy of the sentence
+  (`fold_map`: ligatures expanded, mathematical italics and ℓ folded to ASCII letters, combining marks dropped,
+  '-' replaced by a space) whose offset map takes token spans back to the stored sentence text; keys are
+  lower-cased tokens joined by one space;
 - `forms + gen_forms` are case-insensitive keys; `case_forms` are case-sensitive single tokens (abbreviations);
   an all-caps case form with <= `short_caps_max_letters` letters (after a trailing 's') does not match inside a
   run of all-caps words (`in_caps_run`: both neighbouring alphabetic tokens all-caps with >= 2 letters);
@@ -28,7 +30,10 @@ import unicodedata
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
-MATCHER_VERSION = "m1"       # bump when any rule in this module changes
+MATCHER_VERSION = "m2"       # bump when any rule in this module changes
+                             # m2: forms mode tokenises a per-character NFKC-folded copy of the stored text
+                             # (ligatures ﬁ/ﬂ, ℓ, mathematical italics, combining marks) with an offset map,
+                             # as the previous system scanned NFKC-normalised text
 
 DEFAULT_TOKEN_REGEX = r"[A-Za-z0-9]*[A-Za-z][A-Za-z0-9]*"
 DEFAULT_PATTERNS: dict = {
@@ -46,6 +51,29 @@ _QUOTES_RE = re.compile(r"[’‘'`´]")
 _DASHES = set("-‐‑‒–—/")
 _SPACED = set(":<>=±")
 _LIT_KEEP = set("abcdefghijklmnopqrstuvwxyz0123456789%:<>=± ")
+#: Letters NFKC leaves alone but the previous system's corpus writes for Latin ones ('relative ℓ2 error').
+_FOLD_EXTRA = {"ℓ": "l"}
+
+
+def fold_map(s: str | None) -> tuple[str, list[int]]:
+    """(folded text, map) for forms-mode tokenising: every character NFKC-normalised (ﬁ → fi, 𝐼 → I, ¼ → 1⁄4),
+    `ℓ` → l, combining marks dropped, '-' → ' '; map[i] is the offset in `s` of the character that produced
+    folded[i], so token spans index the stored text (a ligature's two letters both map to its one offset; the end
+    of a span is `map[last] + 1`)."""
+    out: list[str] = []
+    idx: list[int] = []
+    for i, ch in enumerate(s or ""):
+        if ch == "-":
+            out.append(" ")
+            idx.append(i)
+            continue
+        for c in unicodedata.normalize("NFKC", ch):
+            c = _FOLD_EXTRA.get(c, c)
+            if unicodedata.category(c) == "Mn":          # combining mark (from '˜' → ' ̃', 'é' stays precomposed)
+                continue
+            out.append(c)
+            idx.append(i)
+    return "".join(out), idx
 
 
 @dataclass(frozen=True, order=True)
@@ -169,10 +197,10 @@ class Matcher:
 
     # ---- forms ----------------------------------------------------------------------------------------------
     def _forms(self, text: str) -> tuple[list[tuple[int, int, str, str]], list[tuple[int, int]]]:
-        """((token index, n tokens, concept id, key) for every forms/case match, token spans)."""
-        raw = text.replace("-", " ")
-        spans = [(m.start(), m.end()) for m in self.token_re.finditer(raw)]
-        otoks = [raw[a:b] for a, b in spans]
+        """((token index, n tokens, concept id, key) for every forms/case match, token spans into `text`)."""
+        raw, idx = fold_map(text)
+        spans = [(idx[m.start()], idx[m.end() - 1] + 1) for m in self.token_re.finditer(raw)]
+        otoks = [raw[m.start():m.end()] for m in self.token_re.finditer(raw)]
         toks = [t.lower() for t in otoks]
         n_tok = len(toks)
         found: set[tuple[int, int, str, str]] = set()

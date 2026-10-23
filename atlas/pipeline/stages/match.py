@@ -17,7 +17,9 @@ Per document (doc_id order; `--doc-ids a,b` reruns those documents after deletin
 After the documents: `counts` is rebuilt from occurrences + topic hits ('body' = is_body sentences plus
 `stats.body_extra_sections` (default: appendix) plus the title-field hits when `stats.body_includes_title` — the
 previous system counted its full text, title line and appendices included, as "body") and `importance` is computed
-per concept × scope with `atlas.core.stats` (parameters from `defaults.yaml` → `stats:`).
+per concept × scope with `atlas.core.stats` (parameters from `defaults.yaml` → `stats:`). Entries that are not
+concepts (origin 句式短语 / 期刊名 / 通用句式 / 歧义缩写, `stats.is_tiered`) get their frequency columns but
+`tier` NULL, as the previous system's frequency_importance.py kept them on a frequency-only sheet.
 
 `--workers N` > 1 runs step 2–3 in a process pool (the matcher is built once per worker); writes stay in the
 parent, in doc_id order, in batches.
@@ -157,6 +159,7 @@ def compute_importance(store: BuildStore, params: dict | None = None) -> list[di
         if d["scope"]:
             scopes[d["id"]] = [x for x in all_ids if d["id"] in (meta[x].get("domains") or [])]
     lits = store.literal_ids()
+    tiered = {cid: cs["tiered"] for cid, cs in store.concept_scope().items()}
     rows: list[dict] = []
     seen: set[str] = set()
 
@@ -164,6 +167,8 @@ def compute_importance(store: BuildStore, params: dict | None = None) -> list[di
         for scope, ids in scopes.items():
             m = concept_metrics(per_doc, ids, doc_years, cid in lits, p, complement_ids=None if scope == "all" else all_ids)
             m.pop("sec_papers", None)
+            if not tiered.get(cid, True):
+                m["tier"] = None            # frequency only: the previous system never tiered phrases / journal names
             rows.append({"concept_id": cid, "scope": scope, **m})
 
     for cid, per_doc in store.iter_counts():
@@ -177,7 +182,9 @@ def compute_importance(store: BuildStore, params: dict | None = None) -> list[di
 
 class MatchStage:
     name = "match"
-    version = "match2"      # match1 summed meta abstract/keywords with the same sentences; match2 falls back instead
+    version = "match4"      # match1 summed meta abstract/keywords with the same sentences; match2 falls back instead;
+                            # match3 writes the denormalised occurrence columns (build schema 2); match4 tiers only
+                            # the 概念 items (tier NULL for phrases / journal names, as the previous system)
     llm = False
     requires: tuple[str, ...] = ()
     gate: tuple[str, ...] = ("concepts", "patterns")

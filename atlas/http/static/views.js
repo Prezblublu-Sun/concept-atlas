@@ -103,6 +103,8 @@ export async function searchView(params) {
       const res = await api.get(path, { phrase, limit: LIMIT, offset });
       if (first) clear(box);
       clear(summary).appendChild(h("span", t("search.summary", { phrase, total: res.total, docs: res.documents })));
+      // a corpus-wide search joins / lists at most a sample of the matches (total_capped): say what the counts mean
+      if (res.total_capped) summary.appendChild(h("div.muted", { style: "font-size:12px" }, t("search.sampled", { total: res.total, n: res.listed })));
       if (!res.rows.length && first) box.appendChild(h("div.empty", t("search.empty")));
       for (const r of res.rows) {
         box.appendChild(h("div.hit", { on: { click: () => go(["docs", r.doc_id], { page: r.page, hl: phrase, sid: r.sid }) } },
@@ -111,7 +113,7 @@ export async function searchView(params) {
           h("div.snip", { html: snippetHtml(r.snippet || "") })));
       }
       offset += res.rows.length;
-      more.hidden = offset >= res.total;
+      more.hidden = offset >= (res.listed ?? res.total);     // only the listed (sampled) rows can be paged
     } catch (e) { clear(box).appendChild(errBox(e)); }
     more.disabled = false;
   }

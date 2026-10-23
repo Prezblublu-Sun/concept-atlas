@@ -328,3 +328,82 @@ def test_text_sha_shared_between_extractions(store: EvidenceStore):
     shas = store.conn.execute("SELECT ext_id, text_sha256 FROM pages WHERE page_no=1").fetchall()
     assert {r[0] for r in shas} == {e1, e2} and len({r[1] for r in shas}) == 1
     assert shas[0][1] == text_sha256(PAGE1_V1)
+
+
+# ---- performance shape (capped candidates, snippets for the page only, stats from aggregates) --------------------
+def test_phrase_search_caps_the_join_not_the_scan(store: EvidenceStore, monkeypatch):
+    """Review fix: every FTS match is scanned (the counts cover the whole corpus); only the joined / listed rows
+    are capped, with an every-k-th sample instead of the earliest-ingested rows."""
+    from atlas.store import evidence as ev_mod
+    _ingest_v1(store)
+    full = store.phrase_search("bone")
+    assert full["total"] == 2 and full["documents"] == 1 and full["total_capped"] is False and full["listed"] == 2
+    # a second document makes the sample observable: 4 matches in 2 documents, cap 2 → every 2nd rowid
+    store.add_document("P002", "paper", "manifest", Path("x.pdf"), "p002.pdf", "b" * 64, DocMeta(title="Second", year=2019))
+    ext = extraction_id("P002", "b" * 64, "v1")
+    texts = ["Cortical bone is stiff.", "Trabecular bone is porous."]
+    page = PageText(1, " ".join(texts), 595.0, 842.0)
+    rows = [SentenceRow(sid=sentence_id("P002", t), doc_id="P002", text=t, ext_id=ext, seq=i, unit_id="P002", page_no=1,
+                        cstart=page.text.index(t), cend=page.text.index(t) + len(t), section="introduction", is_body=True,
+                        tags=(), flags=()) for i, t in enumerate(texts)]
+    store.add_extraction(ext_id=ext, doc_id="P002", pdf_sha256="b" * 64, extractor_version="v1", doc_type="paper",
+                         pages=[page], masks=[], units=[Unit("P002", "P002", "document", 0, None, 1, 1)], sentences=rows,
+                         text_ratio=0.9, drop_ratio=0.0)
+    assert store.phrase_search("bone")["total"] == 4 and store.phrase_search("bone")["documents"] == 2
+    monkeypatch.setattr(ev_mod, "SEARCH_CAP", 2)
+    r = store.phrase_search("bone")
+    assert r["total_capped"] is True and r["total"] == 4 and r["documents"] == 2        # counts: every match
+    assert r["listed"] == 2 and len(r["rows"]) == 2 and {x["doc_id"] for x in r["rows"]} == {DOC, "P002"}   # sampled
+    assert EvidenceStore._subset([1, 2, 3, 4, 5], 2) == ([1, 4], True) and EvidenceStore._subset([1, 2], 2) == ([1, 2], False)
+    assert EvidenceStore._subset(list(range(10)), 5) == ([0, 2, 4, 6, 8], True)
+    # a search inside one document is never capped: it sees every match of that document
+    r = store.phrase_search("bone", doc_id=DOC)
+    assert r["total"] == 2 and r["total_capped"] is False and {x["page_no"] for x in r["rows"]} == {1, 2}
+    assert store.phrase_search("bone", doc_id="P999")["total"] == 0
+    # page search follows the same rule
+    monkeypatch.setattr(ev_mod, "SEARCH_CAP", 1)
+    p = store.page_search("bone")
+    assert p["total_capped"] is True and p["total"] == 3 and p["documents"] == 2 and p["listed"] == 1
+    assert store.page_search("bone", doc_id=DOC)["total"] == 2
+    monkeypatch.setattr(ev_mod, "SEARCH_CAP", 5000)
+    assert store.phrase_search("bone")["total_capped"] is False
+    # the scan itself is never LIMITed (the cap applies to the join only)
+    import inspect
+    src = inspect.getsource(EvidenceStore.phrase_search) + inspect.getsource(EvidenceStore.page_search)
+    assert "MATCH ? LIMIT" not in src
+
+
+def test_phrase_search_snippets_only_the_returned_page(store: EvidenceStore, monkeypatch):
+    """snippet() is computed for the rows of the requested page, never for every match (timing-free: the
+    rowids handed to the snippet helper are counted)."""
+    _ingest_v1(store)
+    calls: list[list[int]] = []
+    orig = EvidenceStore._snippets
+
+    def spy(self, table, q, rowids):
+        calls.append(list(rowids))
+        return orig(self, table, q, rowids)
+    monkeypatch.setattr(EvidenceStore, "_snippets", spy)
+    r = store.phrase_search("bone", limit=1)                     # 2 matches, 1 returned
+    assert r["total"] == 2 and len(r["rows"]) == 1 and "<mark>" in r["rows"][0]["snippet"]
+    assert calls == [[calls[0][0]]] and len(calls[0]) == 1
+    r = store.phrase_search("bone", limit=1, offset=1)
+    assert len(calls) == 2 and len(calls[1]) == 1 and calls[1] != calls[0] and "<mark>" in r["rows"][0]["snippet"]
+    assert store.phrase_search("bone", limit=10, offset=5)["rows"] == [] and calls[2] == []
+    # the SQL shape: the only snippet() statement is the one restricted by rowid
+    import inspect
+    src = inspect.getsource(EvidenceStore.phrase_search) + inspect.getsource(EvidenceStore.page_search)
+    assert "snippet(" not in src and "_snippets(" in src
+
+
+def test_stats_uses_per_extraction_aggregates(store: EvidenceStore):
+    e1 = _ingest_v1(store)
+    assert store.stats() == {"documents": 1, "extractions": 1, "pages": 2, "sentences": 4, "body_sentences": 4}
+    # the body count comes from stats_json when ingest stored it (no scan of extraction_sentences) …
+    store.conn.execute("UPDATE extractions SET stats_json = ? WHERE ext_id = ?", ('{"body_sentences": 3}', e1))
+    assert store.stats()["body_sentences"] == 3
+    # … and from the rows when it did not
+    store.conn.execute("UPDATE extractions SET stats_json = '{}' WHERE ext_id = ?", (e1,))
+    assert store.stats()["body_sentences"] == 4
+    _ingest_v2(store)
+    assert store.stats() == {"documents": 1, "extractions": 2, "pages": 2, "sentences": 4, "body_sentences": 4}

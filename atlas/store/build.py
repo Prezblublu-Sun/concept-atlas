@@ -23,8 +23,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from atlas.core.schemas import SECTIONS
+from atlas.core.stats import is_tiered
 from atlas.store.curated import CURATED_FILES, curated_shas, load_curated
-from atlas.store.db import attach, open_build, transaction
+from atlas.store.db import BUILD_SCHEMA_VERSION, attach, open_build, transaction, upgrade_build, user_version
 
 log = logging.getLogger(__name__)
 
@@ -73,16 +74,17 @@ def sha256_file(path: str | Path) -> str:
 
 
 def new_build_id(builds_dir: str | Path, today: str | None = None) -> str:
-    """b<YYYY-MM-DD>_<seq3>, seq = 1 + number of existing folders of that day."""
+    """b<YYYY-MM-DD>_<seq3>, seq = 1 + the highest sequence number among the existing folders of that day (not
+    their count: after b<day>_001 is deleted while _002 exists, the next id is _003 — the folder is write-once)."""
     day = today or datetime.now().strftime("%Y-%m-%d")
     d = Path(builds_dir)
-    n = 0
+    seqs: list[int] = []
     if d.is_dir():
         for p in d.iterdir():
             m = BUILD_ID_RE.match(p.name)
             if p.is_dir() and m and m.group(1) == day:
-                n += 1
-    return f"b{day}_{n + 1:03d}"
+                seqs.append(int(m.group(2)))
+    return f"b{day}_{max(seqs, default=0) + 1:03d}"
 
 
 def list_build_dirs(builds_dir: str | Path) -> list[Path]:
@@ -109,6 +111,15 @@ def write_manifest(build_dir: str | Path, manifest: dict) -> None:
     os.replace(tmp, p)
 
 
+def build_schema_version(build_dir: str | Path) -> int:
+    """`PRAGMA user_version` of a build folder's build.sqlite (read-only, no migration)."""
+    conn = open_build(Path(build_dir) / DB_FILE, "ro")
+    try:
+        return user_version(conn)
+    finally:
+        conn.close()
+
+
 def current_build_id(builds_dir: str | Path) -> str | None:
     p = Path(builds_dir) / CURRENT_FILE
     if not p.is_file():
@@ -130,6 +141,13 @@ class BuildStore:
         self.conn = conn
         self.build_dir = Path(build_dir)
         self.evidence_attached = evidence_attached
+        self.schema_version = user_version(conn)
+
+    @property
+    def schema_current(self) -> bool:
+        """False for a build file written by an older schema (the service refuses to serve it until
+        `atlas build upgrade <id>` has brought it to the current schema)."""
+        return self.schema_version >= BUILD_SCHEMA_VERSION
 
     # ---- open / create --------------------------------------------------------------------------------------
     @classmethod
@@ -436,11 +454,17 @@ class BuildStore:
                 c.execute(f"DELETE FROM topic_hits WHERE unit_id IN (SELECT unit_id FROM build_units WHERE doc_id IN ({marks}))", part)
 
     def add_occurrences(self, rows: Iterable[tuple[str, str, str, int, int, str | None]]) -> int:
-        """(sid, concept_id, form, cstart, cend, nested_in) rows; INSERT OR IGNORE (PK sid, concept_id, cstart)."""
+        """(sid, concept_id, form, cstart, cend, nested_in) rows; INSERT OR IGNORE (PK sid, concept_id, cstart).
+        The denormalised columns (doc_id, seq, page_no, section, is_body) are copied from the pinned
+        build_sentences row by the insert itself, so callers keep the six-tuple shape; a sid that is not pinned
+        inserts nothing (the finish check "every occurrence sid is pinned" stays true by construction)."""
         rows = list(rows)
         with transaction(self.conn) as c:
-            c.executemany("INSERT OR IGNORE INTO occurrences(sid, concept_id, form, cstart, cend, nested_in) "
-                          "VALUES (?,?,?,?,?,?)", rows)
+            c.executemany("INSERT OR IGNORE INTO occurrences(sid, concept_id, form, cstart, cend, nested_in, doc_id, seq, "
+                          "page_no, section, is_body, tags) "
+                          "SELECT ?, ?, ?, ?, ?, ?, bs.doc_id, bs.seq, bs.page_no, bs.section, bs.is_body, bs.tags "
+                          "FROM build_sentences bs WHERE bs.sid = ?",
+                          [(sid, cid, form, cs, ce, nested, sid) for sid, cid, form, cs, ce, nested in rows])
         return len(rows)
 
     def add_topic_hits(self, rows: Iterable[tuple[str, str, str, int, int]]) -> int:
@@ -456,17 +480,17 @@ class BuildStore:
         abstract); with `body_includes_title` the title-field hits are added to 'body' (the previous system's full
         text started with the title line). n_sa = standalone."""
         extra = [s for s in body_extra_sections or () if s in SECTION_ORDER]
-        body_where = "bs.is_body = 1" + (" OR bs.section IN (%s)" % ",".join("?" * len(extra)) if extra else "")
+        body_where = "o.is_body = 1" + (" OR o.section IN (%s)" % ",".join("?" * len(extra)) if extra else "")
         with transaction(self.conn) as c:
             c.execute("DELETE FROM counts")
             c.execute("INSERT INTO counts(concept_id, doc_id, section, n, n_nested, n_sa) "
-                      "SELECT o.concept_id, bs.doc_id, bs.section, COUNT(*), SUM(o.nested_in IS NOT NULL), 0 "
-                      "FROM occurrences o JOIN build_sentences bs ON bs.sid = o.sid "
-                      "WHERE bs.section NOT IN ('title', 'keywords', 'abstract') GROUP BY o.concept_id, bs.doc_id, bs.section")
+                      "SELECT o.concept_id, o.doc_id, o.section, COUNT(*), SUM(o.nested_in IS NOT NULL), 0 "
+                      "FROM occurrences o "
+                      "WHERE o.section NOT IN ('title', 'keywords', 'abstract') GROUP BY o.concept_id, o.doc_id, o.section")
             c.execute("INSERT INTO counts(concept_id, doc_id, section, n, n_nested, n_sa) "
-                      "SELECT o.concept_id, bs.doc_id, 'body', COUNT(*), SUM(o.nested_in IS NOT NULL), 0 "
-                      f"FROM occurrences o JOIN build_sentences bs ON bs.sid = o.sid WHERE {body_where} "
-                      "GROUP BY o.concept_id, bs.doc_id", tuple(extra))
+                      "SELECT o.concept_id, o.doc_id, 'body', COUNT(*), SUM(o.nested_in IS NOT NULL), 0 "
+                      f"FROM occurrences o WHERE {body_where} "
+                      "GROUP BY o.concept_id, o.doc_id", tuple(extra))
             c.execute("INSERT OR REPLACE INTO counts(concept_id, doc_id, section, n, n_nested, n_sa) "
                       "SELECT th.concept_id, u.doc_id, th.field, th.n, th.n_nested, 0 FROM topic_hits th "
                       "JOIN build_units u ON u.unit_id = th.unit_id AND u.kind = 'document'")
@@ -573,11 +597,22 @@ class BuildStore:
             out.setdefault(r["concept_id"], set()).add(r["doc_id"])
         return out
 
-    def topic_users(self) -> dict[str, set[str]]:
-        """{concept_id: set(doc_id)} with a standalone title/keywords hit."""
+    def topic_users(self, standalone: bool = True) -> dict[str, set[str]]:
+        """{concept_id: set(doc_id)} with a title/keywords hit: standalone hits (the importance table's
+        topic_rate) or, with `standalone=False`, any hit, nested ones included (the sub-domain framework of the
+        previous system read the first version's title/keywords columns, which had no nested distinction)."""
+        col = "n_sa" if standalone else "n"
         out: dict[str, set[str]] = {}
-        for r in self.conn.execute("SELECT concept_id, doc_id FROM counts WHERE section IN ('title','keywords') AND n_sa > 0"):
+        for r in self.conn.execute(f"SELECT concept_id, doc_id FROM counts WHERE section IN ('title','keywords') AND {col} > 0"):
             out.setdefault(r["concept_id"], set()).add(r["doc_id"])
+        return out
+
+    def concept_scope(self) -> dict[str, dict]:
+        """{concept_id: {'domains': [DOM ids], 'tiered': bool}} for every unmerged concept: the data behind the
+        candidate filters of the sub-domain ranking and the tier rule (`atlas.core.stats.is_tiered`)."""
+        out: dict[str, dict] = {}
+        for r in self.conn.execute("SELECT id, domains_json, origin FROM concepts WHERE merged_into IS NULL"):
+            out[r["id"]] = {"domains": _loads(r["domains_json"], []), "tiered": is_tiered(r["origin"])}
         return out
 
     def concept_categories_all(self) -> list[dict]:
@@ -587,8 +622,9 @@ class BuildStore:
         return _rows(self.conn.execute("SELECT * FROM categories ORDER BY ord, id"))
 
     def tier_histogram(self) -> dict[str, dict[str, int]]:
+        """{scope: {tier: n}} over the tiered concepts only (frequency-only items carry tier NULL)."""
         out: dict[str, dict[str, int]] = {}
-        for r in self.conn.execute("SELECT scope, tier, COUNT(*) n FROM importance GROUP BY scope, tier"):
+        for r in self.conn.execute("SELECT scope, tier, COUNT(*) n FROM importance WHERE tier IS NOT NULL GROUP BY scope, tier"):
             out.setdefault(r["scope"], {})[r["tier"]] = r["n"]
         return out
 
@@ -610,10 +646,10 @@ class BuildStore:
         """{doc_id: (n, n_nested)} of body occurrences straight from `occurrences` + title topic hits (finish check;
         same definition as rebuild_counts)."""
         extra = [s for s in body_extra_sections or () if s in SECTION_ORDER]
-        body_where = "bs.is_body = 1" + (" OR bs.section IN (%s)" % ",".join("?" * len(extra)) if extra else "")
+        body_where = "o.is_body = 1" + (" OR o.section IN (%s)" % ",".join("?" * len(extra)) if extra else "")
         out = {r["doc_id"]: [r["n"], r["nn"]] for r in self.conn.execute(
-            "SELECT bs.doc_id, COUNT(*) n, SUM(o.nested_in IS NOT NULL) nn FROM occurrences o "
-            f"JOIN build_sentences bs ON bs.sid = o.sid WHERE o.concept_id=? AND ({body_where}) GROUP BY bs.doc_id",
+            "SELECT o.doc_id, COUNT(*) n, SUM(o.nested_in IS NOT NULL) nn FROM occurrences o "
+            f"WHERE o.concept_id=? AND ({body_where}) GROUP BY o.doc_id",
             (concept_id, *extra))}
         if body_includes_title:
             for r in self.conn.execute("SELECT u.doc_id, th.n, th.n_nested FROM topic_hits th JOIN build_units u "
@@ -656,6 +692,37 @@ class BuildStore:
     def checks(self) -> list[dict]:
         return _rows(self.conn.execute("SELECT * FROM check_results ORDER BY target_kind, target_id, seq"))
 
+    @classmethod
+    def upgrade(cls, build_dir: str | Path) -> dict:
+        """Bring a finished build of schema 1 to the current schema in place (`atlas build upgrade <id>`): clear the
+        read-only attribute, fill the denormalised occurrence columns from build_sentences and create the covering
+        index (db.upgrade_build), then re-freeze (VACUUM, journal DELETE, read-only, new sha256 in manifest.json).
+        Seconds on a 2.3 M-row build; a rebuild is minutes. Returns {build_id, from, to, sha256, seconds}."""
+        build_dir = Path(build_dir)
+        db = build_dir / DB_FILE
+        if not db.is_file():
+            raise FileNotFoundError(f"no build.sqlite in {build_dir}")
+        m = read_manifest(build_dir) or {}
+        if m.get("status") != "finished":
+            raise ValueError(f"build {build_dir.name} is not finished (status {m.get('status')}); only finished builds are upgraded")
+        t0 = time.perf_counter()
+        os.chmod(db, stat.S_IWRITE | stat.S_IREAD)
+        before, after = upgrade_build(db)
+        if before == after:
+            os.chmod(db, stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
+            return {"build_id": build_dir.name, "from": before, "to": after, "sha256": m.get("sha256"), "seconds": 0.0,
+                    "unchanged": True}
+        st = cls.open(build_dir, "rw")
+        try:
+            st.meta_set("schema_upgraded", _now())
+        except Exception:
+            st.close()
+            raise
+        sha = st.freeze()
+        write_manifest(build_dir, dict(m, sha256=sha, schema_version=after, upgraded=_now()))
+        return {"build_id": build_dir.name, "from": before, "to": after, "sha256": sha,
+                "seconds": round(time.perf_counter() - t0, 2), "unchanged": False}
+
     def freeze(self) -> str:
         """wal_checkpoint(TRUNCATE) → VACUUM → journal_mode=DELETE → close → read-only attribute → sha256."""
         c = self.conn
@@ -691,10 +758,16 @@ class BuildStore:
              "topic_rate": ("COALESCE(i.topic_rate, 0)", "DESC"), "label": ("c.label COLLATE NOCASE", "ASC"),
              "tier": ("COALESCE(i.tier, 'Z')", "ASC"), "occ": ("COALESCE(i.occ, 0)", "DESC"), "id": ("c.id", "ASC")}
 
+    #: list_concepts(kind=…): 'concept' = the tiered concepts (origin empty or 概念…, the previous system's 1,308),
+    #: 'other' = the frequency-only entries (phrases, journal names, ambiguous abbreviations), 'all' = both
+    _KINDS = {"concept": "(c.origin IS NULL OR c.origin = '' OR c.origin LIKE '概念%')",
+              "other": "NOT (c.origin IS NULL OR c.origin = '' OR c.origin LIKE '概念%')", "all": "1"}
+
     def list_concepts(self, q: str | None = None, domain: str | None = None, tier: str | None = None,
                       type: str | None = None, sub: str | None = None, cat: str | None = None, scope: str = "all",
-                      sort: str = "papers", dir: str | None = None, limit: int = 100, offset: int = 0) -> dict:
-        where = ["c.merged_into IS NULL"]
+                      sort: str = "papers", dir: str | None = None, limit: int = 100, offset: int = 0,
+                      kind: str = "concept") -> dict:
+        where = ["c.merged_into IS NULL", self._KINDS.get(kind or "concept", self._KINDS["concept"])]
         args: list = [scope or "all"]
         if q:
             like = _like(q.strip())
@@ -728,7 +801,8 @@ class BuildStore:
             (*args, int(limit), int(offset))))
         for r in rows:
             r["domains"] = _loads(r.pop("domains_json"), [])
-        return {"rows": rows, "total": total, "scope": scope or "all", "sort": sort or "papers", "dir": d.lower()}
+        return {"rows": rows, "total": total, "scope": scope or "all", "sort": sort or "papers", "dir": d.lower(),
+                "kind": kind or "concept"}
 
     def concept(self, concept_id: str) -> dict | None:
         r = self.conn.execute("SELECT * FROM concepts WHERE id=?", (concept_id,)).fetchone()
@@ -738,6 +812,7 @@ class BuildStore:
         d["domains"] = _loads(d.pop("domains_json"), [])
         d["place"] = _loads(d.pop("place_json"), [])
         d["shared_with"] = _loads(d.pop("shared_json"), [])
+        d["tiered"] = is_tiered(d.get("origin"))
         d["forms"], d["gen_forms"], d["case_forms"] = [], [], []
         for f in self.conn.execute("SELECT form, kind FROM concept_forms WHERE concept_id=? ORDER BY kind, form", (concept_id,)):
             key = {"form": "forms", "gen": "gen_forms", "case": "case_forms"}.get(f["kind"])
@@ -815,6 +890,14 @@ class BuildStore:
             "SELECT DISTINCT a.sub_id, s.zh, s.en, s.kind FROM anchors a JOIN subdomains s ON s.id = a.sub_id "
             "WHERE a.concept_id=? ORDER BY s.ord", (concept_id,)))
 
+    def sentence_count(self, concept_id: str, standalone: bool = False) -> int:
+        """Number of distinct sentences with an occurrence of the concept (nested ones included unless
+        `standalone`): the total of `concept_sentences` without filters, from the covering index alone."""
+        cond = "o.concept_id = ?" + (" AND o.nested_in IS NULL" if standalone else "")
+        return int(self.conn.execute(
+            f"SELECT COUNT(*) FROM (SELECT 1 FROM occurrences o WHERE {cond} GROUP BY o.doc_id, o.seq)",
+            (concept_id,)).fetchone()[0])
+
     def term_tree_places(self, concept_id: str) -> list[dict]:
         return _rows(self.conn.execute(
             "SELECT domain, section, sub_name, term, zh, note, example, example_doc FROM term_tree WHERE concept_id=? ORDER BY ord",
@@ -824,23 +907,37 @@ class BuildStore:
         """Body sentences with a standalone occurrence: one per document, documents with the most standalone body
         occurrences first (ties by doc_id), the first such sentence of each in reading order, preferring running
         text over keyword lines / unlabelled sections (deterministic)."""
+        # counts first (one row per document), then the covering index of occurrences (no table reads), text last
         docs = [r[0] for r in self.conn.execute(
             "SELECT doc_id FROM counts WHERE concept_id=? AND section='body' AND n_sa > 0 ORDER BY n_sa DESC, doc_id LIMIT ?",
             (concept_id, int(n)))]
         out = []
         for doc_id in docs:
-            text_col = "s.text" if self.evidence_attached else "NULL AS text"
-            join = "JOIN ev.sentences s ON s.sid = bs.sid" if self.evidence_attached else ""
             r = self.conn.execute(
-                f"SELECT bs.sid, bs.doc_id, bs.page_no, bs.section, bs.tags, bs.seq, {text_col} FROM occurrences o "
-                f"JOIN build_sentences bs ON bs.sid = o.sid {join} WHERE o.concept_id=? AND bs.doc_id=? AND bs.is_body=1 "
-                "AND o.nested_in IS NULL ORDER BY CASE WHEN bs.section IN ('keywords', 'title', 'other', 'front') THEN 1 ELSE 0 END, "
-                "bs.seq LIMIT 1", (concept_id, doc_id)).fetchone()
-            if r is None:
-                continue
-            d = dict(r)
-            d["spans"] = self.spans_of(concept_id, [d["sid"]]).get(d["sid"], [])
-            out.append(d)
+                "SELECT o.sid, o.doc_id, o.page_no, o.section, o.tags, o.seq FROM occurrences o "
+                "WHERE o.concept_id=? AND o.doc_id=? AND o.is_body=1 AND o.nested_in IS NULL "
+                "ORDER BY CASE WHEN o.section IN ('keywords', 'title', 'other', 'front') THEN 1 ELSE 0 END, o.seq LIMIT 1",
+                (concept_id, doc_id)).fetchone()
+            if r is not None:
+                out.append(dict(r, text=None))
+        if out:
+            texts = self._texts([d["sid"] for d in out])
+            spans = self.spans_of(concept_id, [d["sid"] for d in out])
+            for d in out:
+                d["text"] = texts.get(d["sid"])
+                d["spans"] = spans.get(d["sid"], [])
+        return out
+
+    def _texts(self, sids: Sequence[str]) -> dict[str, str]:
+        """{sid: text} from the attached evidence (empty when it is not attached)."""
+        out: dict[str, str] = {}
+        if not self.evidence_attached:
+            return out
+        for i in range(0, len(sids), _IN_CHUNK):
+            part = list(sids[i:i + _IN_CHUNK])
+            marks = ",".join("?" * len(part))
+            for r in self.conn.execute(f"SELECT sid, text FROM ev.sentences WHERE sid IN ({marks})", part):
+                out[r["sid"]] = r["text"]
         return out
 
     def spans_of(self, concept_id: str, sids: Sequence[str]) -> dict[str, list[list]]:
@@ -857,40 +954,60 @@ class BuildStore:
     def concept_sentences(self, concept_id: str, section: str | None = None, domain: str | None = None,
                           sub: str | None = None, doc: str | None = None, tag: str | None = None,
                           standalone: bool = False, sort: str = "doc", limit: int = 50, offset: int = 0) -> dict:
+        """Every sentence with an occurrence of the concept, filtered / sorted / paged on the covering index of
+        `occurrences` alone (schema 2: doc_id, seq, section, is_body, tags live in the index); build_doc_meta,
+        build_sentences and the evidence text are read for the page rows only. One row per sentence (GROUP BY
+        doc_id, seq walks the index in order, so the default sort needs no temporary b-tree)."""
         where = ["o.concept_id = ?"]
         args: list = [concept_id]
         if standalone:
             where.append("o.nested_in IS NULL")
-        hit = f"(SELECT DISTINCT o.sid FROM occurrences o WHERE {' AND '.join(where)})"
-        outer = []
         if section:
-            outer.append("bs.section = ?")
+            where.append("o.section = ?")
             args.append(section)
+        if doc:
+            where.append("o.doc_id = ?")
+            args.append(doc)
         if domain:
-            outer.append("m.domains_json LIKE ?")
+            where.append("o.doc_id IN (SELECT doc_id FROM build_doc_meta WHERE domains_json LIKE ?)")
             args.append(f'%"{domain}"%')
         if sub:
-            outer.append("(bs.unit_id IN (SELECT unit_id FROM unit_subdomains WHERE sub_id = ?) OR "
-                         "bs.doc_id IN (SELECT unit_id FROM unit_subdomains WHERE sub_id = ?))")
+            # document units carry the doc id; chapter units (theses) need the sentence's unit through build_sentences
+            where.append("(o.doc_id IN (SELECT unit_id FROM unit_subdomains WHERE sub_id = ?) OR o.sid IN ("
+                         "SELECT bs.sid FROM build_sentences bs WHERE bs.unit_id IN (SELECT us.unit_id FROM unit_subdomains us "
+                         "JOIN build_units u ON u.unit_id = us.unit_id WHERE us.sub_id = ? AND u.kind <> 'document')))")
             args += [sub, sub]
-        if doc:
-            outer.append("bs.doc_id = ?")
-            args.append(doc)
         if tag:
-            outer.append("bs.tags LIKE ?")
+            where.append("o.tags LIKE ?")
             args.append(f"%,{tag},%")
-        text_col = "s.text" if self.evidence_attached else "NULL AS text"
-        join = "JOIN ev.sentences s ON s.sid = bs.sid" if self.evidence_attached else ""
-        base = (f"FROM {hit} h JOIN build_sentences bs ON bs.sid = h.sid JOIN build_doc_meta m ON m.doc_id = bs.doc_id {join}"
-                + (" WHERE " + " AND ".join(outer) if outer else ""))
-        order = {"doc": "bs.doc_id, bs.seq", "year": "m.year DESC, bs.doc_id, bs.seq",
-                 "section": "bs.section, bs.doc_id, bs.seq", "page": "bs.doc_id, bs.page_no, bs.seq"}.get(sort or "doc", "bs.doc_id, bs.seq")
-        total = int(self.conn.execute("SELECT COUNT(*) " + base, args).fetchone()[0])
+        cond = " AND ".join(where)
+        order = {"doc": "o.doc_id, o.seq", "year": "year DESC, o.doc_id, o.seq",
+                 "section": "o.section, o.doc_id, o.seq", "page": "o.doc_id, o.page_no, o.seq"}.get(sort or "doc", "o.doc_id, o.seq")
+        year_col = ", (SELECT m.year FROM build_doc_meta m WHERE m.doc_id = o.doc_id) AS year" if (sort == "year") else ", NULL AS year"
+        total = int(self.conn.execute(
+            f"SELECT COUNT(*) FROM (SELECT 1 FROM occurrences o WHERE {cond} GROUP BY o.doc_id, o.seq)", args).fetchone()[0])
         rows = _rows(self.conn.execute(
-            f"SELECT bs.sid, bs.doc_id, m.title, m.year, bs.page_no AS page, bs.section, bs.tags, bs.seq, bs.unit_id, "
-            f"bs.is_body, {text_col} {base} ORDER BY {order} LIMIT ? OFFSET ?", (*args, int(limit), int(offset))))
-        spans = self.spans_of(concept_id, [r["sid"] for r in rows])
+            f"SELECT o.sid, o.doc_id, o.page_no AS page, o.section, o.tags, o.seq, o.is_body{year_col} "
+            f"FROM occurrences o WHERE {cond} GROUP BY o.doc_id, o.seq ORDER BY {order} LIMIT ? OFFSET ?",
+            (*args, int(limit), int(offset))))
+        sids = [r["sid"] for r in rows]
+        spans = self.spans_of(concept_id, sids)
+        texts = self._texts(sids)
+        units: dict[str, str] = {}
+        for i in range(0, len(sids), _IN_CHUNK):
+            part = sids[i:i + _IN_CHUNK]
+            marks = ",".join("?" * len(part))
+            for u in self.conn.execute(f"SELECT sid, unit_id FROM build_sentences WHERE sid IN ({marks})", part):
+                units[u["sid"]] = u["unit_id"]
+        meta: dict[str, dict] = {}
+        for d in dict.fromkeys(r["doc_id"] for r in rows):
+            m = self.conn.execute("SELECT title, year FROM build_doc_meta WHERE doc_id=?", (d,)).fetchone()
+            meta[d] = dict(m) if m else {"title": None, "year": None}
         for r in rows:
+            r["title"] = meta[r["doc_id"]]["title"]
+            r["year"] = meta[r["doc_id"]]["year"]
+            r["unit_id"] = units.get(r["sid"], r["doc_id"])
+            r["text"] = texts.get(r["sid"])
             r["spans"] = spans.get(r["sid"], [])
             r["tags"] = [t for t in (r["tags"] or "").split(",") if t]
             r["is_body"] = bool(r["is_body"])
@@ -923,17 +1040,22 @@ class BuildStore:
         return {"rows": rows, "total": total}
 
     # ---- framework queries ----------------------------------------------------------------------------------
-    def term_tree(self) -> list[dict]:
+    def term_tree(self, full: bool = False) -> list[dict]:
+        """The 分结构术语库 tree. The tree view renders term / zh / type / note only, so the example sentences (45 % of
+        the payload) are left out unless `full`; the concept page gets them through term_tree_places()."""
         doms = {d["id"]: d for d in self.domains()}
         out: dict[str, dict] = {}
-        for r in self.conn.execute("SELECT * FROM term_tree ORDER BY ord"):
+        cols = "domain, section, sub_name, sub_ord, term, zh, type, concept_id, note" + (", example, example_doc" if full else "")
+        for r in self.conn.execute(f"SELECT {cols} FROM term_tree ORDER BY ord"):
             dom = out.setdefault(r["domain"], {"id": r["domain"], "zh": doms.get(r["domain"], {}).get("zh"),
                                                "en": doms.get(r["domain"], {}).get("en"),
                                                "ord": doms.get(r["domain"], {}).get("ord", 99), "n": 0, "sections": {}})
             sec = dom["sections"].setdefault(r["section"], {"section": r["section"], "n": 0, "subs": {}})
             sub = sec["subs"].setdefault(r["sub_name"], {"name": r["sub_name"], "order": r["sub_ord"], "n": 0, "terms": []})
-            sub["terms"].append({"term": r["term"], "zh": r["zh"], "type": r["type"], "concept_id": r["concept_id"],
-                                 "note": r["note"], "example": r["example"], "example_doc": r["example_doc"]})
+            term = {"term": r["term"], "zh": r["zh"], "type": r["type"], "concept_id": r["concept_id"], "note": r["note"]}
+            if full:
+                term["example"], term["example_doc"] = r["example"], r["example_doc"]
+            sub["terms"].append(term)
             sub["n"] += 1
             sec["n"] += 1
             dom["n"] += 1
@@ -1071,7 +1193,7 @@ class BuildStore:
         out: dict[str, list[dict]] = {}
         for r in self.conn.execute(
                 f"SELECT o.sid, o.concept_id, o.cstart, o.cend, o.nested_in FROM occurrences o "
-                f"JOIN build_sentences bs ON bs.sid = o.sid WHERE bs.doc_id=? AND bs.page_no=? AND o.concept_id IN ({marks}) "
+                f"WHERE o.doc_id=? AND o.page_no=? AND o.concept_id IN ({marks}) "
                 "ORDER BY o.sid, o.cstart", (doc_id, int(page_no), *ids)):
             out.setdefault(r["sid"], []).append({"id": r["concept_id"], "cstart": r["cstart"], "cend": r["cend"],
                                                  "nested_in": r["nested_in"]})

@@ -51,13 +51,15 @@ _RESOLVABLE = ("D", "U", "S", "N", "K", "C", "SD")
 _NEEDS_BUILD = ("C", "SD")
 _IDS_PAGE = 1000            # page size when the service walks a whole concept list (ids mode, type facet)
 CONCEPT_SORTS = ("papers", "coverage", "topic_rate", "label", "tier")   # contract §6; anything else is a 400
+CONCEPT_KINDS = ("concept", "other", "all")                             # list_concepts(kind=…)
 
 
 class NoBuildError(Exception):
-    """A concept/framework route was called while no build is promoted (HTTP 409)."""
+    """A concept/framework route was called while no build is promoted (HTTP 409) — or the promoted build was
+    written by an older schema than this code serves (the message then says to rebuild)."""
 
-    def __init__(self):
-        super().__init__("no build promoted")
+    def __init__(self, msg: str = "no build promoted"):
+        super().__init__(msg)
 
 
 def _ref_object(**kw) -> dict:
@@ -83,6 +85,13 @@ class AtlasService:
         self._ui_strings = self._load_ui_strings()
         self._build_id: str | None = current_build_id(project.builds_dir)
         self._types_cache: tuple[str, list[dict]] | None = None   # (build id, concept type facet) — builds are immutable
+        self._build_stale: str | None = None                       # promoted build id refused for its schema
+        # /info is called on every page load; its evidence aggregates are cached per evidence file state and
+        # its build counts per build id (builds are immutable) — see _evidence_key()
+        self._stats_cache: tuple[tuple, dict] | None = None
+        self._build_stats_cache: tuple[str, dict] | None = None
+        self._year_totals_cache: tuple[str, dict] | None = None
+        self._cache_lock = threading.Lock()
         log.info("service for project %s at %s (build %s)", project.name, project.root, self._build_id)
 
     # ---- per-thread stores ----------------------------------------------------------------------------------
@@ -140,10 +149,19 @@ class AtlasService:
             return None
         m = read_manifest(d) or {}
         mode = "immutable" if m.get("status") == "finished" else "ro"
-        return BuildStore.open(d, mode, evidence_path=self.project.evidence_db)
+        b = BuildStore.open(d, mode, evidence_path=self.project.evidence_db)
+        if not b.schema_current:
+            # a build file of an older schema: its occurrences table lacks the columns the queries use
+            if self._build_stale != bid:
+                log.warning("promoted build %s has schema %s; rebuild it (`atlas build all`)", bid, b.schema_version)
+                self._build_stale = bid
+            b.close()
+            return None
+        return b
 
     def build_optional(self) -> BuildStore | None:
-        """The promoted build's store for this thread, or None when no build is promoted."""
+        """The promoted build's store for this thread, or None when no build is promoted (or the promoted build
+        cannot be served, see `build()`)."""
         if getattr(self._local, "build_bid", None) != self._build_id:
             b = getattr(self._local, "build", None)
             if b is not None:
@@ -158,6 +176,9 @@ class AtlasService:
     def build(self) -> BuildStore:
         b = self.build_optional()
         if b is None:
+            if self._build_id and self._build_stale == self._build_id:
+                raise NoBuildError(f"promoted build {self._build_id} was written by an older schema; "
+                                   f"run `atlas build upgrade {self._build_id}` (seconds) or `atlas build all`")
             raise NoBuildError()
         return b
 
@@ -229,17 +250,71 @@ class AtlasService:
                     log.debug("close pooled store failed", exc_info=True)
 
     # ---- meta
+    def _evidence_key(self) -> tuple:
+        """Cache key for anything derived from evidence.sqlite: (size, mtime_ns) of the main file and of its WAL
+        (ingest writes land in the WAL first; the main file only changes at a checkpoint)."""
+        key: list = []
+        for suffix in ("", "-wal"):
+            p = Path(str(self.project.evidence_db) + suffix)
+            try:
+                st = p.stat()
+                # an empty WAL is what a reader leaves behind when it opens the file: not a change
+                key.append((st.st_size, st.st_mtime_ns) if st.st_size or not suffix else None)
+            except OSError:
+                key.append(None)
+        return tuple(key)
+
+    def evidence_stats(self) -> dict:
+        """EvidenceStore.stats(), cached until the evidence file (or its WAL) changes."""
+        ev = self.evidence()            # opening the connection may create the WAL/SHM files: key afterwards
+        key = self._evidence_key()
+        with self._cache_lock:
+            cached = self._stats_cache
+        if cached is not None and cached[0] == key:
+            return dict(cached[1])
+        stats = ev.stats()
+        with self._cache_lock:
+            self._stats_cache = (key, dict(stats))
+        return stats
+
+    def build_stats(self, b: BuildStore) -> dict:
+        with self._cache_lock:
+            cached = self._build_stats_cache
+        if cached is not None and cached[0] == b.build_id:
+            return dict(cached[1])
+        st = b.stats()
+        with self._cache_lock:
+            self._build_stats_cache = (b.build_id, dict(st))
+        return st
+
+    def year_totals(self, b: BuildStore) -> dict[str, int]:
+        with self._cache_lock:
+            cached = self._year_totals_cache
+        if cached is not None and cached[0] == b.build_id:
+            return dict(cached[1])
+        yt = b.year_totals()
+        with self._cache_lock:
+            self._year_totals_cache = (b.build_id, dict(yt))
+        return yt
+
     def info(self) -> dict:
         """{project, build: build id | 'evidence', build_info: {id, created, docs, sentences, concepts} | None,
-        stats: EvidenceStore.stats(), version}"""
+        build_stale: None | {id, reason} (a promoted build this code refuses: older schema — the UI says so
+        instead of 'no build'), stats: EvidenceStore.stats(), version}. The evidence stats are cached per evidence
+        file state and the build counts per build id (the SPA calls this route on every load)."""
         b = self.build_optional()
         binfo = None
+        stale = None
         if b is not None:
-            st = b.stats()
+            st = self.build_stats(b)
             binfo = {"id": b.build_id, "created": st.get("created"), "docs": st["docs"], "sentences": st["sentences"],
                      "concepts": st["concepts"], "occurrences": st.get("occurrences", 0)}
-        return {"project": self.project.name, "build": self.build_label(), "build_info": binfo,
-                "stats": self.evidence().stats(), "version": atlas.__version__,
+        elif self._build_id and self._build_stale == self._build_id:
+            stale = {"id": self._build_id, "reason": "schema",
+                     "message": f"promoted build {self._build_id} was written by an older schema; "
+                                f"run `atlas build upgrade {self._build_id}` or `atlas build all`"}
+        return {"project": self.project.name, "build": self.build_label(), "build_info": binfo, "build_stale": stale,
+                "stats": self.evidence_stats(), "version": atlas.__version__,
                 "doc_type": self.project.get("doc_type", "paper")}
 
     @staticmethod
@@ -410,7 +485,8 @@ class AtlasService:
                                     year=r.get("year"), page=r["page_no"], sid=r["sid"], status="live",
                                     section=r.get("section"), is_body=r.get("is_body"), snippet=r.get("snippet")))
         return {"phrase": phrase, "doc_id": doc_id, "rows": rows, "total": res["total"],
-                "documents": res["documents"]}
+                "documents": res["documents"], "total_capped": bool(res.get("total_capped")),
+                "listed": int(res.get("listed", len(rows)))}
 
     def _sentence_ref(self, s: dict) -> dict:
         doc = s.get("doc") or {}
@@ -521,10 +597,12 @@ class AtlasService:
     def list_concepts(self, q: str | None = None, domain: str | None = None, tier: str | None = None,
                       type: str | None = None, sub: str | None = None, cat: str | None = None, scope: str = "all",
                       sort: str = "papers", dir: str | None = None, limit: int = 100, offset: int = 0,
-                      ids: bool = False) -> dict:
+                      ids: bool = False, kind: str = "concept") -> dict:
         """{rows: [{id, label, zh, type, mode, papers, coverage, topic_rate, tier, main_section, notes}], total, scope,
-        sort, dir}. With `ids` the whole filtered list in list order is returned instead of a page (`limit`/`offset`
-        ignored): {ids: [...], labels: [...], total, scope, sort, dir} — what the UI keeps for prev/next."""
+        sort, dir, kind}. `kind` = concept (default: the tiered concepts, origin 概念…) | other (the frequency-only
+        phrase / journal-name entries) | all. With `ids` the whole filtered list in list order is returned instead
+        of a page (`limit`/`offset` ignored): {ids: [...], labels: [...], total, scope, sort, dir} — what the UI
+        keeps for prev/next."""
         b = self.build()
         if scope and scope != "all" and scope not in b.scope_ids():
             raise ValueError(f"unknown scope {scope!r}")
@@ -532,8 +610,10 @@ class AtlasService:
             raise ValueError(f"sort must be one of {', '.join(CONCEPT_SORTS)}")
         if dir and dir.lower() not in ("asc", "desc"):
             raise ValueError("dir must be asc | desc")
+        if kind and kind not in CONCEPT_KINDS:
+            raise ValueError(f"kind must be one of {', '.join(CONCEPT_KINDS)}")
         filters = dict(q=q, domain=domain, tier=tier, type=type, sub=sub, cat=cat, scope=scope or "all",
-                       sort=sort or "papers", dir=dir or None)
+                       sort=sort or "papers", dir=dir or None, kind=kind or "concept")
         if ids:
             res = self._all_concepts(b, **filters)
             return {"ids": [r["id"] for r in res["rows"]], "labels": [r["label"] for r in res["rows"]],
@@ -558,12 +638,16 @@ class AtlasService:
         c["sections"] = b.sections_of(concept_id)
         c["domains_use"] = b.domains_use(concept_id)
         c["years"] = b.years_of(concept_id)
-        c["year_totals"] = b.year_totals()
+        c["year_totals"] = self.year_totals(b)
         c["categories"] = b.categories_of(concept_id)
         c["subdomains"] = b.subdomains_of(concept_id)
         c["anchor_of"] = b.anchor_of(concept_id)
         c["term_tree_places"] = b.term_tree_places(concept_id)
         c["examples"] = [self._example_ref(e, concept_id) for e in b.examples(concept_id, 6)]
+        # what the "all sentences" view will report: sentences with any occurrence (nested included) and the
+        # standalone ones — importance.occ counts standalone body occurrences, not sentences
+        c["sentences"] = b.sentence_count(concept_id)
+        c["sentences_standalone"] = b.sentence_count(concept_id, standalone=True)
         c["notes"] = self._notes_count(f"C:{concept_id}")
         c["build"] = b.build_id
         return c

@@ -24,6 +24,7 @@ async function loadInfo() {
     document.title = `${info.project} · ${t("app.name")}`;
     const bits = [t("info.stats", info.stats || {})];
     if (info.build_info) bits.push(t("app.buildLabel", { id: info.build_info.id }) + " · " + t("info.build", info.build_info));
+    else if (info.build_stale) bits.push(t("app.buildStale", { id: info.build_stale.id }));   // promoted but refused: say so, not 'no build'
     else bits.push(t("app.build"));
     document.getElementById("project-sub").textContent = bits.join(" · ");
   } catch (e) {

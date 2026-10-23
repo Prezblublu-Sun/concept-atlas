@@ -126,3 +126,69 @@ Tests: `tests/test_http.py` extended against a fixture project with a finished b
 Integration (agent `integrate`): merge the three worktrees, resolve `cli.py` conflicts, switch C's test helper to `BuildStore`, make `tests` green, run `atlas legacy export-curated` + `atlas build all` on **the femstem project** (`H:\projects\atlas-projects\femstem`; evidence already ingested; the v3 db path above), serve on port 8771 (8770 may be in use) and smoke-test every route with curl. Then three reviewers (fidelity vs v3 and statistics; architecture/layering/ids/robustness; UI/i18n/UX) → fix → verifier (fidelity targets of §3, UCL subset registration + ingest + chapter stats, browser-level checks of the concept list/page/trees).
 
 Acceptance: all tests green; `atlas build all` on femstem finishes without failures and promotes; fidelity targets met; the UI shows the concept list (sortable), concept pages with prev/next, three trees, sub-domain pages, bilingual; UCL subset (~120 theses) ingested with the thesis doctype, ≥ 70 % of theses at chapter confidence ≥ 0.7, every thesis has ≥ 1 chapter unit or a warning; docs updated (`docs/INCREMENT2.md` status section + README commands).
+
+---
+
+## Status
+
+Increment 2 is merged (HEAD 65164ad: packages A/B/C integrated, 521 tests green, femstem built and promoted).
+
+### Performance (2026-10-23)
+
+Problem: on the femstem project (2,545 papers; evidence.sqlite 1.5 GB holding three extraction generations;
+build 002 with 1.23 M pinned sentences and 2.31 M occurrences; H: is a hard disk) the first request after a server
+start took tens of seconds: `GET /info` 61.9 s (the SPA calls it on every load), `concepts/C_micromotion` 15.5 s,
+`concepts/C_micromotion/sentences` 23.4 s, `search?phrase=stress+shielding` 39.0 s, `search?phrase=finite+element`
+50.9 s — warm they were 0.1–0.6 s. The causes, verified with `EXPLAIN QUERY PLAN` and timing: `stats()` scanned
+`extraction_sentences` twice and `pages` once through joins; `phrase_search` computed `snippet()` for every FTS
+match, joined every match to sentences / membership / meta and sorted them all before `LIMIT`, twice (count + rows);
+`concept_sentences` and `examples()` joined every occurrence of a concept through `build_sentences` (random reads
+over 1.2 M rows) and the attached evidence before `ORDER BY … LIMIT`, twice; and every first touch paid random
+reads into a 1.5 GB file of which two thirds were superseded generations.
+
+What changed (in order of preference: query shape first, then less data, then the OS cache):
+
+1. **Query shape.**
+   - `EvidenceStore.stats()` sums `extractions.n_pages` / `n_sentences` and `stats_json.body_sentences` (written
+     by ingest since increment 1; an extraction without it is counted from its rows) over the current extractions —
+     no scan. `AtlasService` caches the result per evidence file state (size + mtime of the main file and of a
+     non-empty WAL) and the build counts / `year_totals` per build id.
+   - `phrase_search` / `page_search`: candidate set first — every FTS match in rowid order (the FTS index alone:
+     4 ms for the 9,818 rowids of "finite element", 164 ms for the 623,749 of "the"; `ORDER BY rank` was measured
+     at 0.7–5 s because bm25 needs a docsize lookup per match), or, inside one document, the FTS matches
+     intersected with the document's own sentence rowids; then at most `SEARCH_CAP = 50_000` candidates are joined
+     (≈19 ms per 1,000 rows), counted, sorted and paged in Python — beyond the cap an every-k-th subset over the
+     whole corpus is joined (review fix: the first version joined the first 5,000 rowids only, which hid 55 % of
+     the documents containing "finite element"), `total` and `documents` are counted over every match, and the
+     response carries `total_capped: true` + `listed` (the SPA explains that a sample is listed); `snippet()` runs
+     for the returned page rows only (`WHERE … MATCH ? AND rowid IN (…)`).
+   - Build schema 2: `occurrences` carries `doc_id, seq, page_no, section, is_body, tags` (copied from
+     `build_sentences` by `BuildStore.add_occurrences` itself, so the match stage and every caller keep the six-tuple
+     shape) and the covering index `occ_concept_doc(concept_id, doc_id, seq, section, is_body, nested_in, page_no,
+     tags, sid)` replaces `occ_concept`. `concept_sentences` filters, counts (`GROUP BY doc_id, seq`), sorts and
+     pages on that index alone and reads `build_sentences` (unit id), `build_doc_meta` and the evidence text for
+     the page rows only; `examples()` goes `counts` → index → text; `page_concepts`, `rebuild_counts` and
+     `recount_body` no longer join `build_sentences`. Stage version `match3`; `BUILD_SCHEMA_VERSION = 2`; a build
+     file of schema 1 is refused for writing and the service answers 409 "promoted build … was written by an older
+     schema; rebuild it" for it. Migrations are now named per schema (`sql/migrations/user_2.sql`).
+2. **Less data: `atlas evidence gc [--vacuum] [--dry-run] [--rebuild-fts]`** (`tools/gc.py`) deletes extractions
+   that are not current, not pinned by any build folder's `build_docs` and not needed by a note / collection
+   (`S:<sid>` refs whose sentence belongs to no kept extraction keep the newest extraction holding it): their
+   pages / line_masks / units / extraction_sentences, then sentences no extraction references (FTS rows via the
+   existing triggers), then unreferenced page_text, then the extractions row — one transaction per extraction, so
+   it can be interrupted and rerun; it refuses while a build is open. `--vacuum` then VACUUMs and rebuilds the FTS
+   indexes (VACUUM may renumber the TEXT-keyed rowids the external-content FTS tables use).
+3. **OS cache: `atlas serve --prewarm` (default on; `--no-prewarm` to skip)** reads evidence.sqlite (+ WAL) and the
+   promoted build.sqlite sequentially in 8 MB chunks on a background thread at startup and logs
+   `prewarm done in N s`: one sequential pass over ~1 GB costs seconds on a hard disk; the same pages fetched on
+   demand by B-tree and FTS seeks cost minutes.
+
+Tests added: capped totals and snippet scope (`tests/unit/test_store_evidence.py`, timing-free: the rowids handed to
+the snippet helper are counted and the search SQL is checked for the `rowid IN` shape), the stats aggregates, the
+gc rules on the fixture corpus (`tests/test_gc.py`: three generations, a pinning build, a note-protected sentence,
+VACUUM + FTS rebuild, idempotence, CLI), the stats cache invalidation and the old-schema refusal
+(`tests/unit/test_service_cache.py`).
+
+femstem after this work: see the measurements below (filled in by the run of 2026-10-23).
+
+MEASUREMENTS_PLACEHOLDER

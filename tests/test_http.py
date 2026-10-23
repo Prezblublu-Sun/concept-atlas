@@ -1137,3 +1137,70 @@ def test_every_chrome_string_has_both_languages():
     for key in ("unit.kind.intro", "unit.kind.lit_review", "unit.kind.other", "doctype.thesis", "trend.up", "trend.down",
                 "mode.literal", "status.orphan", "sd.core", "sd.related"):
         assert key in strings, key
+
+
+# ---- review fixes (performance round) --------------------------------------------------------------------------
+
+def _get(base: str, path: str, headers: dict | None = None):
+    """Raw GET with extra request headers (conditional requests)."""
+    u = urllib.parse.urlsplit(base)
+    conn = http.client.HTTPConnection(u.hostname, u.port, timeout=10)
+    try:
+        conn.request("GET", path, headers={"Accept": "*/*", **(headers or {})})
+        r = conn.getresponse()
+        return r.status, dict(r.getheaders()), r.read()
+    finally:
+        conn.close()
+
+
+def test_static_and_i18n_answer_conditional_requests_with_304(api):
+    st, hd, body = _get(api.base, "/static/style.css")
+    assert st == 200 and hd["ETag"].startswith('W/"') and hd["Last-Modified"].endswith("GMT") and hd["Cache-Control"] == "no-cache"
+    st, hd2, body2 = _get(api.base, "/static/style.css", {"If-None-Match": hd["ETag"]})
+    assert st == 304 and body2 == b"" and hd2["ETag"] == hd["ETag"] and hd2["Content-Length"] == "0"
+    assert _get(api.base, "/static/style.css", {"If-None-Match": 'W/"stale"'})[0] == 200
+    assert _get(api.base, "/static/style.css", {"If-None-Match": '"x", ' + hd["ETag"]})[0] == 304
+    assert _get(api.base, "/static/style.css", {"If-Modified-Since": hd["Last-Modified"]})[0] == 304
+    assert _get(api.base, "/static/style.css", {"If-Modified-Since": "Thu, 01 Jan 2015 00:00:00 GMT"})[0] == 200
+    assert _get(api.base, "/", {"If-None-Match": _get(api.base, "/")[1]["ETag"]})[0] == 304
+    # the i18n payload (~200 KB with a build) carries a validator keyed by build + version + i18n.json
+    st, hd, body = _get(api.base, "/api/v1/i18n")
+    assert st == 200 and hd["ETag"].startswith('W/"i18n-') and json.loads(body)["ui"]
+    st, hd2, body2 = _get(api.base, "/api/v1/i18n", {"If-None-Match": hd["ETag"]})
+    assert st == 304 and body2 == b""
+    assert _get(api.base, "/api/v1/info", {"If-None-Match": hd["ETag"]})[0] == 200     # other routes: no validator
+
+
+def test_static_files_do_not_wait_for_the_store_lease(api, served, monkeypatch):
+    """The SPA shell is served before the stores are opened (a cold start on a hard disk used to show a blank page
+    for seconds): a failing lease must not stop static files, only the API."""
+    svc = served["service"]
+
+    def broken_lease():
+        raise RuntimeError("stores unavailable")
+    monkeypatch.setattr(svc, "lease", broken_lease)
+    st, hd, body = _get(api.base, "/")
+    assert st == 200 and b'id="view"' in body
+    assert _get(api.base, "/static/app.js")[0] == 200
+    st, _, err = api("GET", "info")
+    assert st == 500 and "stores unavailable" in err["error"]
+    monkeypatch.undo()
+    assert api("GET", "info")[0] == 200
+
+
+def test_concept_page_sentence_counts_and_list_kind(bapi):
+    st, _, c = bapi("GET", "concepts/C_micromotion")
+    st2, _, s = bapi("GET", "concepts/C_micromotion/sentences?limit=1")
+    assert st == 200 and st2 == 200 and c["sentences"] == s["total"]                 # the button says what the view shows
+    assert c["sentences_standalone"] == bapi("GET", "concepts/C_micromotion/sentences?standalone=1&limit=1")[2]["total"]
+    assert c["sentences"] >= c["sentences_standalone"] >= 9 and c["tiered"] is True
+    # the term tree is sent without the example sentences (45 % of the payload the tree never rendered)
+    st, _, t = bapi("GET", "framework/terms")
+    term = t["domains"][0]["sections"][0]["subs"][0]["terms"][0]
+    assert st == 200 and "example" not in term and term["concept_id"] == "C_micromotion"
+    assert bapi("GET", "concepts/C_micromotion")[2]["term_tree_places"][0].keys() >= {"example", "example_doc"}
+    # the list's kind filter: the fixture has concepts only
+    assert bapi("GET", "concepts?kind=all")[2]["total"] == 6 and bapi("GET", "concepts?kind=other")[2]["total"] == 0
+    assert bapi("GET", "concepts")[2]["kind"] == "concept"
+    st, _, e = bapi("GET", "concepts?kind=nope")
+    assert st == 400 and "kind" in e["error"]

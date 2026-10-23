@@ -228,3 +228,77 @@ def test_abstract_only_document_keeps_its_abstract(dt):
     p1 = page(1, ["A Paper Title", "Abstract", ABSTRACT, BODY])
     marks = dt.label_sections("D1", [p1], dt.drop_non_body([p1]), [])
     assert [m.section for m in marks] == ["front", "abstract"]
+
+
+# ---- paper5: methods at the end, heading numbers on their own line, abstract cap (review fixes) -------------------
+
+def test_methods_section_after_the_conclusions_is_accepted(dt):
+    """ACS Omega layout (P31): '2. RESULTS AND DISCUSSION', '3. CONCLUSIONS', '4. MATERIALS AND METHODS' — the paper's
+    only strict Methods heading arrives after the conclusions and must not be swallowed by the IMRaD order."""
+    body = [f"Body sentence {i} about the customized hip prosthesis and its porous structure." for i in range(6)]
+    p1 = page(1, ["A Paper Title", "ABSTRACT: Customized hip prostheses were designed and tested in detail here.",
+                  "1. INTRODUCTION"] + body)
+    p2 = page(2, ["2. RESULTS AND DISCUSSION"] + body)
+    p3 = page(3, body[:2] + ["3. CONCLUSIONS"] + body[2:4] + ["4. MATERIALS AND METHODS",
+                  "4.1. Customized Hip Prosthesis Design Methodology."] + body[4:] + ["REFERENCES",
+                  "[1] Doe J. Paper. J Test. 2020;1:1-2."])
+    marks = dt.label_sections("D1", [p1, p2, p3], dt.drop_non_body([p1, p2, p3]), [])
+    assert [m.section for m in marks] == ["front", "abstract", "introduction", "results", "conclusion", "methods",
+                                          "references"]
+    assert marks[5].cstart == p3.text.index("4. MATERIALS AND METHODS")
+    # a second methods heading, a loose form or a numbered keyword heading after the conclusions still do not count
+    p4 = page(4, ["5. CONCLUSIONS AGAIN"] + body[:2] + ["Proposed methodology"] + body[2:4] + ["6 Model limitations"]
+              + body[4:] + ["7 Methods"] + body[:3])
+    marks = dt.label_sections("D1", [p1, p2, p3, p4], dt.drop_non_body([p1, p2, p3, p4]), [])
+    assert [m.section for m in marks] == ["front", "abstract", "introduction", "results", "conclusion", "methods",
+                                          "references"]
+
+
+def test_heading_number_on_its_own_line_is_joined_with_the_heading_text(dt):
+    """ASME layout (P36): '2' / 'Optimization Scheme for Graded-Density Hip', '3' / 'Mechanics of Lattice Materials',
+    sub-headings '3.1' / 'Homogenized Properties. A fully resolved …'."""
+    p1 = page(1, ["A Paper Title", "Abstract", ABSTRACT, "1", "Introduction", BODY,
+                  "2", "Optimization Scheme for Graded-Density Hip", "Implant With Cellular Material", BODY])
+    p2 = page(2, [BODY, "3", "Mechanics of Lattice Materials", "3.1", "Homogenized Properties. A fully resolved resolution of",
+                  BODY, "3.2", "Fatigue Failure of Lattice Materials. Since the femur is", BODY])
+    p3 = page(3, ["4", "Results", BODY, "5", "Conclusions", BODY, "References", "[1] Doe J. Paper. J Test. 2020;1:1-2."])
+    marks = dt.label_sections("D1", [p1, p2, p3], dt.drop_non_body([p1, p2, p3]), [])
+    assert [(m.page_no, m.section) for m in marks] == [(1, "front"), (1, "abstract"), (1, "introduction"), (1, "methods"),
+                                                        (3, "results"), (3, "conclusion"), (3, "references")]
+    assert marks[3].cstart == p1.text.index("2\nOptimization")      # the mark sits on the number's line
+    # a bare number followed by body text, or by a line on the next page, is no heading
+    p4 = page(1, ["A Paper Title", "Abstract", ABSTRACT, "1 Introduction", BODY, "2", BODY, "3", "Results", BODY])
+    assert [s for _, s in sections(dt, [p4])] == ["front", "abstract", "introduction", "results"]
+
+
+def test_abstract_is_capped_at_600_words_or_the_next_page(dt):
+    """R2129: abstract on page 2, next heading on page 44; P2022: no Introduction heading, the abstract ran to the
+    'Methods' on page 14 — the range is cut after ABSTRACT_MAX_WORDS words or with the page after its own and the
+    remainder is 'introduction'; a normal abstract is untouched."""
+    long_lines = [f"Sentence number {i} of a very long abstract that goes on and on about the implant." for i in range(80)]
+    p1 = page(1, ["A Long Report", "Abstract"] + long_lines[:50])
+    p2 = page(2, long_lines[50:])
+    p3 = page(3, [BODY, BODY])
+    p4 = page(4, ["Methods", BODY, "Results", BODY, "References", "[1] Doe J. Paper. J Test. 2020;1:1-2."])
+    marks = dt.label_sections("D1", [p1, p2, p3, p4], dt.drop_non_body([p1, p2, p3, p4]), [])
+    assert [(m.page_no, m.section) for m in marks] == [(1, "front"), (1, "abstract"), (1, "introduction"), (4, "methods"),
+                                                        (4, "results"), (4, "references")]
+    words = 0
+    cut = marks[2]
+    for ln in p1.text.split("\n"):
+        if p1.text.index(ln) >= cut.cstart:
+            break
+        words += len(ln.split())
+    assert 600 < words <= 600 + 16 and p1.text[cut.cstart:].startswith("Sentence number")
+    # a short abstract that only crosses the page boundary is cut at the start of the page after next
+    p1 = page(1, ["A Report", "Abstract"] + long_lines[:10])
+    p2 = page(2, long_lines[10:20])
+    p3 = page(3, long_lines[20:30])
+    p4 = page(4, ["Methods", BODY, "Results", BODY])
+    marks = dt.label_sections("D1", [p1, p2, p3, p4], dt.drop_non_body([p1, p2, p3, p4]), [])
+    assert [(m.page_no, m.section, m.cstart) for m in marks][:3] == [(1, "front", 0), (1, "abstract", p1.text.index("Abstract")),
+                                                                     (3, "introduction", 0)]
+    # the ordinary case is untouched
+    p1 = page(1, ["A Paper Title", "Abstract", ABSTRACT, "1 Introduction", BODY, "2 Methods", BODY])
+    assert [s for _, s in sections(dt, [p1])] == ["front", "abstract", "introduction", "methods"]
+    assert PaperDocType.version == "paper5"

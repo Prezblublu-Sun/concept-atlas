@@ -52,6 +52,13 @@ TIER_EN = {"A": "high coverage, high topic rate", "B": "high coverage, low topic
            "C": "low coverage, high topic rate", "D": "low coverage, low topic rate", "E": "fewer than the minimum"}
 
 
+def is_tiered(origin: str | None) -> bool:
+    """The previous system tiered only the items whose origin starts with 概念 (1,308 of 1,605); the 297 others
+    (句式短语 / 期刊名 T_, 通用句式 G_, 歧义缩写 A_) got frequencies only. A concept without an origin (hand-curated
+    or test data) is tiered."""
+    return not origin or str(origin).startswith("概念")
+
+
 def params_with_defaults(p: Mapping | None) -> dict:
     out = dict(DEFAULT_PARAMS)
     for k, v in (p or {}).items():

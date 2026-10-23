@@ -18,12 +18,16 @@
 - No auth (single user, loopback or tailnet); cross-site browser writes are refused (Sec-Fetch-Site / Origin
   check), which is what stops a web page the user visits from posting notes to the local API.
 - Each request runs inside `AtlasService.lease()` (pooled store connections per request thread).
+- `serve(..., prewarm_files=True)` (CLI `--prewarm` / `--no-prewarm`, default on) reads evidence.sqlite and the
+  promoted build.sqlite sequentially on a background thread at startup so the OS cache holds them; it logs and
+  prints 'prewarm done in N s'.
 
 `make_server(service, host, port)` returns the (unstarted) ThreadingHTTPServer so tests can run it in a thread on
 port 0.
 """
 from __future__ import annotations
 
+import email.utils
 import inspect
 import json
 import logging
@@ -34,7 +38,9 @@ import re
 import socket
 import sys
 import threading
+import time
 import urllib.parse
+from datetime import timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -44,6 +50,8 @@ import atlas
 from atlas.config import Project
 from atlas.http.routes import API_PREFIX, BODY_ALIASES, CREATED, match
 from atlas.service.api import AtlasService, NoBuildError
+from atlas.store.build import build_schema_version, current_build_id
+from atlas.store.db import BUILD_SCHEMA_VERSION
 
 log = logging.getLogger(__name__)
 
@@ -75,7 +83,7 @@ _BOOL_PARAMS = {"explicit", "standalone", "ids"}
 _LIST_PARAMS = {"tags", "target_refs"}
 _STR_PARAMS = {"title", "body_md", "comment_md", "name", "description", "ref", "after_item", "phrase", "q", "tag",
                "highlight", "doc_id", "note_id", "coll_id", "item_id", "sid", "concept_id", "sub_id", "domain",
-               "tier", "type", "sub", "cat", "scope", "sort", "dir", "section", "doc", "c", "use"}
+               "tier", "type", "sub", "cat", "scope", "sort", "dir", "section", "doc", "c", "use", "kind"}
 MAX_LIMIT = 1000
 _INT_LIMIT = 2 ** 63 - 1
 _TRUE = ("1", "true", "yes", "on")
@@ -366,13 +374,13 @@ class AtlasHandler(BaseHTTPRequestHandler):
             self._prepare_body()
             if method not in ("GET", "HEAD"):
                 self._check_site()
-            with service.lease():
-                if path.startswith(API_PREFIX):
+            if path.startswith(API_PREFIX):
+                with service.lease():           # only API calls need the stores: the SPA shell is served at once
                     self._api(service, method, path[len(API_PREFIX):].strip("/"), query)
-                elif method == "GET":
-                    self._static(path)
-                else:
-                    self._error(405, "method not allowed")
+            elif method == "GET":
+                self._static(path)
+            else:
+                self._error(405, "method not allowed")
         except _HttpError as e:
             self._fail(int(e.code), e.msg)
         except NoBuildError as e:
@@ -415,6 +423,15 @@ class AtlasHandler(BaseHTTPRequestHandler):
             return
         body = self._read_body() if method in ("POST", "PUT") else {}
         kwargs = self._kwargs(service, name, method, params, query, body)
+        if name == "i18n":
+            # ~200 KB per page load (the build's 1,963 strings): one validator per (build, code version,
+            # i18n.json edit) so the browser gets a 304 instead of the payload when nothing changed
+            etag = f'W/"i18n-{service.build_label()}-{atlas.__version__}-{_i18n_mtime_ns()}"'
+            if self._not_modified(etag):
+                self._send(304, b"", JSON_CT, {"ETag": etag})
+                return
+            self._json(200, service.i18n(), {"ETag": etag})
+            return
         result = getattr(service, name)(**kwargs)
         if name == "update_note" and isinstance(result, dict) and result.get("conflict"):
             self._json(409, result)
@@ -491,10 +508,47 @@ class AtlasHandler(BaseHTTPRequestHandler):
         if not target.is_file():
             raise KeyError(f"no such file: /{rel}")
         ctype = MIME.get(target.suffix.lower()) or "application/octet-stream"
+        st = target.stat()
+        etag = f'W/"{st.st_size}-{st.st_mtime_ns}-{atlas.__version__}"'
+        validators = {"Cache-Control": "no-cache", "ETag": etag, "Last-Modified": _http_date(st.st_mtime)}
+        if self._not_modified(etag, st.st_mtime):
+            self._send(304, b"", ctype, validators)
+            return
         data = target.read_bytes()
         if rel == "index.html":
             data = _VERSION_TOKEN.sub(b"?v=" + atlas.__version__.encode("ascii"), data)
-        self._send(200, data, ctype, {"Cache-Control": "no-cache"})
+        self._send(200, data, ctype, validators)
+
+    def _not_modified(self, etag: str, mtime: float | None = None) -> bool:
+        """Conditional GET: If-None-Match wins (any listed tag or '*' matching → 304), else If-Modified-Since
+        against the file's mtime (whole seconds). `Cache-Control: no-cache` keeps the browser revalidating, so a
+        dev edit shows at once while an unchanged file costs a 304 instead of a download."""
+        inm = self.headers.get("If-None-Match")
+        if inm:
+            tags = [t.strip() for t in inm.split(",")]
+            weak = etag[2:] if etag.startswith("W/") else etag
+            return any(t == "*" or t == etag or (t[2:] if t.startswith("W/") else t) == weak for t in tags)
+        ims = self.headers.get("If-Modified-Since")
+        if ims and mtime is not None:
+            try:
+                since = email.utils.parsedate_to_datetime(ims)
+            except (TypeError, ValueError, IndexError):
+                return False
+            if since.tzinfo is None:
+                since = since.replace(tzinfo=timezone.utc)
+            return int(mtime) <= int(since.timestamp())
+        return False
+
+
+def _http_date(ts: float) -> str:
+    return email.utils.formatdate(ts, usegmt=True)
+
+
+def _i18n_mtime_ns() -> int:
+    try:
+        return (STATIC_DIR / "i18n.json").stat().st_mtime_ns
+    except OSError:
+        return 0
 
 
 class _HttpError(Exception):
@@ -558,7 +612,68 @@ def setup_logging(project: Project, level: int = logging.INFO) -> Path:
     return path
 
 
-def serve(project: Project, host: str | None = None, port: int | None = None) -> None:
+PREWARM_CHUNK = 8 * 1024 * 1024
+
+
+def prewarm_paths(project: Project) -> list[Path]:
+    """The files a cold start touches: evidence.sqlite (+ its WAL) and the promoted build's build.sqlite — the
+    latter only when the service will serve it (a build of an older schema is refused, so reading its 600 MB
+    would be wasted)."""
+    out: list[Path] = []
+    for suffix in ("", "-wal"):
+        p = Path(str(project.evidence_db) + suffix)
+        if p.is_file() and p.stat().st_size:
+            out.append(p)
+    bid = current_build_id(project.builds_dir)
+    if bid:
+        b = project.builds_dir / bid / "build.sqlite"
+        if b.is_file():
+            try:
+                current = build_schema_version(b.parent) >= BUILD_SCHEMA_VERSION
+            except Exception as e:  # noqa: BLE001 - prewarm is best effort
+                log.debug("prewarm: cannot read the schema of %s: %s", bid, e)
+                current = False
+            if current:
+                out.append(b)
+            else:
+                log.info("prewarm: build %s is not of the current schema and will not be served; skipped", bid)
+    return out
+
+
+def prewarm(paths: list[Path], chunk: int = PREWARM_CHUNK) -> tuple[int, float]:
+    """Read every file sequentially in `chunk` bytes, discarding the data, so the OS file cache holds it: one
+    sequential pass over ~1 GB takes seconds on a hard disk where the same pages read on demand (random seeks
+    through B-trees and FTS doclists) take minutes. Returns (bytes read, seconds)."""
+    t0 = time.perf_counter()
+    n = 0
+    for p in paths:
+        try:
+            with open(p, "rb", buffering=0) as f:
+                while True:
+                    buf = f.read(chunk)
+                    if not buf:
+                        break
+                    n += len(buf)
+        except OSError as e:
+            log.warning("prewarm: cannot read %s: %s", p, e)
+    return n, time.perf_counter() - t0
+
+
+def start_prewarm(project: Project) -> threading.Thread:
+    """Run prewarm() on a daemon thread and log 'prewarm done in N s' when it finishes."""
+    paths = prewarm_paths(project)
+
+    def run() -> None:
+        n, secs = prewarm(paths)
+        log.info("prewarm done in %.1f s (%.0f MB: %s)", secs, n / 1048576, ", ".join(p.name for p in paths))
+        print(f"prewarm done in {secs:.1f} s ({n / 1048576:.0f} MB)", flush=True)
+
+    t = threading.Thread(target=run, name="atlas-prewarm", daemon=True)
+    t.start()
+    return t
+
+
+def serve(project: Project, host: str | None = None, port: int | None = None, prewarm_files: bool = True) -> None:
     host = host or str(project.get("serve.host", "127.0.0.1"))
     port = int(port if port is not None else project.get("serve.port", DEFAULT_PORT))
     log_path = setup_logging(project)
@@ -573,6 +688,8 @@ def serve(project: Project, host: str | None = None, port: int | None = None) ->
     url = f"http://{h}:{p}/"
     log.info("serving %s (project %s, log %s)", url, project.root, log_path)
     print(f"concept-atlas serving {url}  (project: {project.root}; log: {log_path})", flush=True)
+    if prewarm_files:
+        start_prewarm(project)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

@@ -1,6 +1,8 @@
 -- build.sqlite: one disposable derived snapshot (increment 2: pinned evidence + curated scheme + match/assign
 -- outputs). Written by the build stages only; frozen (read-only, journal_mode=DELETE) by `atlas run finish`.
--- Schema version 1.
+-- Schema version 2 (1: increment 2; 2: `occurrences` carries the sentence's doc_id / seq / page_no / section /
+-- is_body and the covering index occ_concept_doc, so the concept routes never touch build_sentences before the
+-- page is cut — see docs/INCREMENT2.md "Performance").
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 
@@ -121,9 +123,20 @@ CREATE TABLE IF NOT EXISTS occurrences (
   cstart     INTEGER NOT NULL,              -- offsets into the stored sentence text
   cend       INTEGER NOT NULL,
   nested_in  TEXT,                          -- concept id of the longer match containing this one
+  -- denormalised from build_sentences by BuildStore.add_occurrences (schema 2): filtering, sorting and paging
+  -- of a concept's sentences run on the covering index below, build_sentences is read for the page rows only
+  doc_id     TEXT NOT NULL,
+  seq        INTEGER NOT NULL,
+  page_no    INTEGER NOT NULL,
+  section    TEXT NOT NULL,
+  is_body    INTEGER NOT NULL DEFAULT 1,
+  tags       TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (sid, concept_id, cstart)
 );
-CREATE INDEX IF NOT EXISTS occ_concept ON occurrences(concept_id, sid);
+-- covering index: every column the concept-sentence queries filter, sort or return (sid last: the page rows
+-- join build_sentences / ev.sentences by it). The PK (sid, concept_id, cstart) serves the lookups by sentence.
+CREATE INDEX IF NOT EXISTS occ_concept_doc ON occurrences(concept_id, doc_id, seq, section, is_body, nested_in,
+                                                          page_no, tags, sid);
 
 CREATE TABLE IF NOT EXISTS topic_hits (
   unit_id    TEXT NOT NULL,
@@ -174,7 +187,8 @@ CREATE TABLE IF NOT EXISTS importance (
   year_cov_json    TEXT,
   trend            REAL,
   trend_flag       TEXT,
-  tier             TEXT NOT NULL,
+  tier             TEXT,                    -- NULL for frequency-only entries (phrases, journal names, ambiguous
+                                            -- abbreviations: origin not 概念…), which the previous system never tiered
   PRIMARY KEY (concept_id, scope)
 );
 CREATE INDEX IF NOT EXISTS imp_scope ON importance(scope, papers DESC);

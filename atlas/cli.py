@@ -6,11 +6,12 @@ atlas docs add <root> [--manifest manifest.csv] [--pattern '**/*.pdf'] [--scan] 
 atlas docs list <root> [--q text] [--limit 50]
 atlas run ingest <root> [--reextract] [--limit N] [--doc-ids a,b] [--workers 1]
 atlas run match|assign|finish <root> [--build <id>] [--doc-ids a,b] [--workers N] [--force]
-atlas build new|list|status|promote|all <root> [<id>] [--note …] [--workers N]
+atlas build new|list|status|promote|all|upgrade <root> [<id>] [--note …] [--workers N]
 atlas curate confirm <root> <name> | atlas curate status <root>
 atlas legacy export-curated <terms_v3.db> <root> [--spec subdomain_spec.json] [--force]
 atlas legacy import-highlights <highlights.sqlite> <sentences.db> <root>
-atlas serve <root> [--host 127.0.0.1] [--port 8770]      (a port in use is an error, exit 1)
+atlas serve <root> [--host 127.0.0.1] [--port 8770] [--no-prewarm]   (a port in use is an error, exit 1)
+atlas evidence gc <root> [--vacuum] [--dry-run] [--rebuild-fts]      remove superseded extractions
 atlas fixture make <dir> [--seed 1] [--kind paper|thesis]
 atlas ucl subset <root> [--inventory csv] [--proximity csv] [--pdf-dir dir] [--target 120]
 atlas notes export <root> <collection_id> [-o file.md]
@@ -99,6 +100,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("root")
     p.add_argument("--note")
     p.add_argument("--workers", type=int, default=1)
+    p = b.add_parser("upgrade", help="bring a finished build of an older schema to the current one in place (seconds)")
+    p.add_argument("root")
+    p.add_argument("build_id", nargs="?", help="default: the promoted build")
 
     c = sub.add_parser("curate", help="confirm curated files").add_subparsers(dest="curate_cmd", metavar="<verb>")
     c.required = True
@@ -126,6 +130,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("root")
     p.add_argument("--host")
     p.add_argument("--port", type=int)
+    p.add_argument("--prewarm", action=argparse.BooleanOptionalAction, default=True,
+                   help="read evidence.sqlite and the promoted build.sqlite sequentially at startup so the OS cache "
+                        "holds them (default: on; --no-prewarm to skip)")
+
+    ev = sub.add_parser("evidence", help="evidence store maintenance").add_subparsers(dest="evidence_cmd",
+                                                                                      metavar="<verb>")
+    ev.required = True
+    p = ev.add_parser("gc", help="delete extractions no document, build or note uses any more")
+    p.add_argument("root")
+    p.add_argument("--vacuum", action="store_true", help="VACUUM afterwards and rebuild the FTS indexes (stop `atlas serve` first)")
+    p.add_argument("--dry-run", action="store_true", help="report what would be removed, change nothing")
+    p.add_argument("--rebuild-fts", action="store_true", help="only rebuild the FTS indexes (recovery after an interrupted --vacuum)")
 
     fx = sub.add_parser("fixture", help="developer tools").add_subparsers(dest="fixture_cmd", metavar="<verb>")
     fx.required = True
@@ -240,6 +256,14 @@ def _cmd_build(a: argparse.Namespace) -> int:
         r = B.promote(proj, a.build_id)
         print(f"build {r['build_id']} promoted (previous: {r['previous'] or '-'})")
         return EXIT_OK
+    if a.build_cmd == "upgrade":
+        r = B.upgrade(proj, a.build_id)
+        if r.get("unchanged"):
+            print(f"build {r['build_id']} already has schema {r['to']}; nothing to do")
+        else:
+            print(f"build {r['build_id']} upgraded: schema {r['from']} -> {r['to']} in {r['seconds']} s "
+                  f"(sha256 {r['sha256'][:12]}…); restart `atlas serve` if it is running")
+        return EXIT_OK
     r = B.build_all(proj, a.note, workers=a.workers)
     print(f"build {r['build_id']} finished and promoted")
     for stage, secs in r["timings"].items():
@@ -289,7 +313,20 @@ def _cmd_serve(a: argparse.Namespace) -> int:
     from atlas.config import load_project
     from atlas.http.server import serve
     proj = load_project(a.root)
-    serve(proj, a.host, a.port)
+    serve(proj, a.host, a.port, prewarm_files=bool(a.prewarm))
+    return EXIT_OK
+
+
+def _cmd_evidence(a: argparse.Namespace) -> int:
+    from atlas.config import load_project
+    from atlas.tools import gc
+    proj = load_project(a.root)
+    if a.rebuild_fts:
+        secs = gc.rebuild_fts(proj)
+        print(f"FTS indexes rebuilt in {secs:.1f} s")
+        return EXIT_OK
+    r = gc.run(proj, vacuum=a.vacuum, dry_run=a.dry_run)
+    print(gc.format_report(r))
     return EXIT_OK
 
 
@@ -336,6 +373,8 @@ def main(argv: list[str] | None = None) -> int:
     from atlas.pipeline.build import BuildError
     from atlas.pipeline.gates import GateError
     from atlas.pipeline.runner import StageError
+    from atlas.store.db import BuildSchemaError
+    from atlas.tools.gc import GcError
     try:
         if a.cmd == "init":
             return _cmd_init(a)
@@ -351,6 +390,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_legacy(a)
         if a.cmd == "serve":
             return _cmd_serve(a)
+        if a.cmd == "evidence":
+            return _cmd_evidence(a)
         if a.cmd == "fixture":
             return _cmd_fixture_make(a)
         if a.cmd == "ucl":
@@ -360,7 +401,7 @@ def main(argv: list[str] | None = None) -> int:
         ap.print_usage(sys.stderr)
         return EXIT_USAGE
     except (FileNotFoundError, FileExistsError, KeyError, ValueError, NotImplementedError, OSError, BuildError,
-            GateError, StageError) as e:
+            GateError, StageError, BuildSchemaError, GcError) as e:
         log.debug("command failed", exc_info=True)
         print(f"error: {e}", file=sys.stderr)
         return EXIT_USAGE

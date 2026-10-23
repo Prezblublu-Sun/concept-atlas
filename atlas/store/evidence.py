@@ -22,6 +22,12 @@ log = logging.getLogger(__name__)
 
 _META_FIELDS = ("title", "year", "authors", "doi", "venue", "keywords", "abstract", "lang")
 _SNIPPET_TOKENS = 40
+# Corpus-wide FTS searches scan every matching rowid (the FTS index alone: milliseconds even for a stop word) but
+# join, sort and page at most SEARCH_CAP of them (~19 ms per 1,000 joined rows, measured): beyond the cap an
+# unbiased subset (every k-th rowid over the whole corpus) is joined, `total` is the number of FTS matches,
+# `documents` is counted over every match, and the result carries `total_capped: True` (the UI says a sample is
+# listed). A search inside one document is never capped (its candidates come from the document's own sentences).
+SEARCH_CAP = 50_000
 
 
 def _now() -> str:
@@ -206,18 +212,22 @@ class EvidenceStore:
         return best
 
     def stats(self) -> dict:
-        """{documents, extractions, pages, sentences, body_sentences}"""
+        """{documents, extractions, pages, sentences, body_sentences} over the current extractions, from the
+        per-extraction aggregates (`n_pages`, `n_sentences`, `stats_json.body_sentences` written by ingest) —
+        no scan of pages / extraction_sentences. An extraction without a stored body count (none written by this
+        code base; defensive) is counted from its rows."""
         c = self.conn
-        one = lambda sql, *a: int(c.execute(sql, a).fetchone()[0])  # noqa: E731
+        r = c.execute(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(e.n_pages), 0) AS pages, COALESCE(SUM(e.n_sentences), 0) AS sentences, "
+            "COALESCE(SUM(COALESCE(json_extract(e.stats_json, '$.body_sentences'), "
+            "  (SELECT COUNT(*) FROM extraction_sentences es WHERE es.ext_id = e.ext_id AND es.is_body = 1))), 0) AS body "
+            "FROM extractions e WHERE e.is_current = 1").fetchone()
         return {
-            "documents": one("SELECT COUNT(*) FROM documents"),
-            "extractions": one("SELECT COUNT(*) FROM extractions"),
-            "pages": one("SELECT COUNT(*) FROM pages p JOIN extractions e ON e.ext_id=p.ext_id "
-                         "WHERE e.is_current=1"),
-            "sentences": one("SELECT COUNT(*) FROM extraction_sentences es JOIN extractions e "
-                             "ON e.ext_id=es.ext_id WHERE e.is_current=1"),
-            "body_sentences": one("SELECT COUNT(*) FROM extraction_sentences es JOIN extractions e "
-                                  "ON e.ext_id=es.ext_id WHERE e.is_current=1 AND es.is_body=1"),
+            "documents": int(c.execute("SELECT COUNT(*) FROM documents").fetchone()[0]),
+            "extractions": int(c.execute("SELECT COUNT(*) FROM extractions").fetchone()[0]),
+            "pages": int(r["pages"]),
+            "sentences": int(r["sentences"]),
+            "body_sentences": int(r["body"]),
         }
 
     # ---- extractions --------------------------------------------------------------------------------------
@@ -466,65 +476,135 @@ class EvidenceStore:
         out["doc"] = dict(m) if m is not None else {"title": None, "year": None, "doi": None}
         return out
 
+    # ---- FTS searches ---------------------------------------------------------------------------------------
+    # Shape (both searches): (1) the candidate set of FTS rowids — every match for a corpus-wide search (the FTS
+    # index alone, no content reads), or the intersection of every match with the document's own rows for a
+    # search inside one document; (2) at most SEARCH_CAP candidates (an unbiased every-k-th subset when there are
+    # more) joined to the membership / meta tables, counted, sorted and paged in Python; (3) snippet() computed
+    # for the returned page rows only, by rowid. `ORDER BY rank` is avoided on purpose: bm25 needs a docsize
+    # lookup per match (seconds for a frequent phrase), and ingestion order is as good a tie-break for a phrase
+    # search as any.
+
+    _IN_CHUNK = 900
+
+    def _candidates(self, cand: str, args: tuple) -> list[int]:
+        return [int(r[0]) for r in self.conn.execute(cand, args)]
+
+    @staticmethod
+    def _subset(rids: list[int], cap: int) -> tuple[list[int], bool]:
+        """(rowids to join, capped): every k-th rowid when there are more than `cap` (k = ceil(n / cap)), so the
+        joined sample spans the whole corpus instead of the earliest-ingested documents."""
+        n = len(rids)
+        if n <= cap or cap <= 0:
+            return rids, False
+        k = -(-n // cap)
+        return rids[::k], True
+
+    @staticmethod
+    def _page(rows: list[dict], key, limit: int, offset: int) -> list[dict]:
+        rows.sort(key=key)
+        lo = max(0, int(offset))
+        return rows[lo: lo + max(0, int(limit))]
+
+    def _snippets(self, table: str, q: str, rowids: Sequence[int]) -> dict[int, str]:
+        """{rowid: snippet} for the given FTS rowids (one bounded FTS lookup per page, not per match)."""
+        out: dict[int, str] = {}
+        if not rowids:
+            return out
+        marks = ",".join("?" * len(rowids))
+        for r in self.conn.execute(
+                f"SELECT rowid, snippet({table}, 0, '<mark>', '</mark>', '…', ?) AS snip FROM {table} "
+                f"WHERE {table} MATCH ? AND rowid IN ({marks})", (_SNIPPET_TOKENS, q, *[int(x) for x in rowids])):
+            out[int(r["rowid"])] = r["snip"]
+        return out
+
     def phrase_search(self, phrase: str, doc_id: str | None = None, limit: int = 50, offset: int = 0) -> dict:
         """FTS5 phrase search over sentences (current extractions only): {'rows': [{sid, doc_id, page_no, section,
-        is_body, snippet, title, year}], 'total': n, 'documents': n_distinct_docs}. The phrase is quoted (no FTS
-        syntax from users)."""
-        empty = {"rows": [], "total": 0, "documents": 0}
+        is_body, snippet, title, year}], 'total': n, 'documents': n_distinct_docs, 'total_capped': bool}. The phrase
+        is quoted (no FTS syntax from users). A corpus-wide search scans every match but joins / pages at most
+        SEARCH_CAP of them: when capped, `total` and `documents` count every FTS match (all ingested generations)
+        and the rows are an every-k-th sample (`total_capped` says so); a search inside one document sees every
+        match of that document."""
+        empty = {"rows": [], "total": 0, "documents": 0, "total_capped": False}
         q = _fts_phrase(phrase)
         if q == '""':
             return empty
-        base = (
-            "FROM (SELECT rowid AS rid, snippet(sentence_fts, 0, '<mark>', '</mark>', '…', ?) AS snip "
-            "      FROM sentence_fts WHERE sentence_fts MATCH ?) f "
-            "JOIN sentences s ON s.rowid = f.rid "
-            "JOIN extraction_sentences es ON es.sid = s.sid "
-            "JOIN extractions e ON e.ext_id = es.ext_id AND e.is_current = 1 "
-            "LEFT JOIN document_meta m ON m.doc_id = s.doc_id "
-        )
-        params: list = [_SNIPPET_TOKENS, q]
-        where = ""
         if doc_id:
-            where = "WHERE s.doc_id = ? "
-            params.append(doc_id)
+            cand = ("SELECT rid FROM (SELECT rowid AS rid FROM sentence_fts WHERE sentence_fts MATCH ?) "
+                    "INTERSECT SELECT rowid FROM sentences WHERE doc_id = ?")
+            cand_args: tuple = (q, doc_id)
+        else:
+            cand = "SELECT rowid AS rid FROM sentence_fts WHERE sentence_fts MATCH ?"
+            cand_args = (q,)
         try:
-            tot = self.conn.execute("SELECT COUNT(*), COUNT(DISTINCT s.doc_id) " + base + where, params).fetchone()
-            rows = self.conn.execute(
-                "SELECT s.sid, s.doc_id, es.page_no, es.section, es.is_body, f.snip AS snippet, m.title, m.year "
-                + base + where + "ORDER BY m.year DESC, s.doc_id, es.page_no, es.cstart LIMIT ? OFFSET ?",
-                (*params, limit, offset)).fetchall()
+            rids = self._candidates(cand, cand_args)
+            joined, capped = self._subset(rids, SEARCH_CAP if not doc_id else 0)
+            hits: list[dict] = []
+            for i in range(0, len(joined), self._IN_CHUNK):
+                part = joined[i:i + self._IN_CHUNK]
+                marks = ",".join("?" * len(part))
+                hits += [dict(r) for r in self.conn.execute(
+                    "SELECT s.rowid AS rid, s.sid, s.doc_id, es.page_no, es.cstart, es.section, es.is_body, m.title, m.year "
+                    f"FROM sentences s JOIN extraction_sentences es ON es.sid = s.sid "
+                    "JOIN extractions e ON e.ext_id = es.ext_id AND e.is_current = 1 "
+                    f"LEFT JOIN document_meta m ON m.doc_id = s.doc_id WHERE s.rowid IN ({marks})", part)]
+            if capped:
+                total = len(rids)
+                documents = int(self.conn.execute(
+                    "SELECT COUNT(DISTINCT s.doc_id) FROM sentence_fts f JOIN sentences s ON s.rowid = f.rowid "
+                    "WHERE sentence_fts MATCH ?", (q,)).fetchone()[0])
+            else:
+                total, documents = len(hits), len({h["doc_id"] for h in hits})
+            page = self._page(hits, lambda h: (h["year"] is None, -(h["year"] or 0), h["doc_id"], h["page_no"], h["cstart"]),
+                              limit, offset)
+            snips = self._snippets("sentence_fts", q, [h["rid"] for h in page])
         except sqlite3.OperationalError as e:
             log.warning("phrase_search failed for %r: %s", phrase, e)
             return empty
-        return {"rows": [{"sid": r["sid"], "doc_id": r["doc_id"], "page_no": r["page_no"], "section": r["section"],
-                          "is_body": bool(r["is_body"]), "snippet": r["snippet"], "title": r["title"],
-                          "year": r["year"]} for r in rows],
-                "total": int(tot[0]), "documents": int(tot[1])}
+        return {"rows": [{"sid": h["sid"], "doc_id": h["doc_id"], "page_no": h["page_no"], "section": h["section"],
+                          "is_body": bool(h["is_body"]), "snippet": snips.get(h["rid"], ""), "title": h["title"],
+                          "year": h["year"]} for h in page],
+                "total": total, "documents": documents, "total_capped": capped, "listed": len(hits)}
 
     def page_search(self, phrase: str, doc_id: str | None = None, limit: int = 50, offset: int = 0) -> dict:
         """Same over page_fts (for text the sentence splitter may have cut): rows {doc_id, page_no, snippet}."""
-        empty = {"rows": [], "total": 0, "documents": 0}
+        empty = {"rows": [], "total": 0, "documents": 0, "total_capped": False}
         q = _fts_phrase(phrase)
         if q == '""':
             return empty
-        base = (
-            "FROM (SELECT rowid AS rid, snippet(page_fts, 0, '<mark>', '</mark>', '…', ?) AS snip "
-            "      FROM page_fts WHERE page_fts MATCH ?) f "
-            "JOIN page_text t ON t.rowid = f.rid "
-            "JOIN pages p ON p.text_sha256 = t.text_sha256 "
-            "JOIN extractions e ON e.ext_id = p.ext_id AND e.is_current = 1 "
-        )
-        params: list = [_SNIPPET_TOKENS, q]
-        where = ""
         if doc_id:
-            where = "WHERE e.doc_id = ? "
-            params.append(doc_id)
+            cand = ("SELECT rid FROM (SELECT rowid AS rid FROM page_fts WHERE page_fts MATCH ?) "
+                    "INTERSECT SELECT t.rowid FROM page_text t JOIN pages p ON p.text_sha256 = t.text_sha256 "
+                    "JOIN extractions e ON e.ext_id = p.ext_id AND e.is_current = 1 AND e.doc_id = ?")
+            cand_args: tuple = (q, doc_id)
+        else:
+            cand = "SELECT rowid AS rid FROM page_fts WHERE page_fts MATCH ?"
+            cand_args = (q,)
         try:
-            tot = self.conn.execute("SELECT COUNT(*), COUNT(DISTINCT e.doc_id) " + base + where, params).fetchone()
-            rows = self.conn.execute(
-                "SELECT e.doc_id, p.page_no, f.snip AS snippet " + base + where +
-                "ORDER BY e.doc_id, p.page_no LIMIT ? OFFSET ?", (*params, limit, offset)).fetchall()
+            rids = self._candidates(cand, cand_args)
+            joined, capped = self._subset(rids, SEARCH_CAP if not doc_id else 0)
+            hits: list[dict] = []
+            for i in range(0, len(joined), self._IN_CHUNK):
+                part = joined[i:i + self._IN_CHUNK]
+                marks = ",".join("?" * len(part))
+                hits += [dict(r) for r in self.conn.execute(
+                    "SELECT t.rowid AS rid, e.doc_id, p.page_no FROM page_text t "
+                    "JOIN pages p ON p.text_sha256 = t.text_sha256 "
+                    "JOIN extractions e ON e.ext_id = p.ext_id AND e.is_current = 1 "
+                    f"WHERE t.rowid IN ({marks})" + (" AND e.doc_id = ?" if doc_id else ""),
+                    (*part, doc_id) if doc_id else part)]
+            if capped:
+                total = len(rids)
+                documents = int(self.conn.execute(
+                    "SELECT COUNT(DISTINCT e.doc_id) FROM page_fts f JOIN page_text t ON t.rowid = f.rowid "
+                    "JOIN pages p ON p.text_sha256 = t.text_sha256 JOIN extractions e ON e.ext_id = p.ext_id "
+                    "WHERE page_fts MATCH ?", (q,)).fetchone()[0])
+            else:
+                total, documents = len(hits), len({h["doc_id"] for h in hits})
+            page = self._page(hits, lambda h: (h["doc_id"], h["page_no"]), limit, offset)
+            snips = self._snippets("page_fts", q, [h["rid"] for h in page])
         except sqlite3.OperationalError as e:
             log.warning("page_search failed for %r: %s", phrase, e)
             return empty
-        return {"rows": [dict(r) for r in rows], "total": int(tot[0]), "documents": int(tot[1])}
+        return {"rows": [{"doc_id": h["doc_id"], "page_no": h["page_no"], "snippet": snips.get(h["rid"], "")} for h in page],
+                "total": total, "documents": documents, "total_capped": capped, "listed": len(hits)}

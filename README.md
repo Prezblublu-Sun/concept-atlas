@@ -15,7 +15,8 @@ pip install -e .[dev]
 atlas init <project-dir> --name myproject --pdf-dir <folder-with-pdfs>
 atlas docs add <project-dir>            # register PDFs (manifest.csv optional)
 atlas run ingest <project-dir>          # pages → sentences with stable ids (paper or thesis doctype)
-atlas serve <project-dir>               # http://127.0.0.1:8767
+atlas serve <project-dir> [--no-prewarm]   # http://127.0.0.1:8770 (prewarm: the DB files are read once at start)
+atlas evidence gc <project-dir> [--vacuum] [--dry-run]   # drop superseded extractions no build / note uses
 
 # curated term system (concepts, term tree, categories, sub-domains) → counted on a build
 atlas legacy export-curated <terms_v3.db> <project-dir> [--spec subdomain_spec.json] [--force]
@@ -24,6 +25,7 @@ atlas curate status <project-dir>       # sha check of curated/ vs confirmations
 atlas curate confirm <project-dir> <name>
 atlas build all <project-dir> [--note …] [--workers N]   # new → match → assign → finish → promote
 atlas build new|list|status|promote <project-dir> [<build-id>]
+atlas build upgrade <project-dir> [<build-id>]   # a finished build of an older schema → current schema in place (seconds)
 atlas run match|assign|finish <project-dir> [--build <id>]
 
 # fixtures and the UCL thesis subset

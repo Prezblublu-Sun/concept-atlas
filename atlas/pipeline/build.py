@@ -127,6 +127,19 @@ def promote(project: Project, build: str | None = None) -> dict:
     return {"build_id": d.name, "previous": old, "relink": links}
 
 
+def upgrade(project: Project, build: str | None = None) -> dict:
+    """`atlas build upgrade [<id>]`: a finished build of an older schema (default: the promoted one) is brought to
+    the current schema in place — seconds, against the minutes of a rebuild (BuildStore.upgrade)."""
+    bid = build or current_build_id(project.builds_dir)
+    if not bid:
+        raise BuildError("no build id given and no build promoted")
+    d = resolve_build(project, bid)
+    try:
+        return BuildStore.upgrade(d)
+    except ValueError as e:
+        raise BuildError(str(e)) from e
+
+
 def build_all(project: Project, note: str | None = None, workers: int = 1) -> dict:
     """new → match → assign → finish → promote; returns {build_id, timings: {stage: seconds}, reports}."""
     from atlas.pipeline.runner import run_stage

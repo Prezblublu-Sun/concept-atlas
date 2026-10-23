@@ -1,8 +1,9 @@
 -- evidence.sqlite: append-only evidence store. Schema version 1.
 -- Only `document_meta` is ever updated; everything else is insert-only (deletes only via `atlas evidence gc`).
--- NEVER VACUUM this file (and `atlas evidence gc` must never do it): `page_text` and `sentences` have TEXT primary
--- keys, so VACUUM may renumber their rowids, on which `page_fts` / `sentence_fts` (external-content FTS5) are
--- keyed. If a VACUUM ever happens, run EvidenceStore.rebuild_fts() (INSERT INTO x_fts(x_fts) VALUES('rebuild')).
+-- Never VACUUM this file by hand: `page_text` and `sentences` have TEXT primary keys, so VACUUM may renumber their
+-- rowids, on which `page_fts` / `sentence_fts` (external-content FTS5) are keyed. The one sanctioned VACUUM is
+-- `atlas evidence gc --vacuum`, which runs EvidenceStore.rebuild_fts() (INSERT INTO x_fts(x_fts) VALUES('rebuild'))
+-- right after it; `atlas evidence gc --rebuild-fts` repairs the index if that run was interrupted.
 
 CREATE TABLE IF NOT EXISTS documents (
   doc_id     TEXT PRIMARY KEY,
