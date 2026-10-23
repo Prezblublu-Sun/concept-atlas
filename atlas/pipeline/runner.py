@@ -43,21 +43,37 @@ class Stage(Protocol):
     def run(self, project: Project, build=None, **opts) -> Report: ...
 
 
-STAGES: list[str] = ["ingest", "match", "assign", "finish"]
-# later: terms, concepts, scheme, classify, relations, overview, summaries, translate
-BUILD_STAGES: tuple[str, ...] = ("match", "assign", "finish")
+STAGES: list[str] = ["ingest", "terms", "concepts", "scheme", "match", "assign", "classify", "finish"]
+# later: relations, overview, summaries, translate
+#: stages that work on the project (evidence store, curated files, drafts) and take no build
+PROJECT_STAGES: tuple[str, ...] = ("ingest", "terms", "concepts", "scheme")
+BUILD_STAGES: tuple[str, ...] = ("match", "assign", "classify", "finish")
+#: LLM stages (increment 4): `--dry-run`, `--pilot`, `--mode live|batch`, `--budget`, `--wait`, `--limit`
+LLM_STAGES: tuple[str, ...] = ("terms", "concepts", "scheme", "classify")
 
 
 def get_stage(name: str) -> Stage:
     if name == "ingest":
         from .stages.ingest import IngestStage
         return IngestStage()
+    if name == "terms":
+        from .stages.terms import TermsStage
+        return TermsStage()
+    if name == "concepts":
+        from .stages.concepts import ConceptsStage
+        return ConceptsStage()
+    if name == "scheme":
+        from .stages.scheme import SchemeStage
+        return SchemeStage()
     if name == "match":
         from .stages.match import MatchStage
         return MatchStage()
     if name == "assign":
         from .stages.assign import AssignStage
         return AssignStage()
+    if name == "classify":
+        from .stages.classify import ClassifyStage
+        return ClassifyStage()
     if name == "finish":
         from .stages.finish import FinishStage
         return FinishStage()
@@ -78,13 +94,13 @@ def _check_requires(stage: Stage, build) -> None:
 def run_stage(project: Project, name: str, build: str | Path | None = None, **opts) -> Report:
     """Run one stage. For build stages `build` is a build id or folder (default: the newest open build)."""
     stage = get_stage(name)
-    if name == "ingest":
-        return stage.run(project, None, **opts)
-    from atlas.pipeline.build import open_build_store
     from atlas.pipeline.gates import check_gate
     gate = getattr(stage, "gate", ()) or ()
     if gate:
         check_gate(project, tuple(gate))
+    if name in PROJECT_STAGES:
+        return stage.run(project, None, **opts)
+    from atlas.pipeline.build import open_build_store
     store = open_build_store(project, build, require_open=True)
     try:
         _check_requires(stage, store)
