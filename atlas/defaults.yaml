@@ -5,24 +5,45 @@ paths:
 ingest:
   sentence_min_chars: 3
   page_render_zoom: 1.6
-llm:
-  provider: deepseek
-  base_url: https://api.deepseek.com
-  model: deepseek-flash
-  api_key_env: ATLAS_LLM_API_KEY
-  concurrency: 8
-  prefer_idle: true
-  balance_floor_rmb: 5
-  balance_endpoint: /user/balance
-  pricing:
-    currency: RMB
-    per_million: { input_miss: 1.0, input_hit: 0.02, output: 4.0 }
-    peak_multiplier: 2
+llm:                                  # increment 4 §1.2: the providers the LLM stages talk to (atlas/llm/client.py)
+  provider: anthropic                 # primary provider: anthropic | deepseek | fake (its currency is the budget currency)
+  model: claude-opus-5-5              # the primary provider's model (user's choice; the defaults stay Opus 5.5 / medium)
+  models: { anthropic: claude-opus-5-5, deepseek: deepseek-flash }   # per-provider models for the split
+  effort: medium                      # low | medium | high | xhigh | max (anthropic only; the model's thinking depth)
+  api_key_env: RS_ANTHROPIC_API_KEY   # deliberately NOT ANTHROPIC_API_KEY (Claude Code would pick that one up); resolved
+                                      # from the process environment, then HKCU\Environment, then the system environment
+  split: { anthropic: 0.9, deepseek: 0.1 }   # share of items per provider (policy 2026-10-23: Claude first, ~9:1, so the two
+                                      # can be compared); an item's provider = sha1(item key) → stable across runs; absent →
+                                      # 1.0 for `provider`
+  failover: false                     # true: an item whose provider fails (transport error) is re-run on another provider
+                                      # of the split; such ledger rows carry failover = 1
+  fx: { USD: 1.0, RMB: 0.14 }         # value of one unit of each currency in USD — budgets and reports across providers
+  max_tokens: 8192                    # default output cap per request (a task may set its own)
+  max_tokens_cap: 65536               # the ×2 retry after `max_tokens` never exceeds this
+  batch_default: true                 # stages run in --mode batch unless told otherwise (half price, asynchronous);
+                                      # a provider without a batch API (DeepSeek) runs its share live
+  max_retries: 2                      # SDK-level retries of 429 / 5xx / connection errors (+ one outer attempt)
+  refusal_fallback: true              # beta server-side refusal fallback (`fallbacks: "default"`), live calls only
+  concurrency: 4
+  prefer_idle: true                   # DeepSeek only: warn when a run starts inside the provider's peak hours
+  deepseek:                           # kept so a project can switch / split providers; no new features
+    base_url: https://api.deepseek.com
+    api_key_env: RS_DEEPSEEK_API_KEY  # same resolution order as the Anthropic key
+    balance_endpoint: /user/balance
+    balance_floor_rmb: 5
+    extra_body: {}                    # merged into every chat/completions body (e.g. {thinking: {type: disabled}})
     peak: { tz_offset_hours: 8, weekdays: [0, 1, 2, 3, 4], hours: [[9, 12], [14, 18]] }
-budgets:
-  run: 80
-  stage: { overview: 60 }
-  daily: { ask: 2 }
+    peak_multiplier: 2
+  pricing:                            # per million tokens, in `currency`; batch rows are × batch_multiplier
+    claude-opus-5-5:   { input: 4.0,  output: 20.0, cache_write: 5.0,   cache_read: 0.20, currency: USD, batch_multiplier: 0.5 }
+    claude-sonnet-5-5: { input: 2.0,  output: 10.0, cache_write: 2.5,   cache_read: 0.20, currency: USD, batch_multiplier: 0.5 }
+    claude-haiku-5-5:  { input: 0.10, output: 0.50, cache_write: 0.125, cache_read: 0.01, currency: USD, batch_multiplier: 0.5 }
+    deepseek-flash:    { input: 1.0,  output: 4.0,  cache_write: 1.0,   cache_read: 0.02, currency: RMB, batch_multiplier: 1.0 }
+    fake:              { input: 4.0,  output: 20.0, cache_write: 5.0,   cache_read: 0.20, currency: USD, batch_multiplier: 0.5 }
+budgets:                              # in the provider currency (increment 4 §1.5)
+  run: 80                             # default --budget of one stage run
+  stage: { terms: 40, concepts: 20, scheme: 5, classify: 30, overview: 60 }
+  daily: { total: 150, ask: 2 }       # total: project-wide spend per calendar day; ask: later increments
 overview:
   mode_by_tier: { A: deep, B: deep, C: lite, D: lite, E: skip }
   stale_ratio: 0.10
