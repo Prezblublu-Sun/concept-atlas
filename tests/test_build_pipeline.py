@@ -27,7 +27,7 @@ from atlas.tools.fixture import make_fixture
 ATLAS = Path(__file__).resolve().parents[1] / "atlas"
 # modules that run inside a build: they must never write a curated file
 STAGE_MODULES = [ATLAS / "pipeline" / "runner.py", ATLAS / "pipeline" / "build.py", ATLAS / "store" / "build.py",
-                 ATLAS / "pipeline" / "llm_stage.py", ATLAS / "pipeline" / "llm_shim.py",
+                 ATLAS / "pipeline" / "llm_stage.py", ATLAS / "llm" / "tasks.py", ATLAS / "llm" / "batch.py",
                  *sorted((ATLAS / "pipeline" / "stages").glob("*.py"))]
 
 

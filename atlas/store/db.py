@@ -6,6 +6,8 @@ Rules (Windows-proof):
 - `mode='rw'`: create if missing, `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON`, `synchronous=NORMAL`.
 - `mode='ro'`: `file:...?mode=ro` URI (the file may still grow; used by the server for evidence.sqlite).
 - `mode='immutable'`: `file:...?immutable=1` (frozen build files only; never for WAL databases that still change).
+- the path `':memory:'` opens a private in-memory database (no file, no WAL; same pragmas otherwise) — used by the
+  LLM stages' dry runs when the project has no `llm/llm.sqlite` yet, so a dry run creates nothing.
 - Paths are converted to URIs with `Path.as_uri()` semantics on all platforms (drive letters, spaces, CJK); a UNC
   path `\\\\server\\share\\db.sqlite` becomes `file:////server/share/db.sqlite` (empty authority — SQLite rejects any
   other URI authority than localhost).
@@ -69,7 +71,18 @@ def file_uri(path: str | Path, mode: str = "rw") -> str:
     return uri + "?immutable=1"
 
 
+MEMORY = ":memory:"
+
+
 def connect(path: str | Path, mode: str = "rw", busy_timeout_ms: int = 5000) -> sqlite3.Connection:
+    if str(path) == MEMORY:
+        if mode != "rw":
+            raise ValueError(f"an in-memory database is always mode='rw', not {mode!r}")
+        conn = sqlite3.connect(MEMORY, check_same_thread=False, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        log.debug("sqlite connect %s", MEMORY)
+        return conn
     p = Path(path)
     if not p.is_absolute():
         p = p.resolve()

@@ -18,14 +18,16 @@ from openpyxl import load_workbook
 from atlas import cli
 from atlas.config import Project, deep_merge, init_project, load_project
 from atlas.core.matcher import DEFAULT_PATTERNS
-from atlas.llm.base import NO_NETWORK_ENV, BatchStatus, ChatResponse, FakeChatClient, NetworkForbidden
+from atlas.llm.base import NO_NETWORK_ENV, BatchStatus, ChatRequest, ChatResponse, FakeChatClient, NetworkForbidden
+from atlas.llm.client import make_client
 from atlas.pipeline import build as B
 from atlas.pipeline import gates
-from atlas.pipeline.llm_stage import drafts_dir, format_plan, read_draft
+from atlas.pipeline.llm_stage import drafts_dir, format_plan, read_draft, run_id_of
 from atlas.pipeline.runner import StageError, run_stage
 from atlas.pipeline.stages.ingest import register_documents
 from atlas.store.build import BuildStore, read_manifest
 from atlas.store.curated import curated_path, curated_shas, read_curated, write_yaml
+from atlas.store.llm import LlmStore
 from atlas.tools.fixture import make_fixture
 from atlas.verify import qa
 
@@ -170,17 +172,32 @@ def test_dry_run_plans_without_any_call_or_file(env):
 
 
 def test_no_network_guard_is_honoured(env, monkeypatch):
+    """With ATLAS_LLM_NO_NETWORK set, a non-dry run of an LLM stage on a real provider raises NetworkForbidden before
+    any provider call: no SDK object is built, no ledger exists, no draft is written. A dry run on the same provider
+    still plans — with the configured split — and creates nothing either."""
+    import anthropic
     project = env["project"]
     monkeypatch.setenv(NO_NETWORK_ENV, "1")
+    monkeypatch.setattr(anthropic, "Anthropic", lambda *a, **k: pytest.fail("the SDK client was built under the guard"))
     real = Project(root=project.root, config=deep_merge(project.config, {"llm": {"provider": "anthropic"}}))
-    with pytest.raises(NetworkForbidden):
+    with pytest.raises(NetworkForbidden, match="ATLAS_LLM_NO_NETWORK"):
         run_stage(real, "terms", pilot=2)
-    rep = run_stage(real, "terms", dry_run=True, pilot=2)          # a dry run never needs a client
-    assert rep.details["dry_run"] and not drafts_dir(project, "terms").exists()
-    monkeypatch.delenv(NO_NETWORK_ENV)
-    with pytest.raises(StageError, match="no LLM client"):
-        run_stage(real, "terms", pilot=2)                            # no real client in this checkout
-    assert not drafts_dir(project, "terms").exists()
+    assert not drafts_dir(project, "terms").exists() and not project.llm_db.exists()
+    rep = run_stage(real, "terms", dry_run=True, pilot=2)          # a dry run never calls and never writes
+    plan = rep.details["plan"]
+    assert rep.details["dry_run"] and not drafts_dir(project, "terms").exists() and not project.llm_db.exists()
+    assert plan["models"] == {"anthropic": "claude-opus-5-5", "deepseek": "deepseek-flash"} and plan["currency"] == "USD"
+    assert plan["split"] == {"anthropic": pytest.approx(0.9), "deepseek": pytest.approx(0.1)}
+    assert set(plan["providers"]) <= {"anthropic", "deepseek"} and sum(v["items"] for v in plan["providers"].values()) == plan["items"] > 0
+    assert all(r["provider"] in ("anthropic", "deepseek") and not r["cached"] for r in plan["rows"])
+    assert plan["known_cache_hits"] == 0 and 0 < plan["cost_low"] < plan["cost_high"]
+    txt = format_plan(plan)
+    assert "anthropic (claude-opus-5-5, share 90%)" in txt and "deepseek (deepseek-flash, share 10%)" in txt
+    assert "no batch API: this share runs live" in txt and "no provider call is made by a dry run" in txt
+    # the second line of defence: a real client refuses on its own before touching the SDK
+    with pytest.raises(NetworkForbidden):
+        make_client(real).complete(ChatRequest(model="claude-opus-5-5", system=("s",), user="ping", max_tokens=5))
+    assert not (project.root / "work" / "runs").exists()
 
 
 def test_terms_pilot_draft_and_accept_gate(env):
@@ -205,15 +222,30 @@ def test_terms_pilot_draft_and_accept_gate(env):
     assert all(re.fullmatch(r"S1[0-9a-f]{16}", s) for s in mm["example_sids"]) and mm["n_docs"] == len(mm["docs"])
     assert (project.root / "work" / "drafts" / "terms" / f"{d['run_id']}.report.md").read_text(encoding="utf-8").startswith("# terms run")
     assert d["cost"] > 0 and d["usage"]["input"] > 0 and d["items"][0]["usage"]["output"] > 0
+    assert all(it["provider"] == "fake" and it["model_reported"] == "claude-opus-5-5" for it in d["items"])
+    assert d["ledger_run_id"] == f"terms_{d['run_id']}" and d["provider"] == "fake" and d["split"] == {"fake": 1.0}
+    assert d["providers"] == {"fake": {"items": d["n_items"], "cost": pytest.approx(d["cost"], abs=1e-5)}}
+    assert os.path.isfile(d["settings"]) and d["settings"].endswith("llm_settings.json") and d["ledger_run_id"] in d["settings"]
+    assert json.load(open(d["settings"], encoding="utf-8"))["tasks"]["terms_extract"]["prompt_sha"] == d["prompt_sha"]
+    # the ledger has one ok row per item for this run, priced like the draft
+    store = LlmStore.open(project.llm_db)
+    rows = store.ledger_rows(run_id=d["ledger_run_id"])
+    store.close()
+    assert len(rows) == d["n_items"] and all(r["status"] == "ok" and r["stage"] == "terms" and r["provider"] == "fake" for r in rows)
+    assert sum(r["cost"] for r in rows) == pytest.approx(d["cost"], abs=1e-5)
     # the request payloads are pure: sorted sids, no doc ids, every sid of the chunk
     for req in fake.requests:
         sids = [s for s, _ in SENT_RE.findall(req.user)]
         assert sids == sorted(sids) and "P00" not in req.user and req.output_schema["required"] == ["terms"]
         assert req.system[0].startswith("You are a bilingual") and req.key in rep.details["fingerprints"]
-    rep2 = run(env, "terms", pilot=3, seed=1, client=fake_client())
+    fake2 = fake_client()
+    rep2 = run(env, "terms", pilot=3, seed=1, client=fake2)
     d2 = read_draft(rep2.details["draft"])
     assert [it["fingerprint"] for it in d2["items"]] == [it["fingerprint"] for it in d["items"]]     # deterministic
     assert d2["run_id"] != d["run_id"]
+    # … and the same items are exact-hash cache hits: answered from llm.sqlite, no request, no cost
+    assert fake2.requests == [] and rep2.items_done == rep2.items_total and d2["cost"] == 0
+    assert all(it["status"] == "cache_local" and it["cost"] == 0 for it in d2["items"]) and d2["terms"] == d["terms"]
     env["state"]["terms_draft"] = rep.details["draft"]
     # blind review: a failing sheet keeps the gate shut, a passing one opens it
     s = qa.sample(project, "terms", n=4, seed=1)
@@ -242,36 +274,66 @@ def test_batch_mode_budget_and_limit(env):
             return BatchStatus(batch_id, "in_progress", st.n_requests, 0, 0) if self.polls == 1 else st
 
     slow = SlowBatch({"terms_extract": answer_terms})
-    rep = run(env, "terms", pilot=2, mode="batch", client=slow)
+    assert run(env, "terms", dry_run=True, pilot=2, seed=2, client=slow).details["plan"]["known_cache_hits"] == 0
+    rep = run(env, "terms", pilot=2, seed=2, mode="batch", client=slow)
     assert rep.details["pending"] and rep.details["batch_id"].startswith("fakebatch") and "draft" not in rep.details
     pending = list(drafts_dir(project, "terms").glob("*.pending.yaml"))
-    assert len(pending) == 1
-    rep2 = run(env, "terms", pilot=2, mode="batch", wait=True, client=slow)
+    assert len(pending) == 1 and read_draft(pending[0])["batch_ids"] == [rep.details["batch_id"]]
+    store = LlmStore.open(project.llm_db)
+    rows = store.ledger_rows(run_id=rep.details["ledger_run_id"])
+    assert len(rows) == rep.items_total and all(r["status"] == "pending" and r["batch_id"] == rep.details["batch_id"] for r in rows)
+    assert store.get_batch(rep.details["batch_id"])["stage"] == "terms"
+    store.close()
+    rep2 = run(env, "terms", pilot=2, seed=2, mode="batch", wait=True, client=slow)
     assert rep2.details["batch_id"] == rep.details["batch_id"] and rep2.items_done == rep2.items_total
     assert not list(drafts_dir(project, "terms").glob("*.pending.yaml")) and len(slow.requests) == rep2.items_total
     d = read_draft(rep2.details["draft"])
     assert d["mode"] == "batch" and d["batch_id"] == rep.details["batch_id"] and d["n_ok"] == rep2.items_total
-    rep3 = run(env, "terms", pilot=3, mode="batch", wait=True, client=fake_client())
+    assert d["ledger_run_id"] == rep.details["ledger_run_id"] and d["run_id"] == run_id_of(pending[0])
+    # the collected batch rows are billed at half price and the rerun that read them is a local cache hit
+    assert d["cost"] == pytest.approx(sum(it["cost"] for it in d["items"]), abs=1e-5) and d["cost"] > 0
+    for it in d["items"]:
+        u = it["usage"]
+        assert it["status"] == "cache_local" and u["output"] > 0
+        assert it["cost"] == pytest.approx((u["input"] * 4 + u["cache_write"] * 5 + u["cache_read"] * 0.2 + u["output"] * 20) / 1e6 * 0.5, abs=1e-6)
+    store = LlmStore.open(project.llm_db)
+    statuses = sorted(r["status"] for r in store.ledger_rows(run_id=d["ledger_run_id"]))
+    store.close()
+    assert statuses == ["cache_batch"] * d["n_items"] + ["cache_local"] * d["n_items"]
+    live = read_draft(env["state"]["terms_draft"])
+    assert d["cost"] / d["n_items"] < sum(it["cost"] for it in live["items"]) / live["n_items"]
+    # items already answered live are cache hits in batch mode too: nothing is submitted
+    fake3 = fake_client()
+    rep3 = run(env, "terms", pilot=3, mode="batch", wait=True, client=fake3)
     d3 = read_draft(rep3.details["draft"])
-    assert rep3.items_done == rep3.items_total and d3["mode"] == "batch" and d3["batch_id"].startswith("fakebatch")
-    assert d3["cost"] == pytest.approx(sum(it["cost"] for it in d3["items"]))       # batch rows are billed at half price
-    assert d3["cost"] < sum(it["cost"] for it in read_draft(env["state"]["terms_draft"])["items"])
+    assert rep3.items_done == rep3.items_total and d3["mode"] == "batch" and d3["batch_id"] is None and d3["batch_ids"] == []
+    assert fake3.requests == [] and fake3.batches == {} and d3["cost"] == 0 and all(it["status"] == "cache_local" for it in d3["items"])
     with pytest.raises(StageError, match="unknown mode"):
         run(env, "terms", pilot=2, mode="nope", client=fake_client())
-    # budget: the high estimate of one item is a few cents; a budget below two items leaves items out
-    plan = run(env, "terms", dry_run=True, pilot=3, client=fake_client()).details["plan"]
-    rep4 = run(env, "terms", pilot=3, budget=plan["per_item_high"] * 1.5, client=fake_client())
+    # budget: the high estimate of one item is a few cents; a budget below two items leaves items out (uncached
+    # items — 4 pilot documents — so that the high estimates are not zero)
+    plan = run(env, "terms", dry_run=True, pilot=4, client=fake_client()).details["plan"]
+    assert plan["known_cache_hits"] == 0 and plan["per_item_high"] > 0
+    rep4 = run(env, "terms", pilot=4, budget=plan["per_item_high"] * 1.5, client=fake_client())
     d4 = read_draft(rep4.details["draft"])
     assert d4["n_items"] == 1 and len(d4["budget_stop"]) == plan["items"] - 1 and any("budget" in w for w in rep4.warnings)
+    assert [it["status"] for it in d4["items"]] == ["ok"] and rep4.items_done == 1
     rep5 = run(env, "terms", pilot=3, limit=2, client=fake_client())
     assert rep5.items_total == 2 and read_draft(rep5.details["draft"])["n_items"] == 2
     # a refused item is counted as failed, the rest of the draft stands
-    first = sorted(run_stage(project, "terms", dry_run=True, pilot=3, client=fake_client()).details["fingerprints"])[0]
+    first = sorted(run_stage(project, "terms", dry_run=True, pilot=5, client=fake_client()).details["fingerprints"])[0]
     bad = FakeChatClient({"terms_extract": answer_terms, first: lambda r: ChatResponse(text="", stop_reason="refusal")})
-    rep6 = run(env, "terms", pilot=3, client=bad)
+    rep6 = run(env, "terms", pilot=5, client=bad)
     assert rep6.items_failed == 1 and rep6.items_done == rep6.items_total - 1 and any("refused" in w for w in rep6.warnings)
     d6 = read_draft(rep6.details["draft"])
     assert sum(1 for it in d6["items"] if it["status"] == "refused") == 1 and "## Failed items" in open(rep6.details["report"], encoding="utf-8").read()
+    store = LlmStore.open(project.llm_db)
+    refused = [r for r in store.ledger_rows(run_id=d6["ledger_run_id"]) if r["status"] == "refused"]
+    store.close()
+    assert len(refused) == 1 and refused[0]["item_key"] == first and refused[0]["cost"] > 0     # a refusal is billed, never retried
+    bad2 = FakeChatClient({"terms_extract": answer_terms, first: lambda r: ChatResponse(text="", stop_reason="refusal")})
+    rep7 = run(env, "terms", pilot=5, client=bad2)
+    assert rep7.items_failed == 1 and [q.key for q in bad2.requests] == [first]                 # a refusal is not cached
 
 
 def test_merge_terms_then_concepts(env):
@@ -440,10 +502,20 @@ def test_cli_verbs(env, capsys):
     assert cli.main(["run", "terms", root, "--dry-run", "--pilot", "2"]) == 0
     out = capsys.readouterr().out
     assert "[terms] dry run" in out and "cost live:" in out and "cost batch:" in out and "pilot 2 documents" in out
-    # provider fake without canned answers: the default client answers "{}", the item fails validation, exit 2
-    assert cli.main(["run", "terms", root, "--pilot", "2", "--limit", "1"]) == 2
+    # provider fake without canned answers: the default client answers "{}", the item fails validation (after the
+    # one "return only the JSON object" retry), exit 2; a different model is a different request hash, so the
+    # answer cached by the earlier batch run of these items is not used
+    assert cli.main(["run", "terms", root, "--pilot", "2", "--limit", "1", "--model", "claude-haiku-5-5"]) == 2
     out = capsys.readouterr().out
-    assert "[terms] done 0/1" in out and "invalid" in out and "draft:" in out
+    assert "[terms] done 0/1" in out and "invalid" in out and "draft:" in out and "ledger_run_id: terms_r" in out
+    lrid = re.search(r"ledger_run_id: (\S+)", out).group(1)
+    assert cli.main(["cost", "report", root, "--run", lrid]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith(f"run {lrid}: stage terms, mode live") and "providers: fake claude-haiku-5-5 effort medium" in out
+    assert f"ledger (run {lrid}): 2 rows" in out and "fake\tterms\tterms_extract\t2\t0\t0\t0\t2\t0\t" in out    # two malformed attempts
+    assert cli.main(["cost", "report", root]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("ledger: ") and "cache: local hit rate" in out and "unknown spend: none" in out
     assert cli.main(["curate", "status", root]) == 0
     out = capsys.readouterr().out
     assert "concepts\tconfirmed" in out and "notice:" in out                        # newer terms drafts than term_tree's confirmation
@@ -467,7 +539,7 @@ def test_static_llm_stages_never_write_curated():
     """The new modules carry no curated writer (the runtime check runs inside `run` above)."""
     from pathlib import Path
     atlas = Path(cli.__file__).resolve().parent
-    for py in [atlas / "pipeline" / "llm_stage.py", atlas / "pipeline" / "llm_shim.py", atlas / "verify" / "qa.py",
-               *(atlas / "pipeline" / "stages").glob("*.py")]:
+    for py in [atlas / "pipeline" / "llm_stage.py", atlas / "verify" / "qa.py",
+               *(atlas / "llm").glob("*.py"), *(atlas / "pipeline" / "stages").glob("*.py")]:
         src = py.read_text(encoding="utf-8")
         assert "write_yaml" not in src and "write_confirmations" not in src and "confirm(" not in src, py

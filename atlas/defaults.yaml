@@ -22,6 +22,7 @@ llm:                                  # increment 4 §1.2: the providers the LLM
   max_tokens_cap: 65536               # the ×2 retry after `max_tokens` never exceeds this
   batch_default: true                 # stages run in --mode batch unless told otherwise (half price, asynchronous);
                                       # a provider without a batch API (DeepSeek) runs its share live
+  batch_poll_seconds: 30              # `atlas run <stage> --wait`: seconds between two polls of a running batch
   max_retries: 2                      # SDK-level retries of 429 / 5xx / connection errors (+ one outer attempt)
   refusal_fallback: true              # beta server-side refusal fallback (`fallbacks: "default"`), live calls only
   concurrency: 4

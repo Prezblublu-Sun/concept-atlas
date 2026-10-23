@@ -21,9 +21,8 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 
 from atlas.config import Project
-from atlas.pipeline import llm_shim as shim
-from atlas.pipeline.llm_shim import TaskResult
-from atlas.pipeline.llm_stage import Item, LlmStage, clean_text, fingerprint
+from atlas.llm.tasks import TaskResult
+from atlas.pipeline.llm_stage import Item, LlmStage, clean_text, draft_status, fingerprint
 from atlas.pipeline.runner import StageError
 from atlas.store.build import BuildStore
 from atlas.store.curated import curated_path, file_sha, read_curated
@@ -70,7 +69,6 @@ class ClassifyStage(LlmStage):
     needs_build = True
     accept_gate = True
     max_tokens = 400
-    out_low = 120
     caps = {"sids": MAX_SIDS}
 
     def prepare(self, project: Project, build: BuildStore | None = None, *, pilot: int | None = None,
@@ -87,7 +85,7 @@ class ClassifyStage(LlmStage):
             cats_by_dom.setdefault(str(c.get("domain")), []).append(str(c["id"]))
         block = scheme_block(domains, categories)
         n_examples = int(cfg(project, "examples", DEFAULTS["examples"]))
-        prompt_sha = shim.load_prompt(self.prompt_file).sha
+        prompt_sha = self.prompt_sha
         scope = build.concept_scope()
         ids = sorted(cid for cid, cs in scope.items() if cs["tiered"])
         if concept_ids:
@@ -113,7 +111,7 @@ class ClassifyStage(LlmStage):
                        "label": clean_text(c.get("label")) or cid, "n_examples": len(ex), "type": c.get("type") or "-",
                        "zh": clean_text(c.get("zh")) or "-"}
             item = Item(key=cid, payload=payload, meta={"concept_id": cid, "sids": [str(e["sid"]) for e in ex]},
-                        system_extra=(block,))
+                        context=(block,))
             fp = fingerprint(self.version, prompt_sha, item.content_sha)
             prev = done.get(cid)
             if prev and prev.get("fingerprint") == fp and not force and not concept_ids and isinstance((prev.get("detail") or {}).get("row"), dict):
@@ -150,9 +148,9 @@ class ClassifyStage(LlmStage):
                 continue
             fp = run["fingerprints"][it.key]
             if not r.ok:
-                stage_rows.append((it.key, "failed", fp, {"errors": list(r["errors"])[:5], "status": r["status"]}))
+                stage_rows.append((it.key, "failed", fp, {"errors": [r.error] if r.error else [], "status": draft_status(r)}))
                 continue
-            d = r["data"] or {}
+            d = r.data or {}
             dom, prim = str(d.get("domain")), str(d.get("primary"))
             sec = d.get("secondary")
             errors = []
@@ -163,8 +161,8 @@ class ClassifyStage(LlmStage):
             sids = [s for s in (d.get("sids") or []) if s in set(it.meta["sids"])]
             if not sids:
                 errors.append("no cited sid is an example sentence of the input")
-            if errors:
-                r["status"], r["errors"] = "invalid", errors
+            if errors:                       # the stage's own check failed: the item is `invalid` in the draft
+                r.status, r.error = "failed:invalid", "; ".join(errors)
                 stats["invalid"] += 1
                 stage_rows.append((it.key, "failed", fp, {"errors": errors, "status": "invalid"}))
                 continue

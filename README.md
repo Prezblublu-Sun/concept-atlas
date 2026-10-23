@@ -6,9 +6,11 @@ stable ids, in an append-only evidence store. Builds are disposable snapshots; y
 
 The toolkit counts and organises. It does not rate papers.
 
-Status: increment 2 (increment 1 = evidence store, reader with highlights, phrase search, notes; increment 2 =
-curated term system matched and counted on builds, thesis doctype with chapter units, UCL thesis subset,
-concept / framework / sub-domain views). See `docs/`.
+Status: increment 4 built, pilot not yet run (increment 1 = evidence store, reader with highlights, phrase search,
+notes; increment 2 = curated term system matched and counted on builds, thesis doctype with chapter units, UCL
+thesis subset, concept / framework / sub-domain views; increment 4 = the LLM layer and the curation stages
+`terms` → `concepts` → `scheme` → `classify` with drafts, gates, blind review, ledger and budgets — every test and
+every dry run so far ran without a model call). See `docs/`.
 
 ```
 pip install -e .[dev]
@@ -33,10 +35,16 @@ atlas fixture make --kind paper|thesis <dir>
 atlas ucl subset <ucl-root> [--inventory …] [--proximity …] [--pdf-dir …] [--target N]
 
 # LLM curation stages (increment 4): drafts in work/drafts/<stage>/<run>.yaml (+ <run>.report.md); stages never
-# write curated/ — only `curate merge` and `curate confirm` do. --dry-run prints items, tokens and low/high cost
-# (live and batch) without any call; --pilot N limits a run (terms/scheme: N documents, concepts/classify: N items);
-# a full run of terms / classify needs a passing blind review for the same task + prompt (atlas qa …).
-atlas run terms <project-dir> [--dry-run] [--pilot N] [--mode live|batch] [--budget X] [--wait] [--limit N] [--seed S]
+# write curated/ — only `curate merge` and `curate confirm` do. --dry-run prints items, known cache hits, tokens and
+# low/high cost (live and batch, per provider of the split) without any call and without creating a file;
+# --pilot N limits a run (terms/scheme: N documents, concepts/classify: N items); --budget X stops before the high
+# estimate exceeds X; --model M uses another priced model for the primary provider (a different request hash);
+# a full run of terms / classify needs a passing blind review for the same task + prompt (atlas qa …). Every call
+# is metered in llm/llm.sqlite under the run id <stage>_<run> (`atlas cost report --run terms_r2026-10-23_001`),
+# an identical request is answered from the ledger (cache_local, free), and the run's settings are snapshotted in
+# work/runs/<stage>_<run>/llm_settings.json. --mode batch submits Message Batches and returns; run again with
+# --wait to collect them into the same draft.
+atlas run terms <project-dir> [--dry-run] [--pilot N] [--mode live|batch] [--budget X] [--wait] [--limit N] [--seed S] [--model M]
 atlas run concepts <project-dir> [--draft <terms draft>] …     # rules first, then concepts_merge; delta draft when concepts exist
 atlas run scheme <project-dir> …                               # domains / categories / sub-domains draft (gate: concepts)
 atlas run classify <project-dir> [--build <id>] [--force] …    # on an open build with assign done (gate: the scheme)
@@ -56,9 +64,10 @@ Bring your own LLM key: the Anthropic API by default, read from the environment 
 (deliberately not `ANTHROPIC_API_KEY`; on Windows the user / system environment in the registry is consulted
 too, so a freshly set variable works without restarting the host app). `llm:` in `project.yaml` selects the
 models, effort, budgets and the provider split (`split: {anthropic: 0.9, deepseek: 0.1}` sends a deterministic
-share of items to DeepSeek — key `RS_DEEPSEEK_API_KEY` — so the two can be compared; every ledger row names its
-provider and every run writes `work/runs/<run_id>/llm_settings.json`). Nothing is sent anywhere until you run an
-LLM stage or `atlas llm ping`, every call is metered, dry runs (`--dry-run`) never call a provider, and setting
+share of items to DeepSeek — key `RS_DEEPSEEK_API_KEY` — so the two can be compared; a stage refuses to start when a
+provider of the split has no key, so either set both keys or set `split: {anthropic: 1}`; every ledger row names
+its provider and every run writes `work/runs/<run_id>/llm_settings.json`). Nothing is sent anywhere until you run
+an LLM stage or `atlas llm ping`, every call is metered, dry runs (`--dry-run`) never call a provider, and setting
 `ATLAS_LLM_NO_NETWORK=1` makes every provider refuse (the test suite runs that way). Corpus text, databases and
 keys never enter this repository.
 

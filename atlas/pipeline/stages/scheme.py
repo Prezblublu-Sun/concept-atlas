@@ -25,7 +25,7 @@ from atlas.config import Project
 from atlas.core.ids import slug
 from atlas.core.matcher import form_keys, norm_key
 from atlas.core.sample import pilot_docs
-from atlas.pipeline.llm_shim import TaskResult
+from atlas.llm.tasks import TaskResult
 from atlas.pipeline.llm_stage import Item, LlmStage, clean_text, newest_draft, read_draft
 from atlas.pipeline.runner import StageError
 from atlas.store.build import BuildStore, list_build_dirs, read_manifest
@@ -132,9 +132,8 @@ class SchemeStage(LlmStage):
     requires: tuple[str, ...] = ()
     gate: tuple[str, ...] = ("concepts",)
     max_tokens = 8000
-    out_low = 3000
-    caps = {"domains": 8, "categories": 80, "subdomains": 40, "subdomains.anchors": 12, "subdomains.groups": 4,
-            "subdomains.evidence_docs": 5}
+    caps = {"domains": 8, "categories": 80, "subdomains": 40, "subdomains[].anchors": 12, "subdomains[].groups": 4,
+            "subdomains[].evidence_docs": 5}
 
     def prepare(self, project: Project, build=None, *, pilot: int | None = None, seed: int | None = None, **_) -> dict:
         data = read_curated(project.curated_dir, "concepts") or {}
@@ -186,7 +185,7 @@ class SchemeStage(LlmStage):
 
     def finish(self, ctx: dict, items: Sequence[Item], results: Mapping[str, TaskResult], run: dict) -> dict:
         res = results.get("scheme")
-        data = (res["data"] if res and res.ok else None) or {}
+        data = (res.data if res and res.ok else None) or {}
         known = set(items[0].meta["concept_ids"]) if items else set()
         known_docs = set(items[0].meta["doc_ids"]) if items else set()
         stats: Counter = Counter()

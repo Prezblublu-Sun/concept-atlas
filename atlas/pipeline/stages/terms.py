@@ -26,7 +26,7 @@ from collections.abc import Mapping, Sequence
 from atlas.config import Project
 from atlas.core.matcher import norm_key
 from atlas.core.sample import CHUNK_SIZE, DEFAULT_STRATA, TERM_TYPES, chunk_rows, composition, pilot_docs, stratified_sample
-from atlas.pipeline.llm_shim import TaskResult
+from atlas.llm.tasks import TaskResult
 from atlas.pipeline.llm_stage import Item, LlmStage, clean_text
 from atlas.pipeline.runner import StageError
 from atlas.store.evidence import EvidenceStore
@@ -67,8 +67,7 @@ class TermsStage(LlmStage):
     gate: tuple[str, ...] = ()
     accept_gate = True
     max_tokens = 2000
-    out_low = 600
-    caps = {"terms": MAX_TERMS, "terms.sids": MAX_SIDS}
+    caps = {"terms": MAX_TERMS, "terms[].sids": MAX_SIDS}
 
     def prepare(self, project: Project, build=None, *, pilot: int | None = None, seed: int | None = None,
                 doc_ids: Sequence[str] | None = None, sample_n: int | None = None, per_doc_cap: int | None = None,
@@ -143,7 +142,7 @@ class TermsStage(LlmStage):
             if r is None or not r.ok:
                 continue
             allowed = set(it.meta["sids"])
-            for t in (r["data"] or {}).get("terms") or []:
+            for t in (r.data or {}).get("terms") or []:
                 term = clean_text(t.get("term"))
                 if not term:
                     stats["dropped_empty"] += 1

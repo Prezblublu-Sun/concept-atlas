@@ -8,7 +8,9 @@ atlas run ingest <root> [--reextract] [--limit N] [--doc-ids a,b] [--workers 1]
 atlas run match|assign|finish <root> [--build <id>] [--doc-ids a,b] [--workers N] [--force]
 atlas run terms|concepts|scheme|classify <root> [--dry-run] [--pilot N] [--mode live|batch] [--budget X] [--wait]
                                                [--limit N] [--seed S] [--model M] [--draft file] [--doc-ids …]
-                                               [--concept-ids …] [--build <id>] [--force]   LLM stages (increment 4)
+                                               [--concept-ids …] [--build <id>] [--force]   LLM stages (increment 4);
+                                               every call is metered in llm/llm.sqlite under run id <stage>_<run>
+                                               (`atlas cost report --run terms_r2026-10-23_001`)
 atlas build new|list|status|promote|all|upgrade <root> [<id>] [--note …] [--workers N]
 atlas curate confirm <root> <name> | atlas curate status <root> | atlas curate merge <root> <draft> [--domain DOM_x]
 atlas qa sample <root> --stage terms|classify [--n 50] [--seed 1] [--run id]   blind-review sheet → evalset/
@@ -97,7 +99,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--budget", type=float, metavar="X", help="stop before the high estimate exceeds X (provider currency)")
     g.add_argument("--wait", action="store_true", help="batch mode: poll until the batch ended, then finish the draft")
     g.add_argument("--seed", type=int, help="sampling seed (terms)")
-    g.add_argument("--model", help="model for this run / estimate (default: llm.model, else claude-opus-5-5)")
+    g.add_argument("--model", help="the primary provider's model for this run / estimate (a different model is a "
+                                   "different request hash; default: llm.model)")
     g.add_argument("--draft", help="concepts: a terms draft to take candidates from")
     g.add_argument("--concept-ids", help="classify: comma-separated concept ids")
 
@@ -312,9 +315,11 @@ def _cmd_run(a: argparse.Namespace) -> int:
                 print(f"  warning: {w}")
             return EXIT_OK
         rc = _print_report(report)
-        for key in ("run_id", "draft", "report", "batch_id", "cost", "currency"):
+        for key in ("run_id", "ledger_run_id", "draft", "report", "settings", "batch_id", "cost", "currency"):
             if report.details.get(key) is not None:
                 print(f"  {key}: {report.details[key]}")
+        for p, v in sorted((report.details.get("providers") or {}).items()):
+            print(f"  {p}: {v['items']} items, {v['cost']} {report.details.get('currency') or ''}")
         return rc
     return _print_report(report)
 

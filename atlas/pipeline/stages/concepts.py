@@ -31,7 +31,7 @@ from pathlib import Path
 from atlas.config import Project
 from atlas.core.matcher import DEFAULT_PATTERNS, form_keys, norm_key
 from atlas.core.sample import TERM_TYPES
-from atlas.pipeline.llm_shim import TaskResult
+from atlas.llm.tasks import TaskResult
 from atlas.pipeline.llm_stage import Item, LlmStage, clean_text, drafts_dir, read_draft
 from atlas.pipeline.runner import StageError
 from atlas.store.curated import read_curated
@@ -255,9 +255,8 @@ class ConceptsStage(LlmStage):
     requires: tuple[str, ...] = ()
     gate: tuple[str, ...] = ()
     max_tokens = 3000
-    out_low = 900
-    caps = {"concepts": 40, "deltas": 40, "concepts.forms": 16, "concepts.case_forms": 8, "concepts.sids": 3,
-            "concepts.merged_terms": 20}
+    caps = {"concepts": 40, "deltas": 40, "concepts[].forms": 16, "concepts[].case_forms": 8, "concepts[].sids": 3,
+            "concepts[].merged_terms": 20}
 
     def prepare(self, project: Project, build=None, *, pilot: int | None = None, seed: int | None = None,
                 draft: str | Path | None = None, **_) -> dict:
@@ -397,7 +396,7 @@ class ConceptsStage(LlmStage):
             item_terms = {norm_key(t) or t.lower(): t for t in it.meta["terms"]}
             allowed = set(it.meta["sids"])
             claimed: set[str] = set()
-            for c in (r["data"] or {}).get("concepts") or []:
+            for c in (r.data or {}).get("concepts") or []:
                 merged = []
                 for t in c.get("merged_terms") or []:
                     k = norm_key(str(t)) or str(t).lower()
@@ -462,7 +461,7 @@ class ConceptsStage(LlmStage):
                                  "added_in": run["run_id"], "note": clean_text(c.get("note")), "merged_terms": merged,
                                  "example_sids": sids})
                 claimed.update(norm_key(t) or t.lower() for t in merged)
-            for d in (r["data"] or {}).get("deltas") or []:
+            for d in (r.data or {}).get("deltas") or []:
                 action = str(d.get("action") or "")
                 if action not in ACTIONS:
                     continue
