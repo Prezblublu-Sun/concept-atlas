@@ -1,7 +1,7 @@
 """PyMuPDF adapter: page text with stable offsets, metadata, page rendering with highlights.
 
 Implemented by: increment 1, agent "ingest". Port the proven highlight logic from
-H:/UCL_theses/2610 opt/术语阅览系统_v3_2026-10-20/server.py (render_page: try the phrase, then hyphen/space
+the previous viewer's server.py (render_page: try the phrase, then hyphen/space
 variants, then the longest word ≥ 3 chars; yellow highlight annots; X-Hit-Y as the first hit's relative y).
 
 Offsets: `extract_pages` returns `page.get_text('text')` with only '\\x00' and '\\r' removed; every (cstart, cend)

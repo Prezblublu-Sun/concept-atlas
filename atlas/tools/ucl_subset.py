@@ -26,13 +26,16 @@ Writes `manifest.csv`, `project.yaml` (doc_type thesis, pdf_dir = the UCL pdf fo
 from __future__ import annotations
 
 import csv
+import os
 import re
 from collections import Counter
 from pathlib import Path
 
 import yaml
 
-DEFAULT_BASE = Path("H:/Weikang/01_Literature/UCL_theses")
+#: Folder holding the inventory/proximity CSVs and the pdf/ tree when the paths are not given explicitly
+#: (environment variable ATLAS_UCL_BASE); there is no built-in default.
+BASE_ENV = "ATLAS_UCL_BASE"
 INVENTORY = "UCL_theses_inventory.csv"
 PROXIMITY = "UCL_theses_by_proximity.csv"
 ENGINEERING = "工程 / 计算机 / 机器学习"
@@ -161,7 +164,11 @@ def make_subset(root: str | Path, inventory: str | Path | None = None, proximity
     """Write manifest.csv, project.yaml (unless present) and subset_report.md under `root`; returns
     {n, manifest, report, missing, per_rule, titles_blanked}."""
     root = Path(root).resolve()
-    base = DEFAULT_BASE
+    base_env = os.environ.get(BASE_ENV)
+    if not base_env and not (inventory and proximity and pdf_dir):
+        raise ValueError(f"give --inventory, --proximity and --pdf-dir, or set {BASE_ENV} to the folder that holds "
+                         f"{INVENTORY}, {PROXIMITY} and pdf/")
+    base = Path(base_env) if base_env else Path(".")
     inv_path = Path(inventory) if inventory else base / INVENTORY
     prox_path = Path(proximity) if proximity else base / PROXIMITY
     pdf_root = Path(pdf_dir) if pdf_dir else base / "pdf"

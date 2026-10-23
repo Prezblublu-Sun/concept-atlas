@@ -1,9 +1,9 @@
 """Sentence splitting, heading detection, rule tags and garbage flags (pure).
 
 Implemented by: increment 1, agent "core". Port the proven rules from the previous system:
-  - sentence regex and tag regexes: H:/UCL_theses/2610 opt/术语阅览系统_v3_2026-10-20/_scripts/concept_pipeline.py
+  - sentence regex and tag regexes: the previous viewer's concept_pipeline.py
     (TAGS, CAPTION, REFLIKE, AFFIL, garbage())
-  - matcher sentence split: H:/UCL_theses/2610 opt/术语阅览系统_v3_2026-10-20/matcher.py (SENT)
+  - matcher sentence split: the previous viewer's matcher.py (SENT)
 Improve where the old rules were known to fail: 'Fig. 3', 'et al.', 'e.g.', 'i.e.', 'vs.', 'Eq.', 'No.', 'approx.',
 decimals '3.5', initials 'J. Smith', and 'Ref.' must not split a sentence.
 

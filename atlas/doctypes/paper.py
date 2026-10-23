@@ -1,7 +1,7 @@
 """Journal/conference paper (IMRaD): one document unit, non-body masks, section marks, topic fields.
 
 Implemented by: increment 1, agent "doctypes". Port the proven filters from the previous system:
-  H:/UCL_theses/2610 opt/术语整理_v2_2026-10-17/_scripts/rules_v2.py  (acknowledgement/declaration blocks,
+  the previous system's rules_v2.py (acknowledgement/declaration blocks,
   page-aware header/footer detection, affiliation lines before the Introduction, publication-info lines,
   residual reference lines) — keep their behaviour and known fixes (e.g. 'Funding:' on page 1 is pub_info/
   declaration only if it starts with an uppercase word or digit; header/footer = a normalised line that appears
