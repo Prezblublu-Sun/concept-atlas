@@ -182,9 +182,10 @@ def compute_importance(store: BuildStore, params: dict | None = None) -> list[di
 
 class MatchStage:
     name = "match"
-    version = "match4"      # match1 summed meta abstract/keywords with the same sentences; match2 falls back instead;
+    version = "match5"      # match1 summed meta abstract/keywords with the same sentences; match2 falls back instead;
                             # match3 writes the denormalised occurrence columns (build schema 2); match4 tiers only
-                            # the 概念 items (tier NULL for phrases / journal names, as the previous system)
+                            # the 概念 items (tier NULL for phrases / journal names, as the previous system);
+                            # match5 = matcher m3 (hyphen readings; the item fingerprint prefix is m3)
     llm = False
     requires: tuple[str, ...] = ()
     gate: tuple[str, ...] = ("concepts", "patterns")

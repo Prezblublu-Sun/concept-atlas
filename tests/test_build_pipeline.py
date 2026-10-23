@@ -134,8 +134,8 @@ def test_build_all_and_results(built):
     assert m["status"] == "finished" and len(m["sha256"]) == 64 and m["stages"]["match"]["status"] == "done"
     assert {"build_id", "created", "status", "project", "evidence_sha_at_pin", "curated", "docs", "sentences", "stages"} <= set(m)
     assert len(m["evidence_sha_at_pin"]) == 64 and m["curated"] == before and m["docs"] == 9
-    assert m["stages"]["match"]["version"] == "match4" and m["stages"]["assign"]["version"] == "assign3"
-    assert m["stages"]["match"]["fingerprint"].startswith("m2:")
+    assert m["stages"]["match"]["version"] == "match5" and m["stages"]["assign"]["version"] == "assign3"
+    assert m["stages"]["match"]["fingerprint"].startswith("m3:")
     report = (project.builds_dir / bid / "report.md").read_text(encoding="utf-8")
     assert report.startswith(f"# Build {bid}") and "## Tier histogram" in report and "## Checks" in report
     assert "| all |" in report and "C_micromotion" in report and "ORT-MM" in report

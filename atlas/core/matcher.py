@@ -6,13 +6,24 @@ Implemented by: increment 2 (derived layer).
 Forms mode (`mode: forms`):
 - tokens: `TOKEN = [A-Za-z0-9]*[A-Za-z][A-Za-z0-9]*` over a per-character NFKC-folded copy of the sentence
   (`fold_map`: ligatures expanded, mathematical italics and ℓ folded to ASCII letters, combining marks dropped,
-  '-' replaced by a space) whose offset map takes token spans back to the stored sentence text; keys are
-  lower-cased tokens joined by one space;
+  hyphens replaced by a space) whose offset map takes token spans back to the stored sentence text; keys are
+  lower-cased tokens joined by one space (`norm_key`, applied to the curated forms as well);
+- hyphen readings (m3): a word with an intra-word hyphen ('peri-prosthetic', 'co‑kriging' — hyphen-minus, U+2010 or
+  U+2011 directly between two tokens, see `_HYPHENS`) is read both ways, as the split tokens ('peri', 'prosthetic')
+  and as the joined token ('periprosthetic'), so a form written either way matches text written either way; the
+  curated forms are folded the same way (`form_keys`: 'co-kriging' gives the keys 'co kriging' and 'cokriging';
+  `case_key`: the case form 'micro-CT' is the case key 'microCT', matched against a token and against a
+  hyphen-joined word — the joined reading of case forms is limited to case forms written with a hyphen, since a
+  hyphen between abbreviations usually is a relation: a plain case form 'EI' does not match 'E-I').
+  Per start token and concept the longest token span wins and, on a tie, the reading with fewer joins (the split
+  reading, whose `form` is what m2 recorded), then a case-insensitive key over a case form; so a span is one
+  occurrence per concept; matches of different concepts through the two readings are both kept and nest as
+  usual. Dashes (en/em) stay separators;
 - `forms + gen_forms` are case-insensitive keys; `case_forms` are case-sensitive single tokens (abbreviations);
   an all-caps case form with <= `short_caps_max_letters` letters (after a trailing 's') does not match inside a
   run of all-caps words (`in_caps_run`: both neighbouring alphabetic tokens all-caps with >= 2 letters);
-- single-token keys obey `bad_next` / `bad_prev` and the stem-caps rule (an all-caps token longer than 2 letters
-  never matches `stem` / `stems`);
+- single-word keys obey `bad_next` / `bad_prev` (the neighbours of the whole word, joined or not) and the stem-caps
+  rule (an all-caps token longer than 2 letters never matches `stem` / `stems`);
 - longest match wins per start token and concept; overlapping matches of different concepts are both kept; a
   match fully inside a longer match of another concept gets `nested_in` = that concept (v2 "body_nested").
 
@@ -27,13 +38,17 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 
-MATCHER_VERSION = "m2"       # bump when any rule in this module changes
+MATCHER_VERSION = "m3"       # bump when any rule in this module changes
                              # m2: forms mode tokenises a per-character NFKC-folded copy of the stored text
                              # (ligatures ﬁ/ﬂ, ℓ, mathematical italics, combining marks) with an offset map,
                              # as the previous system scanned NFKC-normalised text
+                             # m3: an intra-word hyphen is read both ways (split tokens and joined token) on the
+                             # text side and in the curated forms (the previous system's counting joined every
+                             # line-end hyphen, which the stored text keeps when the document writes the word with
+                             # the hyphen); U+2010 / U+2011 count as hyphens
 
 DEFAULT_TOKEN_REGEX = r"[A-Za-z0-9]*[A-Za-z][A-Za-z0-9]*"
 DEFAULT_PATTERNS: dict = {
@@ -47,6 +62,14 @@ DEFAULT_PATTERNS: dict = {
     "stem_caps_words": ["stem", "stems"],
 }
 
+#: Hyphens of forms mode: hyphen-minus, hyphen (U+2010) and non-breaking hyphen (U+2011, which NFKC folds to U+2010).
+#: They split a word into tokens and, directly between two tokens, give the joined reading. En/em dashes are not
+#: hyphens ('bone–implant' is two words, 'stress–strain' a range).
+_HYPHENS = frozenset("-\u2010\u2011")
+_HYPHEN_TR = {ord(h): " " for h in _HYPHENS}
+#: A hyphen directly between two token characters (the intra-word hyphen of a curated form).
+_INTRA_HYPHEN_RE = re.compile("(?<=[A-Za-z0-9])[-\u2010\u2011](?=[A-Za-z0-9])")
+
 _QUOTES_RE = re.compile(r"[’‘'`´]")
 _DASHES = set("-‐‑‒–—/")
 _SPACED = set(":<>=±")
@@ -57,13 +80,13 @@ _FOLD_EXTRA = {"ℓ": "l"}
 
 def fold_map(s: str | None) -> tuple[str, list[int]]:
     """(folded text, map) for forms-mode tokenising: every character NFKC-normalised (ﬁ → fi, 𝐼 → I, ¼ → 1⁄4),
-    `ℓ` → l, combining marks dropped, '-' → ' '; map[i] is the offset in `s` of the character that produced
-    folded[i], so token spans index the stored text (a ligature's two letters both map to its one offset; the end
-    of a span is `map[last] + 1`)."""
+    `ℓ` → l, combining marks dropped, hyphens (`_HYPHENS`) → ' '; map[i] is the offset in `s` of the character that
+    produced folded[i], so token spans index the stored text (a ligature's two letters both map to its one offset;
+    the end of a span is `map[last] + 1`)."""
     out: list[str] = []
     idx: list[int] = []
     for i, ch in enumerate(s or ""):
-        if ch == "-":
+        if ch in _HYPHENS:
             out.append(" ")
             idx.append(i)
             continue
@@ -90,11 +113,38 @@ def tokenizer(pattern: str | None = None) -> re.Pattern[str]:
 
 
 def norm_key(label: str | None, token_re: re.Pattern[str] | None = None) -> str:
-    """Lower-case key of a label or form, tokenised exactly like the text: NFKC → ’→' → "'s\\b"→"s" → tokens."""
+    """Lower-case key of a label or form, tokenised exactly like the text: NFKC → ’→' → "'s\\b"→"s" → hyphens to
+    spaces → tokens."""
     rx = token_re or tokenizer()
     s = unicodedata.normalize("NFKC", label or "").replace("’", "'")
     s = re.sub(r"'s\b", "s", s)
-    return " ".join(t.lower() for t in rx.findall(s.replace("-", " ")))
+    return " ".join(t.lower() for t in rx.findall(s.translate(_HYPHEN_TR)))
+
+
+def form_keys(form: str | None, token_re: re.Pattern[str] | None = None) -> list[str]:
+    """Keys of one curated form (`forms` / `gen_forms`): `norm_key(form)` and, when the form has an intra-word
+    hyphen, the key of the joined spelling as well ('co-kriging' → ['co kriging', 'cokriging'], 'state-of-the-art'
+    → ['state of the art', 'stateoftheart']); the text side reads a hyphenated word both ways, so a form written
+    either way matches text written either way."""
+    s = unicodedata.normalize("NFKC", form or "")
+    split = norm_key(s, token_re)
+    keys = [split] if split else []
+    if _INTRA_HYPHEN_RE.search(s):
+        joined = norm_key(_INTRA_HYPHEN_RE.sub("", s), token_re)
+        if joined and joined not in keys:
+            keys.append(joined)
+    return keys
+
+
+def case_key(form: str | None) -> str:
+    """Key of one curated case form: the form with its intra-word hyphens removed ('micro-CT' → 'microCT'), matched
+    case-sensitively against a token and, for a case form written with a hyphen, against a hyphen-joined word."""
+    return _INTRA_HYPHEN_RE.sub("", unicodedata.normalize("NFKC", form or "").strip())
+
+
+def has_intra_hyphen(form: str | None) -> bool:
+    """True when the form has a hyphen directly between two token characters ('micro-CT', 'co-kriging')."""
+    return bool(_INTRA_HYPHEN_RE.search(unicodedata.normalize("NFKC", form or "")))
 
 
 def in_caps_run(otoks: Sequence[str], i: int) -> bool:
@@ -162,9 +212,10 @@ class Matcher:
         self.stem_caps_rule = bool(p.get("stem_caps_rule", True))
         self.stem_words = frozenset(p.get("stem_caps_words") or ("stem", "stems"))
         self.key2ids: dict[str, list[str]] = {}
-        self.case2ids: dict[str, list[str]] = {}
+        self.case2ids: dict[str, list[str]] = {}          # case key -> ids, matched against one token
+        self.case_joined2ids: dict[str, list[str]] = {}   # the case forms written with a hyphen ('micro-CT'):
+                                                          # matched against hyphen-joined words as well
         self.literals: list[tuple[str, re.Pattern[str], str]] = []
-        self.first: dict[str, int] = {}
         for c in concepts:
             cid = str(c["id"])
             if c.get("merged_into"):
@@ -176,16 +227,23 @@ class Matcher:
                     self.literals.append((cid, re.compile(rx), str(c.get("probe") or "")))
                 continue
             for k in list(c.get("forms") or []) + list(c.get("gen_forms") or []):
-                k = str(k).strip()
-                if k and cid not in self.key2ids.setdefault(k, []):
-                    self.key2ids[k].append(cid)
+                for key in form_keys(str(k), self.token_re):
+                    if cid not in self.key2ids.setdefault(key, []):
+                        self.key2ids[key].append(cid)
             for k in c.get("case_forms") or []:
-                k = str(k).strip()
-                if k and cid not in self.case2ids.setdefault(k, []):
-                    self.case2ids[k].append(cid)
+                key = case_key(str(k))
+                if not key:
+                    continue
+                if cid not in self.case2ids.setdefault(key, []):
+                    self.case2ids[key].append(cid)
+                if has_intra_hyphen(str(k)) and cid not in self.case_joined2ids.setdefault(key, []):
+                    self.case_joined2ids[key].append(cid)
+        #: proper word-prefixes of the multi-word keys: a candidate key is extended only while it is one of them
+        self.prefixes: set[str] = set()
         for k in self.key2ids:
             t = k.split()
-            self.first[t[0]] = max(self.first.get(t[0], 0), len(t))
+            for n in range(1, len(t)):
+                self.prefixes.add(" ".join(t[:n]))
         self.short_caps = {k for k in self.case2ids
                            if k.isupper() and len(k.rstrip("s")) <= self.short_caps_max}
 
@@ -196,43 +254,77 @@ class Matcher:
         return cls(concepts, patterns)
 
     # ---- forms ----------------------------------------------------------------------------------------------
+    def _single_ok(self, w: str, orig: str, i: int, end: int, toks: Sequence[str]) -> bool:
+        """The single-word rules for the word `w` (`orig` in the text's case) spanning tokens [i, end): `bad_next` /
+        `bad_prev` look at the tokens after and before the whole word; the stem-caps rule."""
+        nxt = toks[end] if end < len(toks) else ""
+        prv = toks[i - 1] if i else ""
+        if nxt in self.bad_next.get(w, ()) or prv in self.bad_prev.get(w, ()):
+            return False
+        if self.stem_caps_rule and orig.isupper() and len(orig) > 2 and w in self.stem_words:
+            return False
+        return True
+
     def _forms(self, text: str) -> tuple[list[tuple[int, int, str, str]], list[tuple[int, int]]]:
         """((token index, n tokens, concept id, key) for every forms/case match, token spans into `text`)."""
         raw, idx = fold_map(text)
-        spans = [(idx[m.start()], idx[m.end() - 1] + 1) for m in self.token_re.finditer(raw)]
-        otoks = [raw[m.start():m.end()] for m in self.token_re.finditer(raw)]
+        ms = list(self.token_re.finditer(raw))
+        spans = [(idx[m.start()], idx[m.end() - 1] + 1) for m in ms]
+        otoks = [m.group(0) for m in ms]
         toks = [t.lower() for t in otoks]
         n_tok = len(toks)
-        found: set[tuple[int, int, str, str]] = set()
+        # hyphenated[k]: tokens k and k+1 are one hyphenated word ('peri-prosthetic'): exactly one folded character
+        # between them, standing for a hyphen of the stored text (fold_map writes ' ' for it)
+        hyphenated = [k + 1 < n_tok and ms[k + 1].start() == ms[k].end() + 1 and text[idx[ms[k].end()]] in _HYPHENS
+                      for k in range(n_tok)]
+
+        def words(k: int) -> Iterator[tuple[str, str, int, int]]:
+            """Readings of the word starting at token k: (key word, word in the text's case, end token, joins) —
+            the token alone, then every hyphen-joined extension ('peri', 'periprosthetic')."""
+            lo, orig, j = toks[k], otoks[k], k
+            yield lo, orig, k + 1, 0
+            while hyphenated[j]:
+                j += 1
+                lo += toks[j]
+                orig += otoks[j]
+                yield lo, orig, j + 1, j - k
+
+        # (start, concept) -> (n tokens, -joins, key kind, key): the longest span wins, then the reading with fewer
+        # joins (the split one), then a case-insensitive key over a case form (m2 left that tie to set order)
+        best: dict[tuple[int, str], tuple[int, int, int, str]] = {}
+
+        def record(i: int, end: int, cid: str, key: str, joins: int, kind: int) -> None:
+            cand = (end - i, -joins, kind, key)
+            if cand > best.get((i, cid), (0, 0, 0, "")):
+                best[(i, cid)] = cand
+
         for i in range(n_tok):
-            mx = self.first.get(toks[i], 0)
-            key = ""
-            for n in range(1, min(mx, n_tok - i) + 1):
-                key = toks[i] if n == 1 else key + " " + toks[i + n - 1]
-                ids = self.key2ids.get(key)
+            stack: list[tuple[int, str, int]] = [(i, "", 0)]          # (next token, key so far, joins so far)
+            while stack:
+                k, key, joins = stack.pop()
+                for lo, orig, end, j in words(k):
+                    key2 = lo if not key else key + " " + lo
+                    ids = self.key2ids.get(key2)
+                    cont = key2 in self.prefixes
+                    if not ids and not cont:
+                        continue
+                    if ids and (key or self._single_ok(lo, orig, i, end, toks)):
+                        for cid in ids:
+                            record(i, end, cid, key2, joins + j, 1)
+                    if cont and end < n_tok:
+                        stack.append((end, key2, joins + j))
+            # case forms: the token itself; a hyphen-joined word only for the case forms written with a hyphen
+            # ('micro-CT' → 'microCT'; a plain 'EI' must not match 'E-I', where the hyphen is a relation)
+            for lo, orig, end, j in words(i):
+                ids = (self.case2ids if j == 0 else self.case_joined2ids).get(orig)
                 if not ids:
                     continue
-                if n == 1:
-                    w = toks[i]
-                    nxt = toks[i + 1] if i + 1 < n_tok else ""
-                    prv = toks[i - 1] if i else ""
-                    if nxt in self.bad_next.get(w, ()) or prv in self.bad_prev.get(w, ()):
-                        continue
-                    if self.stem_caps_rule and otoks[i].isupper() and len(otoks[i]) > 2 and w in self.stem_words:
-                        continue
+                if orig in self.short_caps and in_caps_run([otoks[i - 1] if i else "", orig,
+                                                            otoks[end] if end < n_tok else ""], 1):
+                    continue
                 for cid in ids:
-                    found.add((i, n, cid, key))
-            ids = self.case2ids.get(otoks[i])
-            if ids and not (otoks[i] in self.short_caps and in_caps_run(otoks, i)):
-                for cid in ids:
-                    found.add((i, 1, cid, otoks[i]))
-        # longest match per (start token, concept)
-        best: dict[tuple[int, str], tuple[int, str]] = {}
-        for i, n, cid, key in found:
-            cur = best.get((i, cid))
-            if cur is None or n > cur[0]:
-                best[(i, cid)] = (n, key)
-        out = [(i, n, cid, key) for (i, cid), (n, key) in best.items()]
+                    record(i, end, cid, orig, j, 0)
+        out = [(i, n, cid, key) for (i, cid), (n, _, _, key) in best.items()]
         out.sort()
         return out, spans
 
