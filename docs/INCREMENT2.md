@@ -194,6 +194,40 @@ gc rules on the fixture corpus (`tests/test_gc.py`: three generations, a pinning
 VACUUM + FTS rebuild, idempotence, CLI), the stats cache invalidation and the old-schema refusal
 (`tests/unit/test_service_cache.py`).
 
-femstem after this work: see the measurements below (filled in by the run of 2026-10-23).
+**femstem measurements (2026-10-23, build b2026-10-23_001: matcher m3 / match5 / assign3, schema 2).**
 
-MEASUREMENTS_PLACEHOLDER
+Evidence file: 1,412 MB with three extraction generations → `atlas evidence gc --vacuum` removed the 3,073
+superseded extractions (seg2/seg3/seg4/seg5) → 1,048 MB (VACUUM 58 s, FTS rebuild 19 s); only the current
+generation (2,545 extractions, 1,228,662 sentences) remains and both kept builds pin it.
+
+Route latency (curl `time_total`, localhost, 61 GB RAM machine, H: hard disk). "Before" = the increment-2 code
+as merged (65164ad), first request after a server start versus a repeated request; "after" = the same requests
+on the performance code with the rebuilt build. A reboot-cold first touch could not be reproduced without
+administrator rights (the OS file cache held the files after `gc`/`build`), so "after, first" is the first touch
+of a fresh process on ids/phrases not requested before; `serve --prewarm` (default) makes the first touch after a
+reboot a sequential read of ~1.3 GB (≈ 10 s on this disk) instead of minutes of seeks.
+
+| route | before, first | before, repeat | after, first | after, repeat |
+|---|---|---|---|---|
+| `info` | 61.9 s | 0.56 s | 0.012 s | 0.002 s |
+| `concepts?sort=papers` | 0.07 s | 0.005 s | 0.006 s | 0.005 s |
+| `concepts/{id}` (C_micromotion / C_kriging / C_stress) | 15.5 / 9.9 s | 0.36 s | 0.028 s | 0.024 s |
+| `concepts/{id}/sentences?limit=50` | 23.4 / 10.8 s | 0.12 s | 0.006 s | 0.003 s |
+| `search?phrase=stress+shielding` | 39.0 s | 0.18 s | 0.034 s (bone density) | 0.030 s |
+| `search?phrase=finite+element` (≈ 200 k matches) | 50.9 s | — | 0.147 s | 0.15 s |
+| `search?phrase=the` (623 k matches, worst case) | — | — | 1.24 s | 1.28 s |
+| `framework/terms` (390 KB) | 0.030 s | — | 0.013 s | 0.011 s |
+| `docs?limit=50` | 0.30 s | — | 0.007 s | 0.005 s |
+
+Every contract route answers in ≤ 0.16 s except the 623 k-match phrase (1.3 s, capped candidate set of 50,000
+joined rows, `total` counted over every match and `listed` reported).
+
+Fidelity of the new build against v3 (all 1,282 concepts with ≥ 5 papers in v3 scope 全库, `importance.papers`
+scope `all`): 77 % within ±5 %, tier agreement 97 %, median deviation −2.8 % (every tier −2.4 … −3.1 %). The
+residual is a definition difference, not a matcher one: the new section labeller keeps affiliations, running
+headers, acknowledgements and reference lists out of the body (v3 counted sentences there — e.g.
+`C_orthopedicsurgery` 216 → 149, mostly "Department of Orthopedic Surgery" lines; `C_biomechanics` 356 → 290,
+journal headers), and six scanned PDFs have no text layer in the new evidence. Over-counts come from the m3
+hyphen readings now matching in-line hyphenated spellings that v3 never matched (`micro-computed tomography`
+63 → 121, `multi-physics` 122 → 200, `peri-prosthetic bone` 121 → 138). Stage timings of the rebuild: new 35 s,
+match 778 s (4 workers), assign 1.6 s, finish 45 s.
