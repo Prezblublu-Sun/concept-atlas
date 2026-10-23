@@ -170,7 +170,11 @@ What changed (in order of preference: query shape first, then less data, then th
      the page rows only; `examples()` goes `counts` → index → text; `page_concepts`, `rebuild_counts` and
      `recount_body` no longer join `build_sentences`. Stage version `match3`; `BUILD_SCHEMA_VERSION = 2`; a build
      file of schema 1 is refused for writing and the service answers 409 "promoted build … was written by an older
-     schema; rebuild it" for it. Migrations are now named per schema (`sql/migrations/user_2.sql`).
+     schema" for it — `atlas build upgrade <id>` (review fix) brings such a file to schema 2 in place in seconds
+     (the six `ALTER TABLE … ADD COLUMN`, the `UPDATE … FROM build_sentences`, the covering index, `user_version
+     = 2`, re-freeze with a new sha256 in manifest.json), the `/info` response carries `build_stale: {id, message}`
+     and the SPA header / concept pages name the build and the command instead of "no build"; prewarm skips a
+     build the service will not serve. Migrations are now named per schema (`sql/migrations/user_2.sql`).
 2. **Less data: `atlas evidence gc [--vacuum] [--dry-run] [--rebuild-fts]`** (`tools/gc.py`) deletes extractions
    that are not current, not pinned by any build folder's `build_docs` and not needed by a note / collection
    (`S:<sid>` refs whose sentence belongs to no kept extraction keep the newest extraction holding it): their
