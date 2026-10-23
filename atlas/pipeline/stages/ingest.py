@@ -40,6 +40,13 @@ unit_kind}]}} replaces the detected chapter units of that document (confidence 1
 part of extractor_version, so a changed override re-extracts). When a thesis has no chapter unit or any chapter's
 confidence is below the doctype's `min_chapter_confidence`, the stage warns and writes
 `work/drafts/chapters/<doc_id>.yaml` (the detected units with pages and reasons) for the user to correct.
+
+Titles: a manifest or PDF-metadata title that is junk (`atlas.core.text.junk_title`: empty, control characters,
+'Microsoft Word - …', a file name, fewer than three words, generic thesis words) never reaches document_meta.
+`atlas docs add` asks the doctype (`guess_title`, the first TITLE_GUESS_PAGES pages) before falling back to the
+largest-font line of page 1; the ingest stage repeats the guess on the extracted pages when the stored title is
+still junk and merges it into document_meta (`extra.title_source = doctype_guess`, `title_replaced` = the old
+value), so re-running ingest repairs titles stored by an earlier registration.
 """
 from __future__ import annotations
 
@@ -58,7 +65,7 @@ from atlas.config import Project
 from atlas.core.ids import canonical_json, extraction_id, norm, sentence_id, text_sha256, unit_id as make_unit_id
 from atlas.core.schemas import BODY_SECTIONS, DocMeta, LineMask, PageText, SectionMark, SentenceRow, Unit
 from atlas.core.segment import SEGMENT_VERSION, garbage_flags, split_sentences, tag_sentence
-from atlas.core.text import hyphen_vocab, sentence_text
+from atlas.core.text import hyphen_vocab, junk_title, sentence_text
 from atlas.doctypes import get_doctype
 from atlas.ingest.pdf import extract_pages, extractor_tag, pdf_metadata, sha256_file, text_ratio
 from atlas.pipeline.runner import Report
@@ -78,6 +85,7 @@ SCAN_ID_WIDTH = 4
 ALIAS_MIN_OVERLAP = 0.5
 UNITS_OVERRIDE_FILE = "units_override.yaml"
 UNIT_KINDS = frozenset({"intro", "lit_review", "methods", "results", "discussion", "conclusion", "other"})
+TITLE_GUESS_PAGES = 4     # pages the doctype's guess_title reads at registration
 CHAPTER_DRAFTS = ("work", "drafts", "chapters")
 INGEST_LOG = "ingest.log"
 _FILE_LOGGER = "atlas.ingest.file"
@@ -300,6 +308,29 @@ def chapter_draft(job) -> dict:
             "hint": "copy the chapters list into curated/units_override.yaml under this doc_id and re-run ingest"}
 
 
+def _repair_title(job: _Job, store: EvidenceStore) -> str | None:
+    """Replace a junk stored title by the doctype's guess from the extracted pages (else the registration's
+    largest-font guess); the new title, or None when nothing changed."""
+    guess_fn = getattr(job.doctype, "guess_title", None)
+    if guess_fn is None:
+        return None
+    doc = store.get_document(job.doc_id)
+    if doc is None or not junk_title(doc.get("title")):
+        return None
+    try:
+        guess = guess_fn(job.pages)
+    except Exception:
+        log.exception("title guess failed for %s", job.doc_id)
+        guess = None
+    if junk_title(guess):
+        guess = (doc.get("extra") or {}).get("title_guess")
+    if junk_title(guess):
+        return None
+    store.upsert_meta(job.doc_id, DocMeta(title=guess, extra={"title_source": "doctype_guess",
+                                                              "title_replaced": doc.get("title")}))
+    return guess
+
+
 def _doc_path(project: Project, rel_path: str | None) -> Path | None:
     if not rel_path:
         return None
@@ -339,6 +370,7 @@ class _Job:
     drop_ratio: float = 0.0
     error: str | None = None
     draft: dict | None = None
+    title_guess: str | None = None     # set by _store when a junk stored title was replaced by the doctype's guess
 
 
 def _compute(job: _Job) -> _Job:
@@ -551,6 +583,7 @@ class IngestStage:
                                  text_ratio=job.text_ratio, drop_ratio=job.drop_ratio, stats=stats)
             if aliases:
                 store.add_aliases(aliases)
+        job.title_guess = _repair_title(job, store)
         return warns, len(aliases)
 
     @staticmethod
@@ -577,7 +610,9 @@ class IngestStage:
                            "text_ratio": round(job.text_ratio, 4), "drop_ratio": round(job.drop_ratio, 4),
                            "warnings": warns, "n_chapters": sum(1 for u in job.units if u.kind == "chapter"),
                            "chapter_confidence": min((u.confidence for u in job.units if u.kind == "chapter"), default=None),
-                           "draft": job.draft is not None}
+                           "draft": job.draft is not None, "title_guess": job.title_guess}
+        if job.title_guess:
+            flog.info("%s title guessed from the title page: %r", doc_id, job.title_guess)
         flog.info("%s done ext=%s pages=%d sentences=%d masks=%d aliases=%d text_ratio=%.3f drop_ratio=%.3f%s",
                   doc_id, job.ext_id, len(job.pages), len(job.sentences), len(job.masks), n_aliases,
                   job.text_ratio, job.drop_ratio, (" warnings=" + "; ".join(warns)) if warns else "")
@@ -625,11 +660,32 @@ def _meta_from_row(row: dict) -> DocMeta:
                    venue=g("venue"))
 
 
-def _fill_from_pdf(meta: DocMeta, path: Path) -> DocMeta:
-    """Fill title/authors/keywords/doi that the manifest did not provide from the PDF (info dict, then guesses)."""
+def _doctype_title_guess(doc_type: str, path: Path) -> str | None:
+    """The doctype's `guess_title` on the first TITLE_GUESS_PAGES pages (None for doctypes without one)."""
+    try:
+        guess_fn = getattr(get_doctype(doc_type), "guess_title", None)
+        if guess_fn is None:
+            return None
+        return guess_fn(extract_pages(path, max_pages=TITLE_GUESS_PAGES))
+    except Exception as e:  # a broken PDF: registration goes on without a title
+        log.warning("title guess failed for %s: %s", path, e)
+        return None
+
+
+def _fill_from_pdf(meta: DocMeta, path: Path, doc_type: str = "paper") -> DocMeta:
+    """Fill title/authors/keywords/doi that the manifest did not provide from the PDF (info dict, then the
+    doctype's title guess, then the largest-font line of page 1); junk titles count as missing."""
     pm = pdf_metadata(path)
+    if junk_title(meta.title):
+        meta.title = None
     if meta.title is None:
-        meta.title = pm.title or pm.extra.get("title_guess")
+        for cand, source in ((pm.title, "pdf_info"), (None, "doctype_guess"), (pm.extra.get("title_guess"), "first_page")):
+            if source == "doctype_guess":
+                cand = _doctype_title_guess(doc_type, path)
+            if not junk_title(cand):
+                meta.title = cand
+                meta.extra["title_source"] = source
+                break
     if meta.authors is None:
         meta.authors = pm.authors
     if meta.keywords is None:
@@ -734,8 +790,8 @@ def register_documents(project: Project, manifest: str | None = None, pattern: s
                     doc_id = known.get(rel) or next_id()
                 doc_type = row.get("doc_type") or default_type
                 meta = _meta_from_row(row)
-                if meta.title is None:
-                    meta = _fill_from_pdf(meta, path)
+                if junk_title(meta.title):
+                    meta = _fill_from_pdf(meta, path, doc_type)
                 try:
                     register(doc_id, doc_type, "manifest", path, meta)
                     report.items_done += 1
@@ -755,7 +811,7 @@ def register_documents(project: Project, manifest: str | None = None, pattern: s
                     report.items_skipped += 1
                     continue
                 doc_id = next_id()
-                meta = _fill_from_pdf(DocMeta(), path)
+                meta = _fill_from_pdf(DocMeta(), path, default_type)
                 try:
                     register(doc_id, default_type, "scan", path, meta)
                     report.items_done += 1

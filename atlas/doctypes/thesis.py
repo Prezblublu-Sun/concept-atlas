@@ -1,5 +1,5 @@
-"""PhD thesis doctype (version `thesis1`): front matter masks, TOC-calibrated chapter units, per-chapter sections,
-topic fields. Pure, like `paper` (increment 2 §4; architecture §8).
+"""PhD thesis doctype (version `thesis2`): front matter masks, TOC-calibrated chapter units, per-chapter sections,
+topic fields, title guess. Pure, like `paper` (increment 2 §4; architecture §8).
 
 The rules were shaped on real UCL theses of four generations of layout (a 1996 scan with a text layer, 2004 LaTeX
 and Word theses, 2018–2023 Word theses, a 2022 LaTeX thesis):
@@ -13,7 +13,8 @@ and Word theses, 2018–2023 Word theses, a 2022 LaTeX thesis):
 - TOC: starts at a 'Contents' / 'Table of contents' heading in the first 30 % of the pages and extends while the
   lines look like entries (dotted leaders, sub-numbers, page tokens), through the lists of figures / tables; it
   ends at a split entry that never sees a page number or leaders and starts at the top of a page (the first body
-  heading), at an 'Abstract' or 'Chapter N' heading, or after 4 stray lines. Top-level entries come in three
+  heading), at an 'Abstract' or 'Chapter N' heading that is not itself an entry (an entry is followed by a page
+  token or leaders: 'Abstract' / '3'), or after 4 stray lines. Top-level entries come in three
   shapes: one line ('Chapter 3. Clinical assessment … 109', '2 Background …… 38'), split lines (Word: '1.' /
   'Introduction and objectives …… 29'; LaTeX: '1' / 'Introduction' / '12'; Word numbering: '1. CHAPTER 1 …… 18' /
   title / '… 18') and wrapped titles; a bare number is the next chapter number when it continues the sequence and
@@ -24,15 +25,18 @@ and Word theses, 2018–2023 Word theses, a 2022 LaTeX thesis):
 - Chapter headings, in order of trust: 'Chapter N [. : –] Title' / 'CHAPTER ONE' / 'Chapter IV: Results' lines at
   the top of a page, Word numbering 'N. CHAPTER N' with the title on the following line(s), LaTeX 'N' alone at
   the top of a page followed by the title line (`chapter_regex`; chapter source `latex`); fallback: numbered
-  top-level headings '1 Introduction' / '2 Background' at the top of a page (`numbered_fallback`). A heading with
-  an empty title takes the next line(s); wrapped titles are joined (continuation lines start in lower case or
-  follow a dangling 'and' / 'of' / 'for' …, <= 70 chars). Rejected: lines followed by dotted leaders (TOC context),
-  in-text mentions ('Chapter 2 introduces …', 'Chapter 4 (Establishment …)', '6 I agree to …'), titles of more than
-  12 words after 'Chapter N', numbers out of sequence, and (for headings without the word 'Chapter') anything after
-  a 'References' / 'Bibliography' heading at the top of a page. The accepted chapters form the longest chain 1, 2,
-  3 …; a missing number is tolerated once (`sequence_gap`) unless the expected number appears later; a chapter
-  the TOC lists at a page where no heading was found is inserted from the TOC (`toc_filled`, never after the last
-  detected chapter).
+  top-level headings '1 Introduction' / '2 Background' at the top of a page (`numbered_fallback`), together with
+  the bare-number chapters of the LaTeX shape (a Word thesis may set one chapter as '9' / title lines). A heading
+  with an empty title takes the next line(s); wrapped titles are joined (continuation lines start in lower case or
+  follow a dangling 'and' / 'of' / 'for' …, <= 70 chars); a title line that reads like a sentence ('I, A. B.,
+  confirm that …', 'This chapter will focus on …') is no title. A heading left as a bare 'Chapter N' takes the
+  TOC's title for number N. Rejected: lines followed by dotted leaders (TOC context), in-text mentions ('Chapter 2
+  introduces …', 'Chapter 4 (Establishment …)', '6 I agree to …'), titles of more than 12 words after 'Chapter N',
+  numbers out of sequence, and (for headings without the word 'Chapter') anything after a 'References' /
+  'Bibliography' heading at the top of a page. The accepted chapters form the longest chain 1, 2, 3 …; a missing
+  number is tolerated once (`sequence_gap`) unless the expected number appears later; a chapter the TOC lists at
+  a page where no heading was found is inserted from the TOC (`toc_filled`, never after the last detected
+  chapter).
 - Units: one `document` unit + one `chapter` unit per chapter (`unit_id = doc_id/slug(heading)[:24]`, `~k` on
   duplicates; `unit_kind` by heading keywords; confidence by detection path: heading + TOC 0.9, heading only 0.8,
   numbered + TOC 0.75, TOC only 0.7, numbered only 0.6; -0.15 for a sequence gap, -0.1 for a TOC-filled
@@ -42,13 +46,31 @@ and Word theses, 2018–2023 Word theses, a 2022 LaTeX thesis):
   declaration, acknowledgements, lists, impact statement — except the abstract block (`Abstract` / `Summary`
   heading until the next front-matter heading or 600 words), which stays section `abstract`. TOC lines are
   `reason: toc`. Without any chapter the front matter ends after the TOC and the rest is body (`other`).
-- Sections: the chapter heading block is `other`; the chapter's default section follows from its unit_kind (intro /
-  lit_review → introduction, methods → methods, …; a chapter titled 'References' / 'Appendix' → that section);
-  canonical sub-headings inside the chapter (`segment.detect_heading_ex`) override until the next; 'References' /
-  'Bibliography' inside a chapter makes the rest of the chapter `references`; a late 'Summary' inside a chapter
-  is `conclusion`.
-- `topic_fields`: document = manifest title (else the title lines of page 1) + the abstract block (<= 600 words);
-  chapter = heading + the first 300 words after the heading block.
+- Sections (thesis2): every chapter starts with a mark — its heading block is `other`, then the chapter's default
+  section, which follows from its unit_kind (intro / lit_review → introduction, methods → methods, results →
+  results, discussion → discussion, conclusion → conclusion, other → other; a 'References' / 'Bibliography' tail
+  or chapter → references, an 'Appendix' → appendix). Headings refine the section only inside their chapter — a
+  chapter boundary always resets — through a stack of numbered sub-headings: '4.2 Methods' (a sub-heading of
+  chapter 4 whose text is a canonical heading, `segment.detect_heading_ex` strength `strict`) switches to that
+  section, '4.2.1 Loading' keeps its parent's section, '4.3 Sensitivity' (unrecognised) returns to the chapter
+  default; descriptive (`loose`) headings such as 'Problem statement', 'Literature review' or 'Limitations' only
+  count in chapters of kind `other` (paper-style chapters without a usable default), never in a typed chapter
+  (an Introduction chapter's '1.3 Problem statement' stays introduction, a Discussion chapter's '6.1 Literature
+  review' stays discussion). Unnumbered headings ('Methods', 'INTRODUCTION', 'Materials and methods',
+  'References') count only when prose follows them (a line of >= 40 chars / 6 words, or one short sub-heading and
+  then prose; 'References' also needs a reference entry): table cells ('Test' / 'Reference' / 'Topology'),
+  wrapped last words ('Modeling' / 'in') and figures ('Summary' / '66.9') never switch. 'References' inside a
+  chapter makes the rest of the chapter `references`, a late 'Summary' ('2.9 Summary', or 20+ lines in) is
+  `conclusion`. In a references / appendix unit only 'References' / 'Appendix' headings switch. The marks are
+  monotone in (page, cstart).
+- `topic_fields`: document = manifest title (unless junk — `atlas.core.text.junk_title` — else `guess_title`) + the
+  abstract block (<= 600 words); chapter = heading + the first 300 words after the heading block.
+- `guess_title`: the title lines of the first text page that is not a ProQuest / library notice page: the first
+  run of title-like lines (>= 2 words, no title-page formula such as 'A thesis submitted …' / 'University …' / a
+  year, digits <= 15 %) joined over at most 6 lines, ending at the author line ('Alice Northwood', 'Ilona
+  Świątkowska') or a formula line; a caps title ends where the case changes. A word-per-line page (dvips PDFs:
+  every word on its own line, digits as control characters) is joined and the leading run of capitalised words
+  is the title.
 - Thresholds: `max_drop_ratio 0.30`, `min_chapter_confidence 0.7` (ingest warns below it and writes a chapter
   draft the user can correct through `curated/units_override.yaml`).
 """
@@ -62,8 +84,9 @@ from dataclasses import dataclass, field
 from atlas.core import segment
 from atlas.core.ids import unit_id as make_unit_id
 from atlas.core.schemas import DocMeta, LineMask, PageText, SectionMark, Unit
+from atlas.core.text import junk_title
 from .base import Thresholds, register
-from .paper import HF_MIN_PAGES, REFCUE, REFSTART, _all_lines, _header_footer_keys, _Line, _line_key
+from .paper import HF_EDGE, HF_MIN_PAGES, REFCUE, REFSTART, YEAR, _all_lines, _header_footer_keys, _Line, _line_key
 
 _WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
           "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
@@ -72,7 +95,7 @@ _ROMAN = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7, "VIII":
           "XII": 12, "XIII": 13, "XIV": 14, "XV": 15, "XVI": 16, "XVII": 17, "XVIII": 18, "XIX": 19, "XX": 20}
 _NUM = r"(?:\d{1,2}|[IVXivx]{1,6}|[A-Za-z]{3,9})"
 _PAGE = r"(\d{1,3}|[ivxlcIVXLC]{1,6})"
-CHAPTER_RE = re.compile(rf"^(?:chapter|CHAPTER|Chapter)\s+({_NUM})\b[\s.:\-–—|]*(.*)$")
+CHAPTER_RE = re.compile(rf"^(?:chapter|CHAPTER|Chapter)[.:]?\s+({_NUM})\b[\s.:\-–—|]*(.*)$")   # 'CHAPTER. 6' (OCR)
 #: Word numbering: '1. CHAPTER 1', '2 CHAPTER TWO: Title'
 WORD_CHAPTER_RE = re.compile(rf"^(\d{{1,2}})[.:\s]+chapter\s+({_NUM})\b[\s.:\-–—|]*(.*)$", re.I)
 TOC_HEAD_RE = re.compile(r"^(?:table of contents|contents|list of contents|table of content)\s*$", re.I)
@@ -94,21 +117,36 @@ LIST_HEAD_RE = re.compile(r"^(?:list of (?:figures|tables|plates|abbreviations|s
 ABSTRACT_RE = re.compile(r"^(?:abstract|summary|synopsis)\s*[.:]?\s*$", re.I)
 TAIL_RE = re.compile(r"^(?:(\d{1,2}|[A-Z]|chapter\s+\d{1,2})[\s.:\-–—]+)?(appendix|appendices|bibliography|references|"
                      r"list of references|works cited|supplementary material|literature cited)\b", re.I)
-_AUTHOR_LINE_RE = re.compile(r"^[A-Z][a-z]+(?: [A-Z]\.?)* [A-Z][a-z]+$")      # 'Alice Northwood', 'Mark C. Ransley'
+#: 'Alice Northwood', 'Mark C. Ransley', 'Ilona Świątkowska': two name words (Unicode letters) with optional initials
+_AUTHOR_LINE_RE = re.compile(r"^[^\W\d_][^\W\d_'’\-]*(?:\s+[^\W\d_]\.?)*\s+[^\W\d_][^\W\d_'’\-]*$")
 #: title-page formulas that are never the title ('A thesis submitted …', 'Doctor of Philosophy', 'University College London')
 _TITLE_PAGE_RE = re.compile(r"\b(?:19|20)\d\d\b|universit|(?:thesis|dissertation) (?:submitted|presented)|submitted (?:to|for|in)\b|"
                             r"for the degree|degree of|doctor of|philosophy|department|faculty|school of|institute of|"
-                            r"supervis|proquest|copyright|©|^by\b|\bby$|date of submission|college", re.I)
+                            r"supervis|proquest|copyright|©|^by\b|\bby$|date of submission|college|cent(?:re|er) for|"
+                            r"division of|research group", re.I)
+#: a ProQuest / library notice page before the title page ('INFORMATION TO ALL USERS', 'ProQuest Number: …')
+_NOTICE_RE = re.compile(r"information to all users|proquest number|reproduced with permission|further reproduction|"
+                        r"microform edition|quality of this reproduction|all rights reserved", re.I)
+#: words after which a title-page word run stops (word-per-line pages)
+_TITLE_STOP_WORDS = frozenset("by submitted thesis dissertation university degree doctor department faculty copyright "
+                              "supervisor supervisors presented zur des der im von vorgelegt erlangung doktor".split())
+TITLE_SCAN_PAGES = 4           # the title page is one of the first pages that carry text
+TITLE_GUESS_MAX_LINES = 6
+TITLE_GUESS_MAX_WORDS = 40
 #: unit kinds by heading keyword, first hit wins; 'Experimental results' is results, 'Evaluation methodology' is
 #: methods ('results'/'findings' outrank the methods words, which outrank the looser results words)
 KIND_RES: list[tuple[str, re.Pattern[str]]] = [
-    ("lit_review", re.compile(r"literature|review|state of the art|related work|previous work|theoretical background", re.I)),
-    ("intro", re.compile(r"introduction|background|motivation|overview|aims? and objectives|scope|thesis outline", re.I)),
+    ("lit_review", re.compile(r"literature|\breview|state of the art|related work|previous work|prior work|"
+                              r"theoretical background", re.I)),
+    ("intro", re.compile(r"introduction|background|motivation|overview|\baims?\b|\bobjectives?\b|\bscope\b|"
+                         r"thesis outline|outline of|research questions?|problem statement|rationale", re.I)),
     ("results", re.compile(r"\bresults?\b|\bfindings\b", re.I)),
     ("discussion", re.compile(r"discussion|implication|limitation", re.I)),
-    ("conclusion", re.compile(r"conclusion|summary|future work|outlook|recommendation|contribution", re.I)),
+    ("conclusion", re.compile(r"conclu|summary|future (?:work|directions?|research)|outlook|recommendation|"
+                              r"contribution|closing remarks|final remarks|perspectives", re.I)),
     ("methods", re.compile(r"method|materials|experimental|approach|design|implementation|model(?:ling|ing)?|framework|"
-                           r"development|setup|procedure|technique|algorithm|protocol|theory|formulation", re.I)),
+                           r"development|setup|procedure|technique|algorithm|protocol|theory|formulation|synthesis|"
+                           r"fabrication|construction|measurement|calibration|instrumentation|apparatus", re.I)),
     ("results", re.compile(r"experiment|evaluation|validation|case stud|analysis|study|assessment|performance|"
                            r"application|comparison|investigation|characteri[sz]ation|simulation", re.I)),
 ]
@@ -134,6 +172,15 @@ TOC_TITLE_OVERLAP = 0.6
 CONFIDENCE = {"heading+toc": 0.9, "heading": 0.8, "numbered+toc": 0.75, "toc": 0.7, "numbered": 0.6}
 GAP_PENALTY = 0.15
 TOC_FILL_PENALTY = 0.1
+LATE_SUMMARY_LINES = 20        # an unnumbered 'Summary' this many lines into a chapter closes it (conclusion)
+PROSE_MIN_CHARS = 40           # the line after an unnumbered heading must read like prose: this long, …
+PROSE_MIN_WORDS = 6            # … or this many words, or >= 4 words with terminal punctuation
+EVIDENCE_LINES = 3             # … within this many content lines (a 'References' heading also needs an entry)
+#: numbered sub-heading inside a chapter: '4.2 Methods', '2.3.3. Overall results', '1.1. Problem statement'
+_SUBHEAD_RE = re.compile(r"^(\d{1,2})((?:\.\d{1,3}){1,3})\.?\s+(\S.*)$")
+_TRAILING_PAGE_RE = re.compile(r"\s\d{2,3}$")                           # chapter mini-TOC: '4.1 Introduction 112'
+_BARE_CHAPTER_RE = re.compile(r"^Chapter \d+$")
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 _FIRST_PERSON_RE = re.compile(r"^I\b|^(?:we|you|my|your)\b", re.I)       # consent-form items: '6 I agree to …'
 #: a wrapped heading line that cannot end a title ('A Model for Documents and' / 'Constraints'); the articles only
 #: in lower case ('Appendix A' is complete)
@@ -164,10 +211,13 @@ def _not_reference(s: str) -> bool:
 
 
 def _title_line(s: str) -> bool:
-    """A line that can be the title of a chapter whose number stands alone on the previous line."""
+    """A line that can be the title of a chapter whose number stands alone on the previous line: not a sentence
+    ('I, Kunhee Lee, confirm that …', 'This chapter will focus on …'), not a caption, page token or reference."""
     if not s or len(s.split()) > NEXT_TITLE_MAX_WORDS or len(s) > 160 or sum(c.isalpha() for c in s) < 3:
         return False
     if not (s[0].isupper() or s[0].isdigit() or s[0] in "‘'\"("):
+        return False
+    if _FIRST_PERSON_RE.match(s) or (_VERBISH.search(s) and not s.isupper()):
         return False
     return not (_DOTS_RE.search(s) or _FIGTAB_RE.match(s) or _PAGE_TOKEN_RE.match(s)) and _not_reference(s)
 
@@ -182,9 +232,11 @@ def _chapter_heading(s: str) -> bool:
 
 
 def _structural(s: str) -> bool:
-    """A heading that LaTeX / Word may repeat as a running header; its first occurrence is the heading itself."""
+    """A heading that LaTeX / Word may repeat as a running header; its first occurrence is the heading itself.
+    Canonical and numbered sub-headings count too: the header/footer keys normalise digits, so the chapter-initial
+    '1.1. Introduction', '2.1. Introduction', … of a Word thesis would otherwise pass for one running header."""
     return bool(_chapter_heading(s) or TAIL_RE.match(s) or LIST_HEAD_RE.match(s) or ABSTRACT_RE.match(s)
-                or TOC_HEAD_RE.match(s))
+                or TOC_HEAD_RE.match(s) or segment.detect_heading_ex(s) is not None or _sub_heading(s) is not None)
 
 
 @dataclass
@@ -310,10 +362,13 @@ def _unmask_structural(lines: Sequence[_Line], hf_raw: set[int], exclude: set[in
     'Bibliography' / 'Acknowledgements' as a running header on consecutive pages: the first page of each run
     holds the heading itself. A text that occurs on fewer than HF_MIN_PAGES pages ('Chapter 6' in a chapter list
     and as the heading) is no running header at all. Lines in `exclude` (the TOC) do not open a run."""
-    groups: dict[str, list[int]] = {}
+    groups: dict[tuple[str, bool], list[int]] = {}
+    ranks = _ranks(lines, set())
     for i in sorted(hf_raw - exclude):
         if _structural(lines[i].text):
-            groups.setdefault(_norm(lines[i].text), []).append(i)
+            # headers run along the page tops; a 'Chapter 2' box at the foot of the page before (a thesis-structure
+            # figure) must not count as the first of the run
+            groups.setdefault((_norm(lines[i].text), ranks.get(i, 99) <= HF_EDGE), []).append(i)
     out = set(hf_raw)
     for idxs in groups.values():
         if len({lines[i].page_no for i in idxs}) < HF_MIN_PAGES:
@@ -328,9 +383,10 @@ def _unmask_structural(lines: Sequence[_Line], hf_raw: set[int], exclude: set[in
 
 
 def _page_number_lines(lines: Sequence[_Line]) -> tuple[set[int], int | None]:
-    """Indexes of bare page-number lines at the page edges and the dominant printed - physical offset. A page
-    holds one page number: when two edge lines carry the same value, the outermost one is the page number and the
-    other a chapter number ('1' opening a LaTeX TOC on printed page 1)."""
+    """Indexes of bare page-number lines at the page edges and the dominant physical - printed offset (the sign
+    the TOC votes use: physical page = printed page + offset). A page holds one page number: when two edge lines
+    carry the same value, the outermost one is the page number and the other a chapter number ('1' opening a
+    LaTeX TOC on printed page 1)."""
     by_page: dict[int, list[int]] = {}
     for i, ln in enumerate(lines):
         if ln.text:
@@ -341,7 +397,7 @@ def _page_number_lines(lines: Sequence[_Line]) -> tuple[set[int], int | None]:
         for i in sorted(set(idxs[:EDGE_LINES] + idxs[-EDGE_LINES:])):
             s = lines[i].text
             if _BARE_NUMBER_RE.match(s):
-                arabic.setdefault(pno, []).append((i, int(s) - pno))
+                arabic.setdefault(pno, []).append((i, pno - int(s)))
             elif _ROMAN_PAGE_RE.match(s):
                 roman.append(i)
     offset: int | None = None
@@ -396,6 +452,12 @@ def _toc_triple(lines: Sequence[_Line], j: int, skip: set[int]) -> bool:
     if not t1[0].isalpha() or TOC_SUB_RE.match(t1) or LIST_HEAD_RE.match(t1) or _PAGE_TOKEN_RE.match(t1):
         return False
     return bool(_PAGE_TOKEN_RE.match(t2) or TOC_SUB_RE.match(t2) or _DOTS_RE.search(t2) or _ENDS_PAGE_RE.match(t1))
+
+
+def _entry_follows(lines: Sequence[_Line], j: int, skip: set[int]) -> bool:
+    """The next content line after line j is a page token or a leader line (line j is a split TOC entry)."""
+    k = next((x for x in range(j + 1, min(j + 4, len(lines))) if lines[x].text and x not in skip), None)
+    return k is not None and bool(_PAGE_TOKEN_RE.match(lines[k].text) or _DOTS_RE.search(lines[k].text))
 
 
 def _parse_toc(lines: Sequence[_Line], start: int, skip: set[int], top: set[int]) -> tuple[list[_TocEntry], int]:
@@ -501,6 +563,9 @@ def _parse_toc(lines: Sequence[_Line], start: int, skip: set[int], top: set[int]
             prev_kind = "page" if (page_tok or (ends_page and (dots or is_sub or opening))) else "other"
             continue
         if _chapter_heading(s) or ABSTRACT_RE.match(s):
+            if j not in top and _entry_follows(lines, j, skip):
+                last, gap, prev_kind = j, 0, "other"       # 'Abstract' / '3': an entry of the front matter
+                continue
             break
         gap += 1                      # list headings ('List of Figures') and stray lines; the entries may go on
         if gap >= TOC_GAP_LINES:
@@ -510,10 +575,92 @@ def _parse_toc(lines: Sequence[_Line], start: int, skip: set[int], top: set[int]
     return entries, last
 
 
+def _sub_heading(s: str) -> tuple[int, int] | None:
+    """(chapter prefix, depth) of a numbered sub-heading line — (4, 2) for '4.2 Methods', (2, 3) for '2.3.3 Overall
+    results'; None for other lines: captions, prose that starts with a number ('1.5 Tesla MRI scanner was used'),
+    chapter mini-TOC entries (leader dots or a trailing page number)."""
+    if len(s) > 120 or _DOTS_RE.search(s) or _TRAILING_PAGE_RE.search(s):
+        return None
+    m = _SUBHEAD_RE.match(s)
+    if m is None:
+        return None
+    rest = m.group(3).strip()
+    if len(rest.split()) <= 8:
+        rest = rest.rstrip(" .:")                     # OCR'd typescripts: '3.1. Introduction.', '6.3. Conclusions :'
+    if not _subheading_like(rest) or _FIGTAB_RE.match(rest):
+        return None
+    return int(m.group(1)), 1 + m.group(2).count(".")
+
+
+#: a numbered line that is a sentence, not a sub-heading ('1.5 Tesla MRI scanner was used'); milder than _VERBISH,
+#: whose nouns-as-verbs ('Thesis outline', 'Aims and objectives', 'Contributions') are ordinary sub-heading words
+_SENTENCE_RE = re.compile(r"\b(?:is|are|was|were|has|have|had|will|would|can|could|should|may|might|must|does|did|we|"
+                          r"our|which|these|those|this (?:thesis|chapter|study|work|section))\b", re.I)
+
+
+def _subheading_like(rest: str) -> bool:
+    if not rest or rest.endswith(".") or len(rest.split()) > TITLE_MAX_WORDS or not (rest[0].isupper() or rest[0].isdigit()):
+        return False
+    if _FIRST_PERSON_RE.match(rest) or (_SENTENCE_RE.search(rest) and not rest.isupper()):
+        return False
+    return sum(c.isalpha() for c in rest) >= 3
+
+
+SUBHEAD_PREFIX_MIN = 3         # a foreign prefix used by this many sub-headings is a missed chapter inside the unit
+
+
+def _section_prefixes(lines: Sequence[_Line], start: int, end: int, skip: set[int], number: int) -> set[int]:
+    """The numbers the sub-headings of a chapter unit carry ('5.1', '5.2' → 5): the chapter's own number (else,
+    when no sub-heading uses it, the most common prefix — a chapter numbered by a sequence gap or the TOC), plus
+    every prefix of >= SUBHEAD_PREFIX_MIN sub-headings (a chapter whose heading was missed lies inside the unit;
+    its '6.1 Introduction' / '6.2 …' still structure the text)."""
+    seen: Counter[int] = Counter()
+    for i in range(start, end):
+        s = lines[i].text
+        if s and i not in skip and (h := _sub_heading(s)) is not None:
+            seen[h[0]] += 1
+    out = {n for n, c in seen.items() if c >= SUBHEAD_PREFIX_MIN}
+    out.add(number if (not seen or number in seen) else seen.most_common(1)[0][0])
+    return out
+
+
+def _prose_like(s: str) -> bool:
+    words = s.split()
+    return len(s) >= PROSE_MIN_CHARS or len(words) >= PROSE_MIN_WORDS or (len(words) >= 4 and s[-1] in ".?!")
+
+
+def _short_heading(s: str) -> bool:
+    return len(s) <= 60 and len(s.split()) <= 8 and (s[0].isupper() or s[0].isdigit()) and not s.endswith(".")
+
+
+def _reference_entry(s: str) -> bool:
+    return bool(REFSTART.match(s) and (YEAR.search(s) or REFCUE.search(s)))
+
+
+def _heading_evidence(lines: Sequence[_Line], i: int, sec: str, skip: set[int]) -> bool:
+    """Prose follows the unnumbered heading at line i (a paragraph line, or one short sub-heading and then a
+    paragraph line) on its page or the next one; a 'References' heading is also followed by a reference entry.
+    Table cells ('Test' / 'Reference' / 'Topology'), wrapped last words and figures ('Summary' / '66.9') fail."""
+    nxt: list[str] = []
+    for k in range(i + 1, len(lines)):
+        if lines[k].page_no > lines[i].page_no + 1:
+            break
+        if lines[k].text and k not in skip:
+            nxt.append(lines[k].text)
+            if len(nxt) >= EVIDENCE_LINES:
+                break
+    if not nxt:
+        return False
+    ok = _prose_like(nxt[0]) or (len(nxt) > 1 and _short_heading(nxt[0]) and _prose_like(nxt[1]))
+    if sec == "references":
+        ok = ok and any(_reference_entry(t) for t in nxt)
+    return ok
+
+
 class ThesisDocType:
     name = "thesis"
-    version = "thesis1"
-    thresholds = Thresholds(max_drop_ratio=0.30, min_chapter_confidence=0.7)
+    version = "thesis2"      # thesis2: per-chapter section stack, numbered sub-headings, heading evidence, TOC
+    thresholds = Thresholds(max_drop_ratio=0.30, min_chapter_confidence=0.7)   # entries named 'Abstract', title guess
 
     def __init__(self) -> None:
         self._cache: tuple[tuple, _Analysis] | None = None
@@ -574,17 +721,32 @@ class ThesisDocType:
             return False
 
         # --- chapter heading candidates in the body (not TOC, not running headers)
-        def title_block(i: int, rest: str) -> tuple[str, int]:
+        def paragraph_start(k: int) -> bool:
+            """Line k opens a paragraph (three long lines, the second starting in lower case), not a title."""
+            run = [x for x in range(k, min(k + 3, len(lines))) if lines[x].text and lines[x].page_no == lines[k].page_no]
+            return len(run) == 3 and all(len(lines[x].text) >= 60 for x in run) and lines[run[1]].text[0].islower()
+
+        def title_block(i: int, rest: str, number: int | None = None) -> tuple[str, int]:
             """Heading text and the last line of the heading block for a heading line i whose own text is `rest`."""
             parts = [rest] if rest else []
             end = i
             k = next_content(i)
             if not parts:
+                # LaTeX repeats the chapter title as the running header of its pages: the first occurrence (the
+                # masked line right after 'Chapter N') is the title itself
+                k0 = next((x for x in range(i + 1, len(lines)) if lines[x].text or lines[x].page_no != lines[i].page_no), None)
+                if k0 is not None and k0 != k and lines[k0].page_no == lines[i].page_no and k0 in hf_idx \
+                        and _title_line(lines[k0].text) and not CHAPTER_RE.match(lines[k0].text):
+                    k = k0
+                numbered = segment.split_numbered_heading(lines[k].text) if k is not None else None
                 if k is None or not _title_line(lines[k].text) or CHAPTER_RE.match(lines[k].text) \
-                        or WORD_CHAPTER_RE.match(lines[k].text) or segment.split_numbered_heading(lines[k].text) \
-                        or TOC_SUB_RE.match(lines[k].text):
+                        or WORD_CHAPTER_RE.match(lines[k].text) or TOC_SUB_RE.match(lines[k].text) \
+                        or (numbered is not None and numbered[0] != number) or paragraph_start(k):
                     return "", i
-                parts.append(lines[k].text)
+                text = lines[k].text
+                if numbered is not None:                        # 'CHAPTER 4' / '4. PROSTHETIC CONSTRUCTION METHODS'
+                    text = re.sub(rf"^{number}[.:\-–—|]?\s+(?=\S)", "", text)
+                parts.append(text)
                 end = k
                 k = next_content(k)
             n = 0
@@ -603,10 +765,11 @@ class ThesisDocType:
                 heading = " ".join(heading.split()[:NEXT_TITLE_MAX_WORDS])
             return heading, end
 
+        toc_page = lines[toc_start].page_no if toc_start is not None else None   # no chapter starts on it
         cands: list[_Chapter] = []
         for i, ln in enumerate(lines):
             s = ln.text
-            if not s or i in skip or i in toc_idx or i not in top_idx or len(s) > 120:
+            if not s or i in skip or i in toc_idx or i not in top_idx or len(s) > 120 or ln.page_no == toc_page:
                 continue
             m = CHAPTER_RE.match(s)
             mw = WORD_CHAPTER_RE.match(s)
@@ -619,12 +782,12 @@ class ThesisDocType:
                     continue                                          # a stray TOC line
                 if not _heading_like(rest):
                     continue                                          # 'Chapter 2 introduces an automated …'
-                heading, end = title_block(i, rest)
+                heading, end = title_block(i, rest, num)
                 cands.append(_Chapter(num, heading or f"Chapter {num}", ln.page_no, ln.cstart, i, end, "chapter_regex"))
             elif _BARE_NUMBER_RE.match(s) and rank_of.get(i, 99) <= 2 and 1 <= int(s) <= 30:
                 k = next_content(i)                                   # LaTeX: '4' / 'A Model for Documents'
                 if k is None or not _title_line(lines[k].text) or CHAPTER_RE.match(lines[k].text) \
-                        or segment.split_numbered_heading(lines[k].text) or toc_context(i):
+                        or segment.split_numbered_heading(lines[k].text) or toc_context(i) or paragraph_start(k):
                     continue
                 k2 = next_content(k)
                 if k2 is not None and _PAGE_TOKEN_RE.match(lines[k2].text):
@@ -642,7 +805,7 @@ class ThesisDocType:
             fb: list[_Chapter] = []
             for i, ln in enumerate(lines):
                 s = ln.text
-                if not s or i in skip or i in toc_idx or rank_of.get(i, 99) > 3 or len(s) > 120:
+                if not s or i in skip or i in toc_idx or rank_of.get(i, 99) > 3 or len(s) > 120 or ln.page_no == toc_page:
                     continue
                 if toc_end is not None and i <= toc_end:
                     continue
@@ -654,6 +817,8 @@ class ThesisDocType:
                     continue
                 heading, end = title_block(i, head)
                 fb.append(_Chapter(n, heading, ln.page_no, ln.cstart, i, end, "numbered"))
+            numbers = {c.number for c in fb}
+            fb += [c for c in cands if c.source == "latex" and c.number not in numbers]   # '9' / title lines
             chapters = self._sequence(self._before_references(fb, lines, rank_of, skip))
             if chapters:
                 reasons.append("numbered_fallback")
@@ -716,6 +881,11 @@ class ThesisDocType:
             reasons.append("toc_only")
         if chapters and any(b.number != a.number + 1 for a, b in zip(chapters, chapters[1:])):
             reasons.append("sequence_gap")
+        # --- a bare 'Chapter N' heading (no usable title line on its page) takes the TOC's title for N
+        toc_titles = {e.number: e.title for e in toc_entries if sum(c.isalpha() for c in e.title) >= 3}
+        for c in chapters:
+            if c.source != "toc" and _BARE_CHAPTER_RE.match(c.heading) and c.number in toc_titles:
+                c.heading = toc_titles[c.number]
 
         # --- tail units (appendix / bibliography after the last chapter)
         tails: list[_Chapter] = []
@@ -873,9 +1043,12 @@ class ThesisDocType:
         marks: list[SectionMark] = [SectionMark(1, 0, "front")]
         current = "front"
 
-        def emit(page_no: int, cstart: int, sec: str) -> None:
+        def emit(page_no: int, cstart: int, sec: str, force: bool = False) -> None:
+            """A mark at (page_no, cstart) when the section changes — or always with `force` (chapter starts and
+            sub-heading lines: ingest makes every mark a hard sentence boundary, so the heading line stays its own
+            sentence even inside a chapter whose section is already `other`)."""
             nonlocal current
-            if sec == current:
+            if sec == current and not force:
                 return
             last = marks[-1]
             if len(marks) > 1 and last.page_no == page_no and last.cstart == cstart:
@@ -885,14 +1058,11 @@ class ThesisDocType:
             current = sec
 
         def after_line(i: int, sec: str) -> None:
-            """Section `sec` starts at the content line after line i (the heading block itself stays `other`)."""
-            nxt = next((j for j in range(i + 1, len(lines)) if lines[j].text), None)
-            if nxt is None:
-                return
-            if lines[nxt].page_no == lines[i].page_no:
-                emit(lines[nxt].page_no, lines[nxt].cstart, sec)
-            else:
-                emit(lines[nxt].page_no, 0, sec)
+            """Section `sec` starts right after line i (the heading block itself stays `other`). The mark sits at
+            the END of line i: ingest makes every mark a hard sentence boundary at its offset and at the end of
+            its line, so a mark at the start of the next line would cut the first line of the paragraph into a
+            sentence of its own."""
+            emit(lines[i].page_no, lines[i].cend, sec)
 
         if a.abstract:
             i0, i1 = a.abstract
@@ -901,31 +1071,47 @@ class ThesisDocType:
                 emit(lines[i1].page_no, lines[i1].cstart, "front")
         chapters: list[_Chapter] = list(a.chapters) + list(a.tails)
         chapter_units = [u for u in units if u.kind == "chapter"]
+        skip = a.hf_idx | a.page_numbers
         for k, ch in enumerate(chapters):
             u = chapter_units[k] if k < len(chapter_units) and chapter_units[k].page_from == ch.page_no else None
-            default = self._default_section(ch, u.unit_kind if u else None)
-            emit(ch.page_no, ch.cstart, "other")
+            kind = u.unit_kind if u and u.unit_kind else ("other" if ch.kind == "tail" else unit_kind_of(ch.heading))
+            default = self._default_section(ch, kind)
+            tail = ch.kind == "tail" or default in ("references", "appendix")
+            loose_ok = not tail and kind == "other"         # paper-style chapters without a usable default
+            emit(ch.page_no, ch.cstart, "other", force=True)   # one mark at every chapter start: nothing bleeds in
             after_line(ch.end_idx, default)
+            stack: list[tuple[int, str]] = []               # (depth, section) of the active sub-heading refinements
             end = chapters[k + 1].line_idx if k + 1 < len(chapters) else len(lines)
+            prefixes = set() if tail else _section_prefixes(lines, ch.end_idx + 1, end, skip, ch.number)
             for i in range(ch.end_idx + 1, end):
                 ln = lines[i]
-                if not ln.text or i in a.hf_idx or i in a.page_numbers:
+                if not ln.text or i in skip or i in a.toc_idx:
                     continue
-                hit = segment.detect_heading_ex(ln.text)
-                if hit is None:
-                    continue
-                sec, strength = hit
-                if sec == "keywords":
-                    continue
-                if sec == "abstract":
-                    if i - ch.end_idx < 20 or not re.search(r"summary", ln.text, re.I):
+                s = ln.text
+                sub = None if tail else _sub_heading(s)
+                depth = sub[1] if sub is not None and sub[0] in prefixes else None
+                hit = segment.detect_heading_ex(s.rstrip(" .:") if depth is not None else s)
+                sec: str | None = None
+                if hit is not None:
+                    sec, strength = hit
+                    if sec == "keywords" or (strength == "loose" and not loose_ok) \
+                            or (tail and sec not in ("references", "appendix")):
+                        sec = None
+                    elif sec == "abstract":                 # '2.9 Summary' / a late 'Summary' closes the chapter
+                        late = depth is not None or i - ch.end_idx >= LATE_SUMMARY_LINES
+                        sec = "conclusion" if late and re.search(r"summary", s, re.I) else None
+                if depth is None:
+                    if sec is None or not _heading_evidence(lines, i, sec, skip):
                         continue
-                    sec = "conclusion"                      # a late 'Summary' closes the chapter
-                if sec in ("references", "acknowledgements", "appendix"):
-                    emit(ln.page_no, ln.cstart, sec)
-                elif strength == "strict" or sec != default:
-                    emit(ln.page_no, ln.cstart, "other")
-                    after_line(i, sec)
+                    depth = 2
+                elif sec == "references" and not _heading_evidence(lines, i, sec, skip):
+                    sec = None
+                while stack and stack[-1][0] >= depth:
+                    stack.pop()
+                if sec is not None:
+                    stack.append((depth, sec))
+                emit(ln.page_no, ln.cstart, "other", force=True)   # the heading line itself
+                after_line(i, stack[-1][1] if stack else default)
         if not any(m.section not in ("front", "abstract") for m in marks):
             # no chapter at all: the text after the front matter (or everything) is body of unknown structure
             if a.first_body is not None and a.first_body < len(lines):
@@ -945,7 +1131,7 @@ class ThesisDocType:
         lines = a.lines
         skip = a.hf_idx | a.page_numbers
         if unit.kind == "document":
-            title = [" ".join(meta.title.split())] if meta.title and meta.title.strip() else _guess_title(lines, skip)
+            title = [" ".join(meta.title.split())] if not junk_title(meta.title) else _guess_title(lines, skip)
             abstract: list[str] = []
             if meta.abstract and meta.abstract.strip():
                 abstract.append(" ".join(meta.abstract.split()))
@@ -980,25 +1166,125 @@ class ThesisDocType:
         return {"title": [unit.heading] if unit.heading else [], "keywords": [],
                 "abstract": [" ".join(words[:CHAPTER_WORDS])] if words else []}
 
+    # ---- title ---------------------------------------------------------------------------------------------
+    def guess_title(self, pages: Sequence[PageText]) -> str | None:
+        """The title read from the title page (module docstring); the first pages suffice as input."""
+        if not pages:
+            return None
+        a = self._analyse(pages)
+        found = _guess_title(a.lines, a.hf_idx | a.page_numbers)
+        return found[0] if found else None
+
+
+def _word_per_line(texts: Sequence[str]) -> bool:
+    head = texts[:30]
+    return len(head) >= 8 and sum(1 for t in head if len(t.split()) == 1) >= 0.7 * len(head)
+
+
+def _title_page_texts(lines: Sequence[_Line], skip: set[int]) -> tuple[list[str], bool]:
+    """(content lines, word-per-line layout) of the title page: the first of the first TITLE_SCAN_PAGES pages that
+    carries text and is not a ProQuest / library notice page; control characters removed. On a word-per-line
+    page the running-header mask is ignored (single words recur at the page edges of many pages)."""
+    by_page: dict[int, list[tuple[int, str]]] = {}
+    for i, ln in enumerate(lines):
+        if ln.text:
+            t = " ".join(_CTRL_RE.sub("", ln.text).split())
+            if t:
+                by_page.setdefault(ln.page_no, []).append((i, t))
+    for pno in sorted(by_page)[:TITLE_SCAN_PAGES]:
+        raw = [t for _, t in by_page[pno]]
+        wpl = _word_per_line(raw)
+        texts = raw if wpl else [t for i, t in by_page[pno] if i not in skip]
+        if not texts:
+            continue
+        hits = sum(1 for t in texts if _NOTICE_RE.search(t))
+        if hits >= 2 or any(re.search(r"information to all users|proquest number", t, re.I) for t in texts):
+            continue
+        return texts, wpl
+    return [], False
+
+
+def _title_candidate(s: str) -> bool:
+    if len(s.split()) < 2 or "@" in s or sum(c.isalpha() for c in s) < 3:
+        return False
+    if (_TITLE_PAGE_RE.search(s) or _PAGE_TOKEN_RE.match(s) or LIST_HEAD_RE.match(s) or ABSTRACT_RE.match(s)
+            or TOC_HEAD_RE.match(s) or _FIGTAB_RE.match(s)):
+        return False
+    return sum(c.isdigit() for c in s) / len(s) <= 0.15
+
+
+def _credentials_line(s: str) -> bool:
+    """'MBChB, FRCA, MRCP(UK), FFICM' / 'BSc MSc': the qualifications under the author's name."""
+    toks = [t.strip("(),.;") for t in re.split(r"[,\s]+", s) if t.strip("(),.;")]
+    return 1 <= len(toks) <= 8 and sum(1 for t in toks if len(t) <= 10 and sum(c.isupper() for c in t) >= 2) >= 0.6 * len(toks)
+
+
+def _author_line(s: str) -> bool:
+    """'Alice Northwood', 'Dr Rachel M Baumber', 'JIA HUA': 2–4 name tokens, each capitalised."""
+    toks = s.split()
+    if not 2 <= len(toks) <= 4 or not all(t[0].isupper() and t[0].isalpha() for t in toks):
+        return False
+    return bool(_AUTHOR_LINE_RE.match(s)) or all(re.fullmatch(r"[^\W\d_][^\W\d_'’\-]*\.?", t) for t in toks)
+
+
+def _word_per_line_title(texts: list[str]) -> str | None:
+    """dvips / Type-3 pages set every word on its own line: join them and take the leading run of capitalised
+    words (the typeset title), else the words before the first title-page formula word."""
+    words = " ".join(texts).split()
+    out: list[str] = []
+    lead = [w for w in words[:10] if any(c.isalpha() for c in w)][:8]
+    caps = bool(lead) and sum(1 for w in lead if w.isupper()) >= 0.6 * len(lead)
+    for w in words[:TITLE_GUESS_MAX_WORDS]:
+        if caps:
+            if not (w.isupper() or not any(c.isalpha() for c in w)):
+                break
+        elif w.lower().strip(".,:;") in _TITLE_STOP_WORDS or re.fullmatch(r"(?:19|20)\d\d", w):
+            break
+        out.append(w)
+    return " ".join(out) if len(out) >= 3 else None
+
 
 def _guess_title(lines: Sequence[_Line], skip: set[int]) -> list[str]:
-    """The title lines of page 1: the first line of >= 3 words that is not a title-page formula ('A thesis
-    submitted …', 'University College London', a year), joined with up to two following lines of the same shape."""
-    page1 = [i for i, ln in enumerate(lines) if ln.page_no == lines[0].page_no and ln.text and i not in skip] if lines else []
-    texts = [lines[i].text for i in page1]
-    for k, s in enumerate(texts[:12]):
-        if len(s.split()) < 3 or _TITLE_PAGE_RE.search(s) or _PAGE_TOKEN_RE.match(s):
+    """The title lines of the title page as one string (module docstring, `guess_title`); [] when none."""
+    texts, wpl = _title_page_texts(lines, skip)
+    if not texts:
+        return []
+    if wpl:
+        title = _word_per_line_title(texts)
+        return [title] if title else []
+    for k, s in enumerate(texts[:15]):
+        if not _title_candidate(s):
             continue
+        if len(s.split()) < 3 and not (k + 1 < len(texts) and _title_candidate(texts[k + 1])):
+            continue                                    # a two-word line starts the title only when it goes on
         parts = [s]
-        for j in range(k + 1, min(k + 3, len(texts))):
+        for j in range(k + 1, min(k + TITLE_GUESS_MAX_LINES, len(texts))):
             t = texts[j]
             after = texts[j + 1] if j + 1 < len(texts) else ""
-            if len(t.split()) < 2 or _TITLE_PAGE_RE.search(t) or t.endswith("."):
+            if after.lower().rstrip(":") == "by":       # '… HIP PROSTHESIS' / 'by' / 'JIA HUA'
+                if _title_candidate(t):
+                    parts.append(t)
                 break
-            if _AUTHOR_LINE_RE.match(t) and (not after or _TITLE_PAGE_RE.search(after) or len(after.split()) == 1):
+            if len(t.split()) == 1 and t.isalpha() and (t[0].islower() or (t.isupper() and all(p.isupper() for p in parts))) \
+                    and not _TITLE_PAGE_RE.search(t) and t.lower() not in _TITLE_STOP_WORDS \
+                    and _DANGLING_RE.search(parts[-1]) is None:
+                parts.append(t)                         # the wrapped last word of the title ('implants', 'TRAUMA')
+                break
+            if not _title_candidate(t) or t.endswith("."):
+                break
+            if _DANGLING_RE.search(parts[-1]):
+                parts.append(t)                         # 'Managing the Consistency of' / 'Distributed Documents'
+                continue
+            if all(p.isupper() for p in parts) and not t.isupper():
+                break                                   # a caps title ends where the case changes (author line)
+            if _author_line(t) and (not after or _TITLE_PAGE_RE.search(after) or len(after.split()) <= 1
+                                    or _credentials_line(after) or parts[-1][-1] in "?!."):
                 break                                   # 'Alice Northwood' before 'A thesis submitted …' / 'UCL'
             parts.append(t)
-        return [" ".join(" ".join(parts).split())]
+            if sum(len(p.split()) for p in parts) >= TITLE_GUESS_MAX_WORDS:
+                break
+        title = " ".join(" ".join(parts).split()).rstrip(" .:;,")
+        return [title] if len(title.split()) >= 3 else []
     return []
 
 

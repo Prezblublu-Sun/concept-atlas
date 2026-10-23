@@ -20,8 +20,11 @@ Increment 2: `make_fixture(out_dir, seed, kind="thesis")` writes 3 synthetic the
 page numbers are offset from the physical pages by the front matter, a list of figures, 4–6 chapters ("Chapter N"
 line + title line, numbered sub-headings, per-chapter references, >= 2 pages each), a bibliography and an
 appendix; a running header on every page and printed page numbers (roman in the front matter, arabic from
-chapter 1) in the footer. The returned dict lists every chapter with its physical page range, unit kind and
-printed start page, the abstract text and the planted 'micromotion' sentences.
+chapter 1) in the footer. The returned dict lists every chapter with its physical page range, unit kind, printed
+start page, sub-headings and the first sentence under each, the abstract text and the planted 'micromotion'
+sentences. Section traps (thesis2): the Results chapter carries a numbered 'Methods' sub-heading (its text is
+`methods`, the next sub-heading returns to `results`), the Discussion chapter a table rendered as the short lines
+'Test' / 'Reference' / 'Topology', and the bibliography the legend 'Summary' / '66.9' — `traps` names them.
 
 Layout notes (verified against PyMuPDF text extraction): text is written with the bundled Unicode fallback font
 (so μ, ± and ° survive), every line is wrapped to the column width (PyMuPDF clips glyphs outside the page), a
@@ -481,9 +484,13 @@ THESIS_CHAPTERS = [("Introduction", "intro"), ("Literature review", "lit_review"
 THESIS_SUBS = {"Introduction": ["Motivation", "Aims and objectives", "Thesis outline"],
                "Literature review": ["Cementless fixation", "Interface micromotion", "Computational models"],
                "Materials and methods": ["Specimens", "Finite element model", "Loading and boundary conditions"],
-               "Results": ["Interface micromotion", "Strain distribution", "Sensitivity"],
+               "Results": ["Interface micromotion", "Strain distribution", "Methods", "Sensitivity"],
                "Discussion": ["Comparison with the literature", "Limitations"],
                "Conclusions and future work": ["Conclusions", "Future work"]}
+#: section traps (thesis2): table cells that look like headings inside the Discussion chapter, and a figure legend
+#: inside the bibliography — none of them may switch the section
+THESIS_TRAP_CELLS = ["Test", "Reference", "Topology"]
+THESIS_TAIL_TRAP = ["Summary", "66.9"]
 THESIS_ABSTRACT = ["Cementless femoral stems rely on primary stability for bone ingrowth.",
                    "This thesis quantifies interface micromotion of cementless stems with validated finite element models.",
                    "A surrogate model is used to explore the design space efficiently.",
@@ -614,14 +621,17 @@ class _Thesis:
         blocks: list[list[_Line]] = []
         for ci, (heading, kind) in enumerate(self.chapters, start=1):
             blocks.append(self.chapter_heading_lines(ci, heading))
-            for sub, paras in self.chapter_text[ci - 1]:
+            for si, (sub, paras) in enumerate(self.chapter_text[ci - 1], start=1):
                 blocks.append([_heading(sub)])
-                for para in paras:
+                for pi, para in enumerate(paras):
                     blocks.append(_paragraph(para, font))
-            if self.per_chapter_refs:
-                blocks.append([_heading("References")] + [_Line(r) for r in self.refs[:3]])
+                    if heading == "Discussion" and si == 1 and pi == 0:
+                        blocks.append([_Line(t) for t in THESIS_TRAP_CELLS])      # a table rendered as short lines
+            if self.per_chapter_refs:       # two references of its own per chapter (a line recurring on three
+                k = 2 * ((ci - 1) % 4)      # page bottoms would be a running footer)
+                blocks.append([_heading("References")] + [_Line(r) for r in self.refs[k:k + 2]])
         blocks.append([_Line(self.bib_heading, TITLE_SIZE, new_page=True, mark=f"tail:{self.bib_heading}")]
-                      + [_Line(r, gap=2.0) for r in self.refs])
+                      + [_Line(r, gap=2.0) for r in self.refs] + [_Line(t, gap=2.0) for t in THESIS_TAIL_TRAP])
         blocks.append([_Line("Appendix A", TITLE_SIZE, new_page=True, mark="tail:Appendix A"),
                        _Line("Supplementary tables", HEADING_SIZE, HEAD_GAP)]
                       + _paragraph([_filler((900 + j) % N_FILLER) for j in range(6)], font))
@@ -698,7 +708,11 @@ def make_thesis_fixture(out_dir: str | Path, seed: int = 1) -> dict:
             nxt = ch_pages.get(ci + 1) or tail_pages[th.bib_heading]
             chapters.append({"number": ci, "heading": th.chapters[ci - 1][0], "unit_kind": th.chapters[ci - 1][1],
                              "page_from": n_front + ch_pages[ci], "page_to": n_front + nxt - 1, "printed_from": printed_ch[ci],
-                             "sections": [sub for sub, _ in th.chapter_text[ci - 1]]})
+                             "sections": [sub for sub, _ in th.chapter_text[ci - 1]],
+                             "sub_first_sentences": [paras[0][0] for _, paras in th.chapter_text[ci - 1]]})
+        disc = next((ci for ci, (h, _) in enumerate(th.chapters, start=1) if h == "Discussion"), None)
+        traps = {"cells": list(THESIS_TRAP_CELLS), "tail": list(THESIS_TAIL_TRAP),
+                 "after_cells": th.chapter_text[disc - 1][0][1][1][0] if disc else None}
         tail = [{"heading": th.bib_heading, "kind": "references", "page_from": n_front + tail_pages[th.bib_heading],
                  "page_to": n_front + tail_pages["Appendix A"] - 1},
                 {"heading": "Appendix A", "kind": "appendix", "page_from": n_front + tail_pages["Appendix A"], "page_to": n_pages}]
@@ -712,7 +726,7 @@ def make_thesis_fixture(out_dir: str | Path, seed: int = 1) -> dict:
                           "per_chapter_references": th.per_chapter_refs, "micromotion_sentences": len(th.mm_sentences),
                           "mm_sentences": list(th.mm_sentences), "sentences": list(th.body_sentences),
                           "references": list(th.refs), "acknowledgements": THESIS_ACK,
-                          "declaration": THESIS_DECL.format(author=th.author)})
+                          "declaration": THESIS_DECL.format(author=th.author), "traps": traps})
         rows.append([th.doc_id, th.title, str(th.year), th.author, "", "University of Example", "thesis", file])
     manifest = out / "manifest.csv"
     with open(manifest, "w", encoding="utf-8", newline="") as f:

@@ -61,13 +61,14 @@ def _quiet_mupdf() -> None:
         pass
 
 
-def extract_pages(path: str | Path) -> list[PageText]:
-    """page.get_text('text') for every page, 1-based page_no, width/height in points. The text is stored verbatim
-    (offsets index into it); only '\\x00' and '\\r' are removed."""
+def extract_pages(path: str | Path, max_pages: int | None = None) -> list[PageText]:
+    """page.get_text('text') for every page (the first `max_pages` when given), 1-based page_no, width/height in
+    points. The text is stored verbatim (offsets index into it); only '\\x00' and '\\r' are removed."""
     _quiet_mupdf()
     out: list[PageText] = []
     with fitz.open(str(path)) as doc:
-        for i in range(doc.page_count):
+        n = doc.page_count if max_pages is None else min(doc.page_count, max(0, max_pages))
+        for i in range(n):
             page = doc[i]
             rect = page.rect
             out.append(PageText(page_no=i + 1, text=_clean(page.get_text("text")),
@@ -104,8 +105,11 @@ def _largest_font_line(page) -> str | None:
     return " ".join(parts) or None
 
 
+_INFO_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")     # dvips / Type-3 digits land as control characters
+
+
 def _str_or_none(v) -> str | None:
-    s = " ".join(str(v).split()) if v is not None else ""
+    s = " ".join(_INFO_CTRL_RE.sub("", str(v)).split()) if v is not None else ""
     return s or None
 
 

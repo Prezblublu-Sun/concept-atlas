@@ -49,6 +49,12 @@ class DocType(Protocol):
         Thesis document: title + front-matter abstract; thesis chapter: heading + first 300 words."""
         ...
 
+    def guess_title(self, pages: Sequence[PageText]) -> str | None:
+        """The document's title read from its first text page, or None. `atlas docs add` and the ingest stage
+        store it in document_meta when the manifest / PDF-metadata title is missing or junk
+        (atlas.core.text.junk_title); the first pages suffice as input."""
+        ...
+
 
 DOCTYPES: dict[str, type] = {}
 

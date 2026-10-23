@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from atlas.core.text import (INLINE_ID_RE, collapse_ws, extract_numbers, nfkc, numbers_missing,
+from atlas.core.text import (INLINE_ID_RE, collapse_ws, extract_numbers, junk_title, nfkc, numbers_missing,
                              strip_inline_ids)
 
 
@@ -236,3 +236,28 @@ def test_sentence_text_collapses_breaks_and_expands_ligatures():
     assert sentence_text("a\u00adb") == "ab"
     assert sentence_text("2\u2002 \x07Material and\xa0Methods") == "2 Material and Methods"
     assert sentence_text(None) == ""
+
+
+# ---- document titles ----------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("title", [
+    None, "", "   ",
+    "c \x00 Cop yrigh t \x01 \x08\x08 b y Da vid",                      # control characters (dvips digits)
+    "Microsoft Word - Thesis correction.docx", "ProQuest Dissertations", "Print to file, Job 124",
+    "main.dvi", "Schauer_2008_PHD_vol1", "SafaAlmadhi_PhDThesis_C1.2", "Thesis correction",
+    "PhD thesis final version", "UNIVERSITY OF LONDON THESIS", "Untitled", "A thesis submitted for the degree",
+])
+def test_junk_title_rejects_empty_control_characters_file_names_artefacts_and_generic_words(title):
+    assert junk_title(title)
+
+
+@pytest.mark.parametrize("title", [
+    "Does cement mantle thickness really matter?",
+    "Model checking multi-agent systems",
+    "The Measurement of Wear in Hip Arthroplasties",
+    "On the Free Vibration of an Array of Elastically Mounted Cylinders",
+    "Design and evaluation of CAD-CAM custom-made hip prostheses",
+])
+def test_junk_title_keeps_real_titles(title):
+    assert not junk_title(title)
