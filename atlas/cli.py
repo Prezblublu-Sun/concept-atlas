@@ -15,6 +15,9 @@ atlas evidence gc <root> [--vacuum] [--dry-run] [--rebuild-fts]      remove supe
 atlas fixture make <dir> [--seed 1] [--kind paper|thesis]
 atlas ucl subset <root> [--inventory csv] [--proximity csv] [--pdf-dir dir] [--target 120]
 atlas notes export <root> <collection_id> [-o file.md]
+atlas llm ping <root> [--effort low]      the only spending command: one 20-token request (refused under ATLAS_LLM_NO_NETWORK)
+atlas llm batches list|status|collect <root> [<batch_id>]
+atlas cost report <root> [--run id] [--stage s] | atlas cost calibrate <root>
 Exit codes: 0 ok, 1 usage/project error, 2 stage reported failures. Prints Report.summary() for stages.
 Windows: stdout is reconfigured to UTF-8 (errors='replace').
 """
@@ -166,6 +169,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("root")
     p.add_argument("collection_id")
     p.add_argument("-o", "--output", help="write to this file instead of stdout")
+
+    llm = sub.add_parser("llm", help="provider connectivity and message batches").add_subparsers(dest="llm_cmd",
+                                                                                                  metavar="<verb>")
+    llm.required = True
+    p = llm.add_parser("ping", help="one 20-token request: prints model, usage, cost, request id (spends money)")
+    p.add_argument("root")
+    p.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"), default="low")
+    bt = llm.add_parser("batches", help="message batches of this project").add_subparsers(dest="batches_cmd",
+                                                                                          metavar="<verb>")
+    bt.required = True
+    p = bt.add_parser("list", help="batches known to the ledger")
+    p.add_argument("root")
+    p = bt.add_parser("status", help="ledger and provider state of one batch")
+    p.add_argument("root")
+    p.add_argument("batch_id")
+    p = bt.add_parser("collect", help="fetch the results of an ended batch into the ledger (idempotent)")
+    p.add_argument("root")
+    p.add_argument("batch_id")
+    p.add_argument("--wait", action="store_true", help="poll until the batch ended, then collect")
+    p.add_argument("--poll", type=float, default=30.0, help="seconds between polls with --wait")
+
+    cost = sub.add_parser("cost", help="ledger reports").add_subparsers(dest="cost_cmd", metavar="<verb>")
+    cost.required = True
+    p = cost.add_parser("report", help="ledger totals, cache hit rate, unknown pending spend")
+    p.add_argument("root")
+    p.add_argument("--run", help="one run id")
+    p.add_argument("--stage", help="one stage")
+    p = cost.add_parser("calibrate", help="refresh unit_costs (per-item cost medians) from the ledger")
+    p.add_argument("root")
     return ap
 
 
@@ -361,6 +393,131 @@ def _cmd_notes_export(a: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_llm(a: argparse.Namespace) -> int:
+    from atlas.config import load_project
+    from atlas.llm import batch as Bt
+    from atlas.llm.base import ChatRequest, NetworkForbidden, network_forbidden
+    from atlas.llm.client import describe_secret, key_env_of, llm_config, make_client, models_of, primary_provider
+    from atlas.llm.ledger import Ledger, new_run_id, price_table, report_unknown_pending
+    from atlas.store.llm import LlmStore
+    proj = load_project(a.root)
+    if a.llm_cmd == "ping" and network_forbidden():
+        raise NetworkForbidden("ATLAS_LLM_NO_NETWORK is set: `atlas llm ping` refuses to call the provider")
+    store = LlmStore.open(proj.llm_db)
+    try:
+        if a.llm_cmd == "ping":
+            cfg = llm_config(proj)
+            provider = primary_provider(cfg)
+            client = make_client(proj, provider)
+            model = models_of(cfg).get(provider) or str(cfg.get("model") or "")
+            print("key: not needed (fake)" if provider == "fake" else describe_secret(key_env_of(cfg, provider)))
+            ledger = Ledger(store, price_table(proj), provider=client.provider, currency=client.currency,
+                            run_id=new_run_id("ping"), stage="ping")
+            req = ChatRequest(model=model, system=("Connectivity check. Reply with the single word OK.",),
+                              user="ping", max_tokens=20, effort=a.effort if provider != "deepseek" else None,
+                              task="ping", key="ping")
+            row = ledger.begin(req, "ping", "", 1, 0.01)
+            try:
+                resp = client.complete(req)
+            except BaseException as e:
+                ledger.fail_pending(row, f"{type(e).__name__}: {e}")
+                raise
+            status = "ok" if resp.ok else ("refused" if resp.stop_reason == "refusal" else "error")
+            cost = ledger.finish(row, req, resp, status, validated=resp.ok, prompt_sha="")
+            u = resp.usage
+            print(f"provider {client.provider}  model {model}  served by {u.model_reported or '-'}")
+            print(f"stop_reason {resp.stop_reason}  text {resp.text.strip()[:60]!r}  latency {resp.latency_ms} ms")
+            print(f"usage: input {u.input}, cache_write {u.cache_write}, cache_read {u.cache_read}, output {u.output}")
+            print(f"cost {cost:.6f} {client.currency}  request id {resp.raw_id or '-'}")
+            if resp.error:
+                print(f"error: {resp.error}")
+            if client.provider == "fake":
+                print("provider fake: no network call was made")
+            return EXIT_OK if resp.ok else EXIT_STAGE_FAILED
+        note = report_unknown_pending(store)
+        if note:
+            print(f"notice: {note}")
+        if a.batches_cmd == "list":
+            rows = store.list_batches()
+            print("batch_id\tprovider\tstatus\tcreated\tstage\trun_id\tn_requests\tn_done\tn_failed\tcost")
+            for b in rows:
+                print(f"{b['batch_id']}\t{b['provider']}\t{b['status']}\t{b['created']}\t{b['stage']}\t{b['run_id']}\t"
+                      f"{b['n_requests']}\t{b['n_done']}\t{b['n_failed']}\t{b['cost']:.4f}")
+            print(f"{len(rows)} batches")
+            return EXIT_OK
+        meta = store.get_batch(a.batch_id)
+        if meta is None:
+            raise KeyError(f"batch {a.batch_id} is not in this project's ledger")
+        client = make_client(proj, meta["provider"])
+        if a.batches_cmd == "status":
+            r = Bt.status_report(store, client, a.batch_id)
+            print(json.dumps(r, ensure_ascii=False, indent=1, default=str))
+            return EXIT_OK
+        prices = price_table(proj)
+        if a.wait:
+            r = Bt.wait_for_batch(store, client, a.batch_id, prices, poll_seconds=a.poll)
+        else:
+            r = Bt.collect(store, client, a.batch_id, prices)
+        print(f"batch {a.batch_id} ({r['provider']}): state {r['state']}, pending before {r['pending_before']}, "
+              f"collected {r['collected']}, failed {r['failed']}, missing {r['missing']}, cost {r['cost']:.4f} {client.currency}")
+        if r["state"] != "ended":
+            print("not ended yet; run the command again later (or with --wait)")
+        return EXIT_OK
+    finally:
+        store.close()
+
+
+def _cmd_cost(a: argparse.Namespace) -> int:
+    from atlas.config import load_project
+    from atlas.llm.ledger import report_unknown_pending
+    from atlas.llm.tasks import read_settings
+    from atlas.store.llm import LlmStore
+    proj = load_project(a.root)
+    store = LlmStore.open(proj.llm_db)
+    try:
+        if a.cost_cmd == "calibrate":
+            rows = store.calibrate()
+            print("task\tprompt_sha\tunit\tcost_median\tn")
+            for r in rows:
+                print(f"{r['task']}\t{r['prompt_sha'][:12]}\t{r['unit']}\t{r['cost_median']:.6f}\t{r['n']}")
+            print(f"{len(rows)} unit costs refreshed")
+            return EXIT_OK
+        if a.run:
+            s = read_settings(proj, a.run)
+            if s is None:
+                print(f"run {a.run}: no settings snapshot (work/runs/{a.run}/llm_settings.json)")
+            else:
+                provs = ", ".join(f"{p} {v['model']}" + (f" effort {v['effort']}" if v.get("effort") else "")
+                                  for p, v in sorted(s.get("providers", {}).items()))
+                split = ", ".join(f"{p} {w:.0%}" for p, w in sorted(s.get("split", {}).items()))
+                tasks = ", ".join(f"{n} {v['prompt_sha'][:12]}" for n, v in sorted(s.get("tasks", {}).items()))
+                print(f"run {a.run}: stage {s.get('stage')}, mode {s.get('mode')}, created {s.get('created')}")
+                print(f"  providers: {provs}; split: {split}; failover {s.get('failover')}; "
+                      f"pricing {str(s.get('pricing_sha', ''))[:12]}; max_tokens_cap {s.get('max_tokens_cap')}")
+                print(f"  tasks (prompt_sha): {tasks or '-'}")
+        t = store.totals(run_id=a.run, stage=a.stage)
+        scope = " ".join(s for s in (f"run {a.run}" if a.run else "", f"stage {a.stage}" if a.stage else "") if s)
+        cur = t["total"]["currency"] or "-"
+        print(f"ledger{' (' + scope + ')' if scope else ''}: {t['total']['rows']} rows, cost {t['total']['cost']:.4f} {cur}")
+        for p in t["by_provider"]:
+            print(f"  {p['provider'] or '-'}: {p['rows']} rows, in {p['in_tokens']} (+cache write {p['cache_write_tokens']}, "
+                  f"read {p['cache_read_tokens']}), out {p['out_tokens']}, cost {p['cost']:.4f} {p['currency']}"
+                  + (f", failover rows {p['failover']}" if p["failover"] else ""))
+        print("provider\tstage\ttask\trows\tok\tcache_local\tcache_batch\tfailed\tpending\tin_tokens\tcache_write\tcache_read\tout_tokens\tcost\tcurrency")
+        for r in t["rows"]:
+            s = r["by_status"]
+            failed = sum(v for k, v in s.items() if k in ("truncated", "malformed", "refused", "error", "budget_stop"))
+            print(f"{r['provider']}\t{r['stage']}\t{r['task']}\t{r['rows']}\t{s.get('ok', 0)}\t{s.get('cache_local', 0)}\t"
+                  f"{s.get('cache_batch', 0)}\t{failed}\t{s.get('pending', 0)}\t{r['in_tokens']}\t{r['cache_write_tokens']}\t"
+                  f"{r['cache_read_tokens']}\t{r['out_tokens']}\t{r['cost']:.4f}\t{r['currency']}")
+        print(f"cache: local hit rate {t['cache_local_rate']:.1%} (rows), prompt cache read ratio {t['cache_read_ratio']:.1%} (tokens)")
+        note = report_unknown_pending(store)
+        print(f"unknown spend: {note}" if note else "unknown spend: none (no pending rows)")
+        return EXIT_OK
+    finally:
+        store.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     _reconfigure_streams()
     ap = build_parser()
@@ -370,6 +527,9 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USAGE if e.code else EXIT_OK
     level = logging.WARNING - 10 * min(int(a.verbose), 2)
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s", stream=sys.stderr)
+    from atlas.llm.base import NetworkForbidden
+    from atlas.llm.client import LlmError
+    from atlas.llm.governor import BudgetExceeded
     from atlas.pipeline.build import BuildError
     from atlas.pipeline.gates import GateError
     from atlas.pipeline.runner import StageError
@@ -398,10 +558,14 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_ucl_subset(a)
         if a.cmd == "notes":
             return _cmd_notes_export(a)
+        if a.cmd == "llm":
+            return _cmd_llm(a)
+        if a.cmd == "cost":
+            return _cmd_cost(a)
         ap.print_usage(sys.stderr)
         return EXIT_USAGE
     except (FileNotFoundError, FileExistsError, KeyError, ValueError, NotImplementedError, OSError, BuildError,
-            GateError, StageError, BuildSchemaError, GcError) as e:
+            GateError, StageError, BuildSchemaError, GcError, NetworkForbidden, LlmError, BudgetExceeded) as e:
         log.debug("command failed", exc_info=True)
         print(f"error: {e}", file=sys.stderr)
         return EXIT_USAGE

@@ -31,9 +31,22 @@ atlas run match|assign|finish <project-dir> [--build <id>]
 # fixtures and the UCL thesis subset
 atlas fixture make --kind paper|thesis <dir>
 atlas ucl subset <ucl-root> [--inventory …] [--proximity …] [--pdf-dir …] [--target N]
+
+# LLM layer (increment 4): provider, ledger, batches — every call is metered in <project>/llm/llm.sqlite
+atlas llm ping <project-dir> [--effort low]        # the only command that spends by itself: one 20-token request
+atlas llm batches list|status|collect <project-dir> [<batch-id>] [--wait]   # Message Batches (half price)
+atlas cost report <project-dir> [--run <id>] [--stage <s>]   # ledger totals, cache hit rate, unknown pending spend
+atlas cost calibrate <project-dir>                 # refresh per-item cost medians (unit_costs) from the ledger
 ```
 
-Bring your own LLM key (OpenAI-compatible endpoint); nothing is sent anywhere until you run an LLM stage, and
-every call is metered. Corpus text, databases and keys never enter this repository.
+Bring your own LLM key: the Anthropic API by default, read from the environment variable `RS_ANTHROPIC_API_KEY`
+(deliberately not `ANTHROPIC_API_KEY`; on Windows the user / system environment in the registry is consulted
+too, so a freshly set variable works without restarting the host app). `llm:` in `project.yaml` selects the
+models, effort, budgets and the provider split (`split: {anthropic: 0.9, deepseek: 0.1}` sends a deterministic
+share of items to DeepSeek — key `RS_DEEPSEEK_API_KEY` — so the two can be compared; every ledger row names its
+provider and every run writes `work/runs/<run_id>/llm_settings.json`). Nothing is sent anywhere until you run an
+LLM stage or `atlas llm ping`, every call is metered, dry runs (`--dry-run`) never call a provider, and setting
+`ATLAS_LLM_NO_NETWORK=1` makes every provider refuse (the test suite runs that way). Corpus text, databases and
+keys never enter this repository.
 
 License: MIT.
