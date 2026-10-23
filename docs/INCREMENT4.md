@@ -112,3 +112,96 @@ With `FakeChatClient`: request hash determinism; prompt rendering and `prompt_sh
 | **S** | `atlas/core/sample.py`, `atlas/pipeline/stages/{terms,concepts,scheme,classify}.py`, `atlas/pipeline/gates.py` (merge), `atlas/pipeline/runner.py` (STAGES, options), `atlas/verify/qa.py`, `atlas/llm/prompts/{terms_extract,concepts_merge,scheme_draft,classify}.md`, `atlas/cli.py` verbs `run <new stages>`, `curate merge`, `qa`, `tests/test_curation_pipeline.py`, `tests/unit/test_sample.py`, `test_gates_merge.py`, `test_qa.py` | `atlas/llm/*.py` other than prompts (code against `base.py`; use `FakeChatClient` and a thin local `run_task(client, task, payload)` shim until integration swaps in L's `tasks.py`) |
 
 Integration merges L then S, replaces the shim with the real task runner, runs the suite, then the dry runs: `atlas run terms H:/projects/atlas-projects/ucl --dry-run --pilot 20` and `--dry-run` without `--pilot` (prints sample composition by stratum, chunk count, token and cost estimates for `claude-opus-5-5` live and batch — expected pilot ≤ $5, full ≤ $35), and `atlas cost report` on the empty ledger. Acceptance: suite green; no test or dry run performs a network call (guard active); documented commands in README; `docs/INCREMENT4.md` gains a Status section with the dry-run numbers; nothing under `H:\UCL_theses` touched; the femstem and UCL projects unchanged except `llm/llm.sqlite` created empty by the dry run.
+
+---
+
+## 4. Status (2026-10-23, integration done; pilot not yet run)
+
+### 4.1 Delivered
+
+- **Package L** (`bd706a2`, merged `d352fc2`): `atlas/llm/client.py` (`AnthropicClient`, `DeepSeekClient`, the key resolver, `choose_provider`, `make_client` / `make_clients`), `tasks.py` (`StructuredTask`, prompt files, rendering, validation and caps, the truncation / malformed / refusal policy, `TaskRunner` with one backend per provider, failover tagging, `cache_local` hits, batch queueing, the settings snapshot, `make_runner`, `plan_items`), `ledger.py`, `governor.py`, `batch.py`, `store/llm.py` + `sql/llm.sql`, the `llm` / `budgets` blocks of `defaults.yaml`, `atlas llm ping|batches`, `atlas cost report|calibrate`, 72 unit tests, `tests/conftest.py` guard.
+- **Package S** (`962bc5d`, merged `bb6dc0d`): `core/sample.py`, `pipeline/llm_stage.py`, the stages `terms` / `concepts` / `scheme` / `classify`, the four prompt files, `gates.py` merge, `verify/qa.py`, runner `STAGES`, `atlas run <stage>` options, `atlas curate merge`, `atlas qa`, the curation chain test and the unit tests for sampling, merge, qa.
+- **Integration** (this commit): `LlmStage` builds a `TaskRunner` through `make_runner(project, stage, client= | clients=, run_id, build_id, mode, budget, tasks=[task])` and calls `runner.run(task, payload, key, context=item.context)` — S's `system_extra` is L's `context` (the scheme of `classify` is the last, cached system block); `--dry-run` is `plan_items` + `format_plan` with the ledger opened read-only (in memory when the project has none yet), so a dry run creates no file; `--mode batch` queues, `submit_queued`, probes once (`collect`) or polls (`wait_for_batch`, `llm.batch_poll_seconds` = 30) and then re-runs the items, which come back as `cache_local` hits — failed batch rows are read from the ledger and reported like live failures; the provider split applies through the runner: `TaskResult.provider` is in every draft row, per-provider totals in the draft head, the report and the CLI, per-provider shares in the plan; usage and cost per item come from the ledger rows of the run (every attempt, batch rows at batch prices, hits at zero, converted into the primary currency); the settings snapshot and the ledger rows carry the run id `<stage>_<run_id>` (`terms_r2026-10-23_001`, draft key `ledger_run_id`); `--budget` trims the item list by the cumulative high estimate (cached items are free) and is also the governor's run scope — `BudgetExceeded` stops a live run cleanly (`budget_stop` rows); every real provider of the split must have its key before the first call; under `ATLAS_LLM_NO_NETWORK` a non-dry run raises `NetworkForbidden` before any client exists. `atlas/pipeline/llm_shim.py` and `tests/unit/test_shim.py` are deleted; the stage caps use the task layer's path grammar (`terms[].sids`); the draft vocabulary maps the runner's statuses (`invalid` = JSON parsed but schema / stage check failed, `malformed` = no JSON); `store/db.py` accepts `':memory:'`; `tests/unit/test_llm_stage.py` ports the shim tests to the real layer; the curation chain test asserts the real cache semantics (an identical rerun is `cache_local` at zero cost; a batch rerun of cached items submits nothing; a refusal is billed, never retried and never cached; the ledger rows and the settings file of each run) and the guard test asserts the real behaviour (no SDK object built, no ledger, no draft; the dry run plans with the configured split). Static layering checks now list `atlas/llm/*.py`.
+- Suite: `PYTHONUTF8=1 python -m pytest -q tests` → **683 passed** (3 min 18 s), `ATLAS_LLM_NO_NETWORK=1` for every test; no test and no dry run performs a network call.
+
+### 4.2 Deviations from the contract reported by the implementers
+
+Package S:
+- `--model M` on `atlas run <stage>`: the primary provider's model for one run or estimate (it must have a price row in `llm.pricing`; a different model is a different request hash, so it never reuses a cached answer).
+- A report file per run, `work/drafts/<stage>/<run>.report.md`, next to the draft.
+- `store/evidence.py` gained read-only reads for the sampling: `iter_membership`, `texts_of`, `unit_kinds`, `doc_meta_all`.
+- `atlas curate merge <terms draft>` merges into `curated/term_tree.yaml` (entries without `concept_id`, under `--domain` or the first counting-scope domain); the `concepts` stage takes its candidates from those entries (example sids recovered from the draft named by `added_in`) and/or from `--draft`.
+- Delta apply rules: `merge_into` and `new_form` proposals are applied as new forms of the existing concept; `retire` proposals are reported, never applied; `add` is the concept itself under `concepts`; curated entries of source `llm` absent from a draft are listed as retire candidates only (drafts are samples).
+- `TERM_TYPES` lives in `atlas/core/sample.py` (the stages import it), not in the LLM layer.
+
+Package L:
+- Batch custom ids: the API requires `[A-Za-z0-9_-]{1,64}`, so `custom_id_for(key)` keeps a conforming key verbatim and otherwise uses `k_<sha256[:40]>`; collect maps the results back through the same function.
+- Refusal fallback on the beta endpoint: live calls go through `client.beta.messages.create(betas=["server-side-fallback-2026-07-01"], fallbacks="default", …)` because the installed SDK accepts `fallbacks` together with `output_config`; batch requests never carry it; `llm.refusal_fallback: false` switches back to `messages.create`.
+- Explicit key: `anthropic.Anthropic(api_key=…)` with the value from `resolve_secret(llm.api_key_env)` (process environment → `HKCU\Environment` → system environment), not the zero-arg constructor.
+- Estimates are local: `estimate_tokens` instead of `count_tokens`, so a dry run never reaches the network; the low estimate uses the ledger's observations of (task, prompt sha, provider) when there are any, else the system-prefix share as cache ratio and `max_tokens / 4` output; both carry +6 %.
+
+Integration:
+- The draft's run id stays `rYYYY-MM-DD_NNN` (per stage folder); the ledger and the settings snapshot use `<stage>_<run_id>` so runs of different stages never collide.
+- A dry run on a project that already has `llm/llm.sqlite` opens it read-only; SQLite then creates empty `-wal` / `-shm` sidecars next to it (deleted from the UCL project after the dry runs below).
+- The stages' own `out_low` estimate is gone: the runner's estimator rules (see above).
+- The `fake` provider ignores `llm.split` (a single fake backend); tests pass their own `FakeChatClient`.
+- New key `llm.batch_poll_seconds` (30).
+
+### 4.3 Dry runs on the UCL project (2026-10-23, `ATLAS_LLM_NO_NETWORK=1`, no network call)
+
+`PYTHONUTF8=1 python -m atlas.cli run terms H:/projects/atlas-projects/ucl --dry-run --pilot 20` (2 min 38 s, cold cache):
+
+```
+[terms] dry run — 84 items, task terms_extract @ prompt 9f84ace89fb5, model claude-opus-5-5, pilot 20 documents (anthropic claude-opus-5-5, deepseek deepseek-flash)
+  documents: 20
+  pool_sentences: 44361
+  sentences: 3200
+  chunks: 84
+  by unit_kind|section: intro|introduction 1192, conclusion|conclusion 447, methods|methods 299, discussion|discussion 297, lit_review|introduction 223, other|discussion 170, methods|discussion 139, document|abstract 121 (+15 more)
+  by venue: 工程 / 计算机 / 机器学习 1920, 化学 / 材料科学 640, 生物医学 / 分子细胞生物学 480, 临床医学 / 流行病学 / 公共卫生 160
+  by year_bin: 2016–2020 2080, ≤2015 640, ? 480
+  by section: introduction 1492, discussion 624, conclusion 573, methods 304, abstract 121, other 86
+  known cache hits: 0 (calls to make: 84)
+  tokens: system 736 (per item), input 203213–203213, output 42000–168000 (max_tokens 2000)
+  cost live:  USD 1.4654 (low) – 4.3181 (high)
+  cost batch: USD 0.7333 (low) – 2.1606 (high)
+  anthropic (claude-opus-5-5, share 90%): 82 items, 0 cached, in 197661 tokens; live USD 1.4642–4.3149, batch USD 0.7321–2.1574
+  deepseek (deepseek-flash, share 10%): 2 items, 0 cached, in 5552 tokens; live USD 0.0012–0.0032, batch USD 0.0012–0.0032 (billed in RMB); no batch API: this share runs live
+  estimates: +6% retry overhead; low from ledger observations for 0 items, defaults for the rest; no provider call is made by a dry run
+  note: provider split: anthropic 90%, deepseek 10%
+```
+
+`… run terms H:/projects/atlas-projects/ucl --dry-run` (1 min 16 s):
+
+```
+[terms] dry run — 404 items, task terms_extract @ prompt 9f84ace89fb5, model claude-opus-5-5 (anthropic claude-opus-5-5, deepseek deepseek-flash)
+  documents: 140
+  pool_sentences: 340102
+  sentences: 16000
+  chunks: 404
+  by unit_kind|section: other|other 2652, intro|introduction 1825, results|results 1460, methods|methods 1455, conclusion|conclusion 1263, other|results 1000, lit_review|introduction 995, other|introduction 855 (+34 more)
+  by venue: 工程 / 计算机 / 机器学习 11785, 化学 / 材料科学 1725, 物理 / 天文 / 数学 / 统计 1025, 生物医学 / 分子细胞生物学 743, 临床医学 / 流行病学 / 公共卫生 640, 未分类 / 无文本层 82
+  by year_bin: ≤2015 8532, 2016–2020 3027, 2021–2023 2493, ? 1163, 2024–2026 785
+  by section: introduction 4173, other 3727, results 2797, methods 2210, conclusion 1657, discussion 1330, abstract 106
+  known cache hits: 0 (calls to make: 404)
+  tokens: system 736 (per item), input 932798–932798, output 202000–808000 (max_tokens 2000)
+  cost live:  USD 6.3581 (low) – 19.0523 (high)
+  cost batch: USD 3.1898 (low) – 9.5569 (high)
+  anthropic (claude-opus-5-5, share 90%): 364 items, 0 cached, in 838989 tokens; live USD 6.3366–18.9909, batch USD 3.1683–9.4955
+  deepseek (deepseek-flash, share 10%): 40 items, 0 cached, in 93809 tokens; live USD 0.0215–0.0614, batch USD 0.0215–0.0614 (billed in RMB); no batch API: this share runs live
+  estimates: +6% retry overhead; low from ledger observations for 0 items, defaults for the rest; no provider call is made by a dry run
+  note: provider split: anthropic 90%, deepseek 10%
+```
+
+Both are inside the contract's expectations (pilot ≤ $5, full ≤ $35; the full run at the default batch mode is $3.2–9.6). The high bound assumes every answer fills `max_tokens` (2000) and nothing is cached; the first pilot's ledger observations will tighten the next plans. Note the project registers 140 theses (the subset target was 120).
+
+`atlas cost report H:/projects/atlas-projects/ucl` on the empty ledger: `ledger: 0 rows, cost 0.0000 -`, the empty per-task table, `cache: local hit rate 0.0% (rows), prompt cache read ratio 0.0% (tokens)`, `unknown spend: none (no pending rows)`. `atlas llm ping --help` prints the usage (`root`, `--effort {low,medium,high,xhigh,max}`); the ping itself was not run. `llm/llm.sqlite` (created by the report) and the dry runs' `-wal` / `-shm` sidecars were deleted afterwards; `work/runs/` was never created; nothing under `H:\UCL_theses` was touched.
+
+### 4.4 How to run the pilot later
+
+1. Keys. `RS_ANTHROPIC_API_KEY` is already in the Windows user environment (the resolver reads the registry, so no restart is needed); the default split also sends 10 % of the items to DeepSeek, so either `RS_DEEPSEEK_API_KEY` must be set too or `project.yaml` gets `llm: {split: {anthropic: 1}}` — a stage refuses to start when a provider of the split has no key. `ATLAS_LLM_NO_NETWORK` must not be set in that shell.
+2. `atlas llm ping H:/projects/atlas-projects/ucl` — the only command that spends on its own (one 20-token request): prints `key: found (N chars) via env|registry`, the model that answered, usage, cost and the request id, and writes the first ledger row.
+3. `atlas run terms H:/projects/atlas-projects/ucl --pilot 20 --budget 5` — the default mode is `batch`: the run submits one Message Batch (half price), writes `work/drafts/terms/<run>.pending.yaml` and returns the batch id; `atlas run terms … --pilot 20 --budget 5 --wait` (or `atlas llm batches collect <root> <id> --wait`, then the same run command) collects it and writes the draft `work/drafts/terms/<run>.yaml` + `<run>.report.md`. `--mode live` answers immediately instead. `atlas cost report H:/projects/atlas-projects/ucl --run terms_<run>` shows the run's settings and spend by provider.
+4. Blind review: `atlas qa sample <root> --stage terms --n 50` → fill the `judgement` column of `evalset/terms_<run>.xlsx` → `atlas qa record <root> <xlsx>` → `atlas qa report <root>` (≥ 10 judged and accuracy ≥ 0.85 open the full run of this task + prompt).
+5. `atlas curate merge <root> work/drafts/terms/<run>.yaml` (→ `term_tree.yaml`), then `atlas run concepts <root>` → `atlas curate merge <root> work/drafts/concepts/<run>.yaml` → `atlas curate confirm <root> concepts` and `patterns` → `atlas run scheme <root>` → merge → confirm `domains`, `categories`, `subdomains` → `atlas build new <root>` → `atlas run match <root>` → `atlas run assign <root>` → `atlas run classify <root> --pilot 20` → `qa sample --stage classify` / record / report → `atlas run classify <root>` → merge → confirm `concept_categories` → `atlas run finish <root>`.
+6. The full `terms` run (`atlas run terms <root> --budget 35`, 404 chunks) once the pilot's review has passed; its items that were already answered in the pilot are cache hits.
