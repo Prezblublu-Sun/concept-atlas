@@ -473,6 +473,11 @@ class PaperDocType:
                 "keywords": merged(meta.keywords, ranges("keywords")),
                 "abstract": merged(meta.abstract, ranges("abstract"))}
 
+    def guess_title(self, pages: Sequence[PageText]) -> str | None:
+        """First-page title guess (the same lines topic_fields uses when the metadata has no title)."""
+        found = _guess_title(pages, ())
+        return found[0] if found else None
+
 
 # ---- helpers for label_sections / topic_fields ---------------------------------------------------------------
 

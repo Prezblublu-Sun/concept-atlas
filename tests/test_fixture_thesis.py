@@ -60,7 +60,7 @@ def test_fixture_is_deterministic(theses, tmp_path):
 
 def test_doctype_units_sections_masks_and_topic_fields(theses):
     dt = ThesisDocType()
-    assert dt.version == "thesis1" and dt.thresholds.max_drop_ratio == 0.30 and dt.thresholds.min_chapter_confidence == 0.7
+    assert dt.version == "thesis2" and dt.thresholds.max_drop_ratio == 0.30 and dt.thresholds.min_chapter_confidence == 0.7
     for d in theses["info"]["documents"]:
         pages = extract_pages(d["path"])
         masks = dt.drop_non_body(pages)
@@ -122,6 +122,13 @@ def test_doctype_units_sections_masks_and_topic_fields(theses):
             if d["per_chapter_references"]:
                 assert "references" in by_page[c["page_to"]] or "references" in by_page.get(c["page_to"] - 1, [])
         assert "references" in by_page[d["tail"][0]["page_from"]] and "appendix" in by_page[d["tail"][1]["page_from"]]
+        # thesis2: the TOC (which lists the IMRaD chapter names) and the rest of the front matter produce no marks;
+        # marks are monotone and unique; every chapter start has its own 'other' mark
+        assert all(m.section in ("front", "abstract") for m in marks if m.page_no <= d["n_front_pages"])
+        keys = [(m.page_no, m.cstart) for m in marks]
+        assert keys == sorted(keys) and len(keys) == len(set(keys))
+        for u in chapters:
+            assert any(m.page_no == u.page_from and m.section == "other" for m in marks), u.heading
         # topic fields
         tf = dt.topic_fields(units[0], pages, marks, DocMeta(title=d["title"]))
         assert tf["title"] == [d["title"]] and tf["keywords"] == []
@@ -140,7 +147,7 @@ def test_ingested_sentences_units_and_counts(theses):
     try:
         for d in info["documents"]:
             ext = store.current_extraction(d["doc_id"])
-            assert ext is not None and ext["doc_type"] == "thesis" and "thesis:thesis1" in ext["extractor_version"]
+            assert ext is not None and ext["doc_type"] == "thesis" and "thesis:thesis2" in ext["extractor_version"]
             units = store.units_of(d["doc_id"])
             assert units[0]["kind"] == "document" and len(units) == 1 + len(d["chapters"]) + len(d["tail"])
             rows = store.sentences_of_extraction(ext["ext_id"])
@@ -168,6 +175,29 @@ def test_ingested_sentences_units_and_counts(theses):
             ch2 = units[2]
             assert ch2["kind"] == "chapter" and ch2["unit_kind"] == "lit_review" and ch2["confidence"] >= 0.7
             assert all(r.unit_id == ch2["unit_id"] for r in rows if ch2["page_from"] <= r.page_no <= ch2["page_to"])
+            # thesis2: every chapter's text carries the section of its unit_kind; the numbered 'Methods' sub-heading
+            # inside the Results chapter switches its own text to methods and the next sub-heading switches back; a
+            # chapter boundary (and a per-chapter 'References') never bleeds into the next chapter
+            for c in d["chapters"]:
+                default = DEFAULT_SECTION[c["unit_kind"]]
+                for sub, first in zip(c["sections"], c["sub_first_sentences"]):
+                    r = texts[first]
+                    want = "methods" if sub.endswith(" Methods") else default
+                    assert r.section == want, (d["layout"], sub, r.section)
+                    assert r.unit_id == units[c["number"]]["unit_id"]
+                    assert texts[sub].section == "other"                   # the heading line is its own sentence
+            # thesis2: the section traps — table cells inside the Discussion chapter and a legend in the bibliography
+            traps = d["traps"]
+            if traps["after_cells"]:
+                row = next(r for r in rows if traps["after_cells"] in r.text)
+                assert row.section == "discussion"
+                cell_rows = [r for r in rows if r.unit_id == row.unit_id and set(r.text.split()) & set(traps["cells"])]
+                assert cell_rows and all(r.section == "discussion" for r in cell_rows), [(r.text, r.section) for r in cell_rows]
+                assert not any(r.section == "references" and r.page_no < d["tail"][0]["page_from"]
+                               and r.unit_id == row.unit_id for r in rows) or d["per_chapter_references"]
+            tail_rows = [r for r in rows if d["tail"][0]["page_from"] <= r.page_no <= d["tail"][0]["page_to"]]
+            assert any(" ".join(traps["tail"]) == r.text for r in tail_rows)
+            assert all(r.section == "references" for r in tail_rows if r.text != d["tail"][0]["heading"])
             st = ext["stats"]
             assert st["masks"]["front_matter"] > 0 and st["masks"]["toc"] > 0 and ext["drop_ratio"] <= 0.30
     finally:
@@ -225,3 +255,64 @@ def test_cli_fixture_kind(tmp_path, capsys):
     assert cli.main(["fixture", "make", str(tmp_path / "t"), "--kind", "thesis"]) == 0
     out = capsys.readouterr().out
     assert "3 documents" in out and (tmp_path / "t" / "manifest.csv").is_file()
+
+
+# ---- thesis2: titles ----------------------------------------------------------------------------------------------
+
+def test_ingest_repairs_a_junk_stored_title_from_the_title_page(theses):
+    """A document whose stored title is junk ('Microsoft Word - …') gets the doctype's title-page guess when it is
+    (re-)ingested; the old value is kept in extra.title_replaced."""
+    info, project = theses["info"], theses["project"]
+    d = info["documents"][2]
+    junk = "Microsoft Word - final thesis.docx"
+    store = EvidenceStore.open(project.evidence_db, "rw")
+    try:
+        store.upsert_meta(d["doc_id"], DocMeta(title=junk))
+        assert store.get_document(d["doc_id"])["title"] == junk
+    finally:
+        store.close()
+    rep = run_stage(project, "ingest", doc_ids=[d["doc_id"]], reextract=True)
+    assert rep.items_done == 1 and rep.details["documents"][d["doc_id"]]["title_guess"] == d["title"]
+    store = EvidenceStore.open(project.evidence_db, "ro")
+    try:
+        doc = store.get_document(d["doc_id"])
+        assert doc["title"] == d["title"]
+        assert doc["extra"]["title_source"] == "doctype_guess" and doc["extra"]["title_replaced"] == junk
+        other = store.get_document(info["documents"][0]["doc_id"])
+        assert other["title"] == info["documents"][0]["title"] and "title_source" not in other["extra"]
+    finally:
+        store.close()
+    # a good title is left alone on the next ingest
+    rep = run_stage(project, "ingest", doc_ids=[d["doc_id"]], reextract=True)
+    assert rep.details["documents"][d["doc_id"]]["title_guess"] is None
+
+
+def test_registration_guesses_the_title_of_a_thesis_with_junk_metadata(tmp_path):
+    """`atlas docs add`: a manifest row without a title and a PDF whose info-dict title is junk → the title page."""
+    import fitz
+    pdf_dir = tmp_path / "pdf"
+    pdf_dir.mkdir()
+    doc = fitz.open()
+    title_lines = ["A Study of Something Important", "in Two Lines"]
+    for k in range(4):
+        page = doc.new_page()
+        lines = (title_lines + ["Jane Doe", "A thesis submitted for the degree of Doctor of Philosophy",
+                                "University of Example", "2021"]) if k == 0 else [f"Body text of page {k + 1}.", "More body text here."]
+        y = 100.0
+        for t in lines:
+            page.insert_text((72, y), t, fontsize=14 if t in title_lines else 11)
+            y += 24
+    doc.set_metadata({"title": "Microsoft Word - thesis final.docx", "author": "Jane Doe"})
+    doc.save(str(pdf_dir / "t9.pdf"))
+    doc.close()
+    project = init_project(tmp_path / "proj", name="t", doc_type="thesis", pdf_dir=str(pdf_dir))
+    project.manifest_path.write_text("doc_id,title,year,authors,doi,venue,doc_type,file\nT9,,2021,,,,thesis,t9.pdf\n", encoding="utf-8")
+    rep = register_documents(project)
+    assert rep.items_failed == 0 and rep.details["added"] == ["T9"]
+    store = EvidenceStore.open(project.evidence_db, "ro")
+    try:
+        d = store.get_document("T9")
+        assert d["title"] == "A Study of Something Important in Two Lines" and d["extra"]["title_source"] == "doctype_guess"
+        assert d["authors"] == "Jane Doe"
+    finally:
+        store.close()

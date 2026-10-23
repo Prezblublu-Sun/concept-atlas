@@ -71,9 +71,10 @@ Fidelity target (verifier): for 30 concepts (10 per tier A/B/C) the `all`-scope 
 
 ---
 
-## 4. Thesis doctype (`doctypes/thesis.py`, version `thesis1`)
+## 4. Thesis doctype (`doctypes/thesis.py`, version `thesis2`)
 
-Pure, like `paper`. Rules (architecture §8):
+Pure, like `paper`. Rules (architecture §8); the `thesis2` revision of the section rules and the title guess is in
+the "thesis2" subsection at the end of this section:
 
 - Front matter masks (`reason: front_matter`): title page, declaration/copyright, acknowledgements block in the first 10 % of pages, table of contents, list of figures/tables/abbreviations, until the first chapter start; the **abstract is kept** (section `abstract`).
 - TOC parsing: lines like `Chapter 3 … 57`, `3.2 Methods … 61`, `CHAPTER THREE`, dotted leaders; calibrate the page offset (printed page → physical page) from ≥ 3 TOC entries whose heading text is found on a physical page; fall back to scanning for `^(Chapter|CHAPTER)\s+(\d+|[IVX]+|One|Two…)` headings, then to numbered top-level headings `^\d+\s+[A-Z]`.
@@ -82,6 +83,19 @@ Pure, like `paper`. Rules (architecture §8):
 - `topic_fields`: document = manifest title + front-matter abstract (the text between an `Abstract` heading and the next front-matter heading, ≤ 600 words); chapter = heading + first 300 words of the chapter.
 - Thresholds: `max_drop_ratio 0.30`, `min_chapter_confidence 0.7`. `ingest` warns per document when confidence < 0.7 and writes `work/drafts/chapters/<doc_id>.yaml` (units with pages and reasons) so the user can correct them later via `curated/units_override.yaml` (the override mechanism itself exists in `ingest` already: `_override_sha`; reading the override file into units is part of this increment: `units_override.yaml: {doc_id: {chapters: [{heading, page_from, page_to, unit_kind}]}}`).
 - Fixture: `atlas fixture make --kind thesis <dir>` writes 3 synthetic theses (TOC with printed page numbers offset from physical pages, 4–6 chapters incl. a literature review and per-chapter references, running headers) and `tests/test_fixture_thesis.py` asserts units, sections, masks and `topic_fields`.
+
+### thesis2 (2026-10-23): sections inside chapters, title guess
+
+The verifier found the section labels inside chapters unreliable on the UCL project (an Introduction chapter labelled `methods` after a '1.1 Problem statement' sub-heading, a Discussion chapter labelled `introduction` after '6.1 Literature review', a References unit carrying 431 `methods` sentences after a wrapped word 'Modeling', chapter 4 carrying 220 `references` sentences after a table column 'Reference'). Rules now (module docstring of `thesis.py`):
+
+- Every chapter unit starts with its own mark (heading block `other`, then the default section of its `unit_kind`: intro / lit_review → introduction, methods, results, discussion, conclusion, other → other; a References / Bibliography tail or chapter → references, an Appendix → appendix). A chapter boundary always resets; the marks are monotone in (page, cstart).
+- Inside a chapter, numbered sub-headings form a stack: a canonical sub-heading of the chapter's own number ('4.2 Methods', `segment.detect_heading_ex` strength `strict`) switches the section, a deeper one ('4.2.1 Loading') inherits, an unrecognised one of the same depth ('4.3 Sensitivity') returns to the chapter default. Descriptive (`loose`) headings only count in chapters of kind `other`. Unnumbered headings count only when prose follows them ('References' also needs a reference entry): table cells, wrapped words and figure legends never switch. In a references / appendix unit only 'References' / 'Appendix' headings switch. A late or numbered 'Summary' is `conclusion`.
+- Chapter detection: a TOC entry named 'Abstract' no longer ends the TOC (T10228338 went from `no_toc`, confidence 0.45, to `toc_matched`, 0.75); LaTeX-shaped bare-number chapters join the numbered fallback; a bare 'Chapter N' heading takes the TOC's title; a title line that reads like a sentence is rejected; the chapter title that LaTeX repeats as a running header counts on its first page; chapter-initial sub-headings ('1.1 Introduction', '2.1 Introduction' …) are no longer taken for one running header; no chapter starts on the TOC page; 'CHAPTER. 6' (OCR) is a chapter heading; the page-number offset uses the same sign as the TOC votes (a `footer_offset` bug).
+- `unit_kind_of` vocabulary: + concluding/closing remarks, aims/objectives/research questions/rationale, synthesis/fabrication/apparatus … (`\bscope\b`, `\baims?\b` instead of substrings).
+- Titles: `atlas.core.text.junk_title` (empty, control characters, 'Microsoft Word - …', file names, < 3 words, generic thesis words); every doctype exposes `guess_title(pages)` (thesis: the title page, skipping ProQuest notice pages, joining word-per-line dvips pages, stopping at the author / credentials / formula lines); `atlas docs add` uses it before the largest-font guess when the manifest and PDF-metadata titles are junk, and the ingest stage repairs a junk stored title on (re-)ingest (`extra.title_source = doctype_guess`, `title_replaced`).
+- Fixture: the Results chapter carries a numbered 'Methods' sub-heading, the Discussion chapter a table rendered as short lines, the bibliography a legend — `traps` in the returned dict; the tests assert the stack, the traps, the TOC producing no marks and the title repair.
+
+UCL project after thesis2 (140 theses, doctype run only): every chapter ≥ 0.7 in 127/140 (was 124), 5 theses without chapters (T802 / T950: 1988–1996 dvips PDFs whose digits are control characters and whose words sit one per line; T1451582, T10122138, T10106537), unit kinds other 402 / tails 371 / methods 154 / intro 125 / results 113 / conclusion 94 / discussion 42 / lit_review 40; sentences of `intro` chapters 94 % introduction (was 73 %), `methods` 57 % methods (was 51 %) with the rest in the IMRaD sub-sections of paper-style chapters, `discussion` 80 % discussion (was 57 %), references tails 99.8 % references (was 91 %); every chapter unit now starts with its own mark (before: 33 theses had chapter starts without one, their heading glued to the first sentence).
 
 ---
 

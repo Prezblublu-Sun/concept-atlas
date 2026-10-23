@@ -38,6 +38,33 @@ def collapse_ws(s: str | None) -> str:
     return " ".join((s or "").split())
 
 
+# ---- document titles ------------------------------------------------------------------------------------------
+
+_TITLE_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+_TITLE_FILE_RE = re.compile(r"\.(?:pdf|docx?|dvi|tex|ps|rtf|odt|wpd|txt|pptx?)\s*$", re.I)
+_TITLE_JUNK_PREFIX_RE = re.compile(r"^(?:microsoft (?:word|powerpoint|office)|proquest|untitled|print to file|"
+                                   r"pdf document|scanned document|new document|document\d*\b|slide \d)", re.I)
+#: words that never make a title on their own ('PhD thesis final version', 'University of London thesis')
+GENERIC_TITLE_WORDS = frozenset("""thesis theses dissertation phd dphil doctoral doctorate final version draft copy
+corrected corrections correction submitted submission full complete vol volume whole document file main body text
+university college london ucl of the a an and for degree doctor philosophy md mphil msc ma ba library hard bound
+hardbound soft electronic e print eprint pdf deposited deposit edition revised""".split())
+
+
+def junk_title(title: str | None) -> bool:
+    """True when a manifest / PDF-metadata title is unusable as the document's title: empty, carrying control
+    characters, fewer than three words, a file name ('main.dvi', 'Schauer_2008_PHD_vol1'), an application
+    artefact ('Microsoft Word - Thesis correction.docx', 'ProQuest Dissertations', 'Print to file, Job 124') or
+    nothing but generic thesis words ('PhD thesis final version', 'UNIVERSITY OF LONDON THESIS')."""
+    t = collapse_ws(title)
+    if not t or _TITLE_CTRL_RE.search(t) or _TITLE_JUNK_PREFIX_RE.match(t) or _TITLE_FILE_RE.search(t):
+        return True
+    words = re.findall(r"[^\W_]+", t)
+    if len(words) < 3 or " " not in t:
+        return True
+    return all(w.lower() in GENERIC_TITLE_WORDS or w.isdigit() for w in words)
+
+
 # ---- sentence text ------------------------------------------------------------------------------------------------
 
 #: Ligature glyphs that PDF fonts emit for letter pairs ('ﬁnding' → 'finding'); NFKC would expand them too, but
