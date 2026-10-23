@@ -31,9 +31,23 @@ atlas run match|assign|finish <project-dir> [--build <id>]
 # fixtures and the UCL thesis subset
 atlas fixture make --kind paper|thesis <dir>
 atlas ucl subset <ucl-root> [--inventory …] [--proximity …] [--pdf-dir …] [--target N]
+
+# LLM curation stages (increment 4): drafts in work/drafts/<stage>/<run>.yaml (+ <run>.report.md); stages never
+# write curated/ — only `curate merge` and `curate confirm` do. --dry-run prints items, tokens and low/high cost
+# (live and batch) without any call; --pilot N limits a run (terms/scheme: N documents, concepts/classify: N items);
+# a full run of terms / classify needs a passing blind review for the same task + prompt (atlas qa …).
+atlas run terms <project-dir> [--dry-run] [--pilot N] [--mode live|batch] [--budget X] [--wait] [--limit N] [--seed S]
+atlas run concepts <project-dir> [--draft <terms draft>] …     # rules first, then concepts_merge; delta draft when concepts exist
+atlas run scheme <project-dir> …                               # domains / categories / sub-domains draft (gate: concepts)
+atlas run classify <project-dir> [--build <id>] [--force] …    # on an open build with assign done (gate: the scheme)
+atlas curate merge <project-dir> work/drafts/<stage>/<run>.yaml [--domain DOM_x]   # three-way merge → curated/
+atlas qa sample <project-dir> --stage terms|classify [--n 50] [--seed 1] [--run id]  # evalset/<stage>_<run>.xlsx
+atlas qa record <project-dir> <xlsx>          # the filled judgement column → evalset/judgments/
+atlas qa report <project-dir>                 # accuracy per stage / stratum; the accept gate reads it
 ```
 
-Bring your own LLM key (OpenAI-compatible endpoint); nothing is sent anywhere until you run an LLM stage, and
-every call is metered. Corpus text, databases and keys never enter this repository.
+Bring your own LLM key; nothing is sent anywhere until you run an LLM stage, and every call is metered. With
+`ATLAS_LLM_NO_NETWORK=1` in the environment no provider is ever called (the test suite runs that way). Corpus text,
+databases and keys never enter this repository.
 
 License: MIT.

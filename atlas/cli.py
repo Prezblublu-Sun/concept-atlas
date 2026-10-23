@@ -6,8 +6,13 @@ atlas docs add <root> [--manifest manifest.csv] [--pattern '**/*.pdf'] [--scan] 
 atlas docs list <root> [--q text] [--limit 50]
 atlas run ingest <root> [--reextract] [--limit N] [--doc-ids a,b] [--workers 1]
 atlas run match|assign|finish <root> [--build <id>] [--doc-ids a,b] [--workers N] [--force]
+atlas run terms|concepts|scheme|classify <root> [--dry-run] [--pilot N] [--mode live|batch] [--budget X] [--wait]
+                                               [--limit N] [--seed S] [--model M] [--draft file] [--doc-ids …]
+                                               [--concept-ids …] [--build <id>] [--force]   LLM stages (increment 4)
 atlas build new|list|status|promote|all|upgrade <root> [<id>] [--note …] [--workers N]
-atlas curate confirm <root> <name> | atlas curate status <root>
+atlas curate confirm <root> <name> | atlas curate status <root> | atlas curate merge <root> <draft> [--domain DOM_x]
+atlas qa sample <root> --stage terms|classify [--n 50] [--seed 1] [--run id]   blind-review sheet → evalset/
+atlas qa record <root> <xlsx> | atlas qa report <root>
 atlas legacy export-curated <terms_v3.db> <root> [--spec subdomain_spec.json] [--force]
 atlas legacy import-highlights <highlights.sqlite> <sentences.db> <root>
 atlas serve <root> [--host 127.0.0.1] [--port 8770] [--no-prewarm]   (a port in use is an error, exit 1)
@@ -81,7 +86,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--doc-ids", help="comma-separated doc ids")
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--build", help="build id (default: the newest open build)")
-    p.add_argument("--force", action="store_true", help="match: redo documents whose fingerprint is unchanged")
+    p.add_argument("--force", action="store_true", help="match / classify: redo items whose fingerprint is unchanged")
+    g = p.add_argument_group("LLM stages (terms, concepts, scheme, classify)")
+    g.add_argument("--dry-run", action="store_true", help="print the plan (items, tokens, low/high cost) and make no call")
+    g.add_argument("--pilot", type=int, metavar="N", help="terms/scheme: N documents; concepts/classify: N items")
+    g.add_argument("--mode", choices=("live", "batch"), help="live calls or one Message Batch (default: llm.batch_default)")
+    g.add_argument("--budget", type=float, metavar="X", help="stop before the high estimate exceeds X (provider currency)")
+    g.add_argument("--wait", action="store_true", help="batch mode: poll until the batch ended, then finish the draft")
+    g.add_argument("--seed", type=int, help="sampling seed (terms)")
+    g.add_argument("--model", help="model for this run / estimate (default: llm.model, else claude-opus-5-5)")
+    g.add_argument("--draft", help="concepts: a terms draft to take candidates from")
+    g.add_argument("--concept-ids", help="classify: comma-separated concept ids")
 
     b = sub.add_parser("build", help="derived builds").add_subparsers(dest="build_cmd", metavar="<verb>")
     b.required = True
@@ -110,6 +125,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("root")
     p.add_argument("name", help="concepts | patterns | subdomains | domains | doc_domains | … | all")
     p = c.add_parser("status", help="confirmation state of every curated file")
+    p.add_argument("root")
+    p = c.add_parser("merge", help="three-way merge of a stage draft (work/drafts/<stage>/<run>.yaml) into curated/")
+    p.add_argument("root")
+    p.add_argument("draft")
+    p.add_argument("--domain", help="terms drafts: the domain id the terms are placed under (default: first scope domain)")
+
+    qa = sub.add_parser("qa", help="blind review of LLM drafts (the accept gate)").add_subparsers(dest="qa_cmd", metavar="<verb>")
+    qa.required = True
+    p = qa.add_parser("sample", help="write evalset/<stage>_<run>.xlsx (+ .jsonl) with an empty judgement column")
+    p.add_argument("root")
+    p.add_argument("--stage", choices=("terms", "classify"), required=True)
+    p.add_argument("--n", type=int, default=50)
+    p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--run", help="draft run id (default: the newest draft of the stage)")
+    p = qa.add_parser("record", help="read the filled sheet into evalset/judgments/")
+    p.add_argument("root")
+    p.add_argument("xlsx")
+    p = qa.add_parser("report", help="accuracy per stage and stratum over every recorded judgment")
     p.add_argument("root")
 
     lg = sub.add_parser("legacy", help="import from the previous term viewer").add_subparsers(dest="legacy_cmd",
@@ -220,7 +253,7 @@ def _cmd_docs_list(a: argparse.Namespace) -> int:
 
 def _cmd_run(a: argparse.Namespace) -> int:
     from atlas.config import load_project
-    from atlas.pipeline.runner import run_stage
+    from atlas.pipeline.runner import LLM_STAGES, run_stage
     proj = load_project(a.root)
     doc_ids = [s.strip() for s in a.doc_ids.split(",") if s.strip()] if a.doc_ids else None
     opts: dict = {}
@@ -228,7 +261,30 @@ def _cmd_run(a: argparse.Namespace) -> int:
         opts = {"reextract": a.reextract, "limit": a.limit, "workers": a.workers, "doc_ids": doc_ids}
     elif a.stage == "match":
         opts = {"doc_ids": doc_ids, "workers": a.workers, "force": a.force}
-    return _print_report(run_stage(proj, a.stage, build=a.build, **opts))
+    elif a.stage in LLM_STAGES:
+        opts = {"dry_run": a.dry_run, "pilot": a.pilot, "mode": a.mode, "budget": a.budget, "wait": a.wait,
+                "limit": a.limit, "seed": a.seed, "model": a.model}
+        if a.stage == "terms":
+            opts["doc_ids"] = doc_ids
+        elif a.stage == "concepts":
+            opts["draft"] = a.draft
+        elif a.stage == "classify":
+            opts["force"] = a.force
+            opts["concept_ids"] = [s.strip() for s in a.concept_ids.split(",") if s.strip()] if a.concept_ids else None
+    report = run_stage(proj, a.stage, build=a.build, **opts)
+    if a.stage in LLM_STAGES:
+        from atlas.pipeline.llm_stage import format_plan
+        if report.details.get("dry_run"):
+            print(format_plan(report.details["plan"]))
+            for w in report.warnings[:50]:
+                print(f"  warning: {w}")
+            return EXIT_OK
+        rc = _print_report(report)
+        for key in ("run_id", "draft", "report", "batch_id", "cost", "currency"):
+            if report.details.get(key) is not None:
+                print(f"  {key}: {report.details[key]}")
+        return rc
+    return _print_report(report)
 
 
 def _cmd_build(a: argparse.Namespace) -> int:
@@ -286,10 +342,35 @@ def _cmd_curate(a: argparse.Namespace) -> int:
             r = gates.confirm(proj, a.name)
             print(f"confirmed {a.name}: {r['sha'][:12]} at {r['confirmed_at']}")
         return EXIT_OK
+    if a.curate_cmd == "merge":
+        r = gates.merge_draft(proj, a.draft, domain=a.domain)
+        print(gates.format_merge_report(r))
+        return EXIT_OK
     rows = gates.status(proj)
     print("name\tstate\tsha\tconfirmed_at")
     for r in rows:
         print(f"{r['name']}\t{r['state']}\t{(r['sha'] or '')[:12]}\t{r['confirmed_at'] or ''}")
+    for n in gates.draft_notices(proj):
+        print(f"notice: {n}")
+    return EXIT_OK
+
+
+def _cmd_qa(a: argparse.Namespace) -> int:
+    from atlas.config import load_project
+    from atlas.verify import qa
+    proj = load_project(a.root)
+    if a.qa_cmd == "sample":
+        r = qa.sample(proj, a.stage, n=a.n, seed=a.seed, run_id=a.run)
+        print(f"qa sheet: {r['xlsx']} ({r['n']} of {r['total']} items of {a.stage} run {r['run']}, task {r['task']} @ "
+              f"{r['prompt_sha'][:12]}); fill the judgement column, then `atlas qa record {a.root} {r['xlsx']}`")
+        return EXIT_OK
+    if a.qa_cmd == "record":
+        r = qa.record(proj, a.xlsx)
+        print(f"recorded {r['judged']} judgements of {r['n']} rows ({r['correct']} correct) for {r['stage']} run {r['run']} → {r['jsonl']}")
+        for u in r["unparsed"][:20]:
+            print(f"  unparsed judgement for {u['key']}: {u['value']!r}")
+        return EXIT_OK
+    print(qa.format_report(qa.report(proj)))
     return EXIT_OK
 
 
@@ -370,8 +451,9 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USAGE if e.code else EXIT_OK
     level = logging.WARNING - 10 * min(int(a.verbose), 2)
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s", stream=sys.stderr)
+    from atlas.llm.base import NetworkForbidden
     from atlas.pipeline.build import BuildError
-    from atlas.pipeline.gates import GateError
+    from atlas.pipeline.gates import GateError, MergeError
     from atlas.pipeline.runner import StageError
     from atlas.store.db import BuildSchemaError
     from atlas.tools.gc import GcError
@@ -386,6 +468,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_build(a)
         if a.cmd == "curate":
             return _cmd_curate(a)
+        if a.cmd == "qa":
+            return _cmd_qa(a)
         if a.cmd == "legacy":
             return _cmd_legacy(a)
         if a.cmd == "serve":
@@ -401,7 +485,7 @@ def main(argv: list[str] | None = None) -> int:
         ap.print_usage(sys.stderr)
         return EXIT_USAGE
     except (FileNotFoundError, FileExistsError, KeyError, ValueError, NotImplementedError, OSError, BuildError,
-            GateError, StageError, BuildSchemaError, GcError) as e:
+            GateError, MergeError, StageError, BuildSchemaError, GcError, NetworkForbidden) as e:
         log.debug("command failed", exc_info=True)
         print(f"error: {e}", file=sys.stderr)
         return EXIT_USAGE

@@ -608,3 +608,60 @@ class EvidenceStore:
             return empty
         return {"rows": [{"doc_id": h["doc_id"], "page_no": h["page_no"], "snippet": snips.get(h["rid"], "")} for h in page],
                 "total": total, "documents": documents, "total_capped": capped, "listed": len(hits)}
+
+    # ---- curation reads (increment 4: the sampling of the `terms` / `scheme` stages) ----------------------------
+    _MEMBERSHIP_SQL = ("SELECT es.sid, e.doc_id, es.unit_id, es.page_no, es.seq, es.section, es.is_body "
+                       "FROM extraction_sentences es JOIN extractions e ON e.ext_id = es.ext_id AND e.is_current = 1")
+
+    def iter_membership(self, doc_ids: Sequence[str] | None = None, body_only: bool = False,
+                        sections: Sequence[str] | None = None) -> Iterator[dict]:
+        """Membership rows of the current extractions, without text: {sid, doc_id, unit_id, page_no, seq, section,
+        is_body} in (doc_id, seq) order; optionally restricted to documents, body sentences or sections."""
+        where: list[str] = []
+        args: list = []
+        if doc_ids is not None:
+            ids = sorted({str(d) for d in doc_ids})
+            if not ids:
+                return iter(())
+            where.append(f"e.doc_id IN ({','.join('?' * len(ids))})")
+            args += ids
+        if body_only:
+            where.append("es.is_body = 1")
+        if sections:
+            secs = sorted({str(s) for s in sections})
+            where.append(f"es.section IN ({','.join('?' * len(secs))})")
+            args += secs
+        sql = self._MEMBERSHIP_SQL + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY e.doc_id, es.seq"
+        return ({"sid": r["sid"], "doc_id": r["doc_id"], "unit_id": r["unit_id"], "page_no": r["page_no"],
+                 "seq": r["seq"], "section": r["section"], "is_body": bool(r["is_body"])}
+                for r in self.conn.execute(sql, args))
+
+    def texts_of(self, sids: Iterable[str]) -> dict[str, str]:
+        """{sid: stored sentence text} for the given ids (unknown ids are left out)."""
+        ids = list(dict.fromkeys(str(s) for s in sids))
+        out: dict[str, str] = {}
+        for i in range(0, len(ids), self._IN_CHUNK):
+            part = ids[i:i + self._IN_CHUNK]
+            marks = ",".join("?" * len(part))
+            for r in self.conn.execute(f"SELECT sid, text FROM sentences WHERE sid IN ({marks})", part):
+                out[r["sid"]] = r["text"]
+        return out
+
+    def unit_kinds(self) -> dict[str, str | None]:
+        """{unit_id: unit_kind} of the current extractions (None for document units and papers)."""
+        return {r["unit_id"]: r["unit_kind"] for r in self.conn.execute(
+            "SELECT u.unit_id, u.unit_kind FROM units u JOIN extractions e ON e.ext_id = u.ext_id AND e.is_current = 1")}
+
+    def doc_meta_all(self) -> dict[str, dict]:
+        """{doc_id: {doc_type, title, year, venue, keywords, abstract, extra}} for every registered document."""
+        out: dict[str, dict] = {}
+        for r in self.conn.execute("SELECT d.doc_id, d.doc_type, m.title, m.year, m.venue, m.keywords, m.abstract, m.extra_json "
+                                   "FROM documents d LEFT JOIN document_meta m ON m.doc_id = d.doc_id ORDER BY d.doc_id"):
+            try:
+                extra = json.loads(r["extra_json"] or "{}")
+            except ValueError:
+                extra = {}
+            out[r["doc_id"]] = {"doc_type": r["doc_type"], "title": r["title"], "year": r["year"], "venue": r["venue"],
+                                "keywords": r["keywords"], "abstract": r["abstract"],
+                                "extra": extra if isinstance(extra, dict) else {}}
+        return out
